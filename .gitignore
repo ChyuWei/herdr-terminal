@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Zig / libghostty-vt
+.zig-cache/
+zig-out/
+**/.zig-cache/
+**/zig-out/
+
+# macOS
+.DS_Store
+
+# Logs and editor files
+*.log
+*.swp
+*.swo
