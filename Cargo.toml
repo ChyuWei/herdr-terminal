@@ -18,9 +18,28 @@ readme = "README.md"
 autobins = false
 default-run = "ht"
 
+[lib]
+name = "herdr_terminal"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ht"
 path = "src/main.rs"
+
+# A deterministic stand-in for `hc connect` used by the probe's error-path and
+# fast-exit tests. It runs its own tests when started without arguments, and
+# speaks the framed protocol when the probe spawns it as `--version`/`connect`.
+[[test]]
+name = "fake_core"
+path = "tests/fake_core.rs"
+harness = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true
