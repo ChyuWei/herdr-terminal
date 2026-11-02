@@ -227,6 +227,18 @@ impl Probe {
         self.child.stdin.as_mut().expect("piped stdin")
     }
 
+    /// Sends a signal to the child. A test PTY is not the child's controlling
+    /// terminal, so `TIOCSWINSZ` on the master does not deliver SIGWINCH the
+    /// way a terminal emulator would; the test sends it explicitly.
+    #[cfg(unix)]
+    pub fn signal(&self, signal: i32) {
+        // SAFETY: kill takes a pid and a signal number; the child was spawned
+        // by this test. A race with its exit is harmless (ESRCH).
+        unsafe {
+            libc::kill(self.child.id() as i32, signal);
+        }
+    }
+
     pub fn write(&mut self, bytes: &[u8]) {
         self.stdin().write_all(bytes).expect("write to probe");
         self.stdin().flush().expect("flush to probe");

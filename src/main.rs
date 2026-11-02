@@ -1,7 +1,7 @@
-//! `ht`: the HerdR Terminal command line. M0 has only `probe`.
+//! `ht`: the HerdR Terminal command line. M0 has `probe`; M1 adds `screen`.
 
 use herdr_terminal::core::{Error, Result};
-use herdr_terminal::probe;
+use herdr_terminal::{probe, screen};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -9,19 +9,24 @@ const HELP: &str = "\
 ht — the terminal client for Herdr Core
 
 usage:
+  ht screen [options] [--] [PROGRAM [ARGS...]]
   ht probe [options] [--] [PROGRAM [ARGS...]]
   ht --version
   ht --help
 
-M0 has only `probe`: it connects to core, runs a shell (or PROGRAM), attaches,
-and copies raw bytes to stdout. Ctrl-C exits. A program that exits before the
-attach lands still has its final screen and exit status printed.
+`ht screen` is one full-screen terminal rendered with ratatui. It runs a shell
+(or PROGRAM), attaches to it, and draws its cells, colors, cursor and wide
+characters. Keys and the mouse go to the program, including Ctrl-C. Ctrl-]
+leaves the screen: it detaches, ends the program, and removes its record.
+It needs a terminal on stdin and stdout.
 
-probe options:
+`ht probe` copies the program's raw bytes to stdout; Ctrl-C quits.
+
+options (both commands):
   --hc PATH    herdr-core binary to use (default: HERDR_TERMINAL_HC, PATH, ...)
   --cols N     attach width in cells (default: the terminal's, else 80)
   --rows N     attach height in cells (default: the terminal's, else 24)
-  -v, --verbose  log events and connection details to stderr
+  -v, --verbose  log connection details to stderr
 ";
 
 fn main() {
@@ -55,20 +60,57 @@ fn run(args: Vec<OsString>) -> Result<i32> {
             print!("{HELP}");
             Ok(0)
         }
-        "probe" => match probe_options(args)? {
+        "screen" => match command_options("screen", args)? {
             None => {
                 print!("{HELP}");
                 Ok(0)
             }
-            Some(options) => probe::run(options),
+            Some(options) => screen::run(screen::Options {
+                cols: options.cols,
+                rows: options.rows,
+                hc: options.hc,
+                argv: options.argv,
+                verbose: options.verbose,
+            }),
+        },
+        "probe" => match command_options("probe", args)? {
+            None => {
+                print!("{HELP}");
+                Ok(0)
+            }
+            Some(options) => probe::run(probe::Options {
+                cols: options.cols,
+                rows: options.rows,
+                hc: options.hc,
+                argv: options.argv,
+                verbose: options.verbose,
+            }),
         },
         other => Err(Error::Usage(format!("unknown command {other:?}\n\n{HELP}"))),
     }
 }
 
-/// `None` means `--help` was asked for.
-fn probe_options(mut args: impl Iterator<Item = OsString>) -> Result<Option<probe::Options>> {
-    let mut options = probe::Options::default();
+/// Options shared by `screen` and `probe`.
+struct CommandOptions {
+    cols: Option<u16>,
+    rows: Option<u16>,
+    hc: Option<PathBuf>,
+    argv: Vec<String>,
+    verbose: bool,
+}
+
+/// Parses the shared options. `None` means `--help` was asked for.
+fn command_options(
+    command: &str,
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<Option<CommandOptions>> {
+    let mut options = CommandOptions {
+        cols: None,
+        rows: None,
+        hc: None,
+        argv: Vec::new(),
+        verbose: false,
+    };
     while let Some(argument) = args.next() {
         if !options.argv.is_empty() {
             options.argv.push(text(argument)?);
@@ -84,12 +126,18 @@ fn probe_options(mut args: impl Iterator<Item = OsString>) -> Result<Option<prob
             }
             "-h" | "--help" => return Ok(None),
             "-v" | "--verbose" => options.verbose = true,
-            "--hc" => options.hc = Some(PathBuf::from(value(&mut args, "--hc")?)),
-            "--cols" => options.cols = Some(dimension(&mut args, "--cols")?),
-            "--rows" => options.rows = Some(dimension(&mut args, "--rows")?),
+            "--hc" => {
+                options.hc = Some(PathBuf::from(value(command, &mut args, "--hc")?));
+            }
+            "--cols" => {
+                options.cols = Some(dimension(command, &mut args, "--cols")?);
+            }
+            "--rows" => {
+                options.rows = Some(dimension(command, &mut args, "--rows")?);
+            }
             _ if argument.starts_with('-') && argument != "-" => {
                 return Err(Error::Usage(format!(
-                    "probe: unknown option {argument:?} (try ht --help)"
+                    "{command}: unknown option {argument:?} (try ht --help)"
                 )));
             }
             _ => options.argv.push(argument),
@@ -98,19 +146,23 @@ fn probe_options(mut args: impl Iterator<Item = OsString>) -> Result<Option<prob
     Ok(Some(options))
 }
 
-fn value(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<String> {
+fn value(command: &str, args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<String> {
     let value = args
         .next()
-        .ok_or_else(|| Error::Usage(format!("probe: {option} needs a value")))?;
+        .ok_or_else(|| Error::Usage(format!("{command}: {option} needs a value")))?;
     text(value)
 }
 
-fn dimension(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<u16> {
-    let value = value(args, option)?;
+fn dimension(
+    command: &str,
+    args: &mut impl Iterator<Item = OsString>,
+    option: &str,
+) -> Result<u16> {
+    let value = value(command, args, option)?;
     match value.parse::<u16>() {
         Ok(size) if size > 0 => Ok(size),
         _ => Err(Error::Usage(format!(
-            "probe: {option} needs a number from 1 to 65535, not {value:?}"
+            "{command}: {option} needs a number from 1 to 65535, not {value:?}"
         ))),
     }
 }

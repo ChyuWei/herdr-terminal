@@ -224,7 +224,7 @@ pub struct ReadResult {
 
 /// What a viewer's own terminal looks like, for core to answer display
 /// queries. Only sent when it changes (FACTS).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Display {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fg: Option<String>,

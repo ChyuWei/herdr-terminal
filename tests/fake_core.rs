@@ -42,7 +42,82 @@ fn run_tests() {
     a_program_that_exits_before_attach_is_still_shown_and_removed();
     #[cfg(unix)]
     a_local_write_error_stops_and_removes_the_started_terminal();
-    println!("fake-core probe tests passed");
+    #[cfg(unix)]
+    screen_draws_the_final_frame_when_data_and_close_arrive_together();
+    println!("fake-core tests passed");
+}
+
+/// DATA and CLOSE in one attach burst: the screen must draw the final frame
+/// (past its frame throttle) before it leaves the alternate screen.
+#[cfg(unix)]
+fn screen_draws_the_final_frame_when_data_and_close_arrive_together() {
+    use common::pty::Pty;
+
+    let scratch = Scratch::new("screen-final");
+    let exe = std::env::current_exe().expect("test executable");
+    let pty = Pty::open(80, 24);
+    let (stdin, stdout) = pty.stdio();
+    let mut child = Command::new(HT)
+        .args(["screen", "--hc"])
+        .arg(&exe)
+        .args(["--cols", "80", "--rows", "24", "--", "sh", "-c", "sleep 30"])
+        .env("FAKE_SCENARIO", "screen-final")
+        .env("FAKE_LOG", scratch.log())
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ht screen");
+    let output = Capture::spawn(pty.reader());
+    let stderr = Capture::spawn(child.stderr.take().expect("stderr"));
+    let mut screen = Probe::new(child);
+
+    let status = screen
+        .wait_timeout(secs(10))
+        .expect("ht screen exits after the scripted CLOSE");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "ht screen exit {status}; stderr={:?}",
+        stderr.text()
+    );
+    let raw = output.bytes();
+    assert!(
+        output.contains(b"READY"),
+        "the final frame is missing READY; raw={:?}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(
+        output.contains(b"END"),
+        "the final frame is missing END; raw={:?}",
+        String::from_utf8_lossy(&raw)
+    );
+    let end = rfind(&raw, b"END").expect("END was drawn");
+    let leave = rfind(&raw, b"\x1b[?1049l").expect("the alternate screen was left");
+    assert!(
+        end < leave,
+        "the final frame must be drawn before the screen is restored; raw={:?}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(
+        pty.is_cooked(),
+        "ht screen did not restore the terminal after the program ended"
+    );
+    let log = scratch.entries();
+    assert!(
+        log.iter().any(|entry| entry["call"] == "terminal.rm"),
+        "the finished record must be removed; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.kill"),
+        "a program that ended by itself must not be killed; log={log:?}"
+    );
+}
+
+fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
 }
 
 /// A program that exited before attach: the probe must read the final screen,
@@ -250,8 +325,27 @@ fn fake_connect() -> io::Result<()> {
                             "terminal": record("live"),
                         }),
                     )?;
-                    // The probe cannot write this anywhere: its stdout is broken.
-                    write_frame(&mut output, ATTACH_CHANNEL, DATA, b"PAINT\n")?;
+                    if scenario == "screen-final" {
+                        // The whole ending arrives as one burst: two DATA
+                        // frames and CLOSE, so the last text is only in the
+                        // VT when the close is seen.
+                        write_frame(
+                            &mut output,
+                            ATTACH_CHANNEL,
+                            DATA,
+                            b"\x1b[38;2;1;2;3mREADY\n",
+                        )?;
+                        write_frame(&mut output, ATTACH_CHANNEL, DATA, b"END\n")?;
+                        write_frame(
+                            &mut output,
+                            ATTACH_CHANNEL,
+                            CLOSE,
+                            br#"{"reason":"exited","exit_code":0}"#,
+                        )?;
+                    } else {
+                        // The probe cannot write this anywhere: its stdout is broken.
+                        write_frame(&mut output, ATTACH_CHANNEL, DATA, b"PAINT\n")?;
+                    }
                 }
             }
             "terminal.get" => reply(&mut output, &id, record("finished"))?,
