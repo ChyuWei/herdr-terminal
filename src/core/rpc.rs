@@ -9,7 +9,13 @@ use std::fmt;
 pub const GENERATION: u32 = 1;
 
 /// Methods this client needs; a core without one cannot serve it.
-pub const REQUIRED_METHODS: &[&str] = &["events.subscribe", "terminal.run", "terminal.attach"];
+pub const REQUIRED_METHODS: &[&str] = &[
+    "events.subscribe",
+    "terminal.run",
+    "terminal.attach",
+    "doc.get",
+    "doc.set",
+];
 /// Features this client needs, as `hello` reports them.
 pub const REQUIRED_FEATURES: &[&str] = &["framed", "attach", "events"];
 
@@ -253,6 +259,22 @@ pub struct Snapshot {
     pub channel: Option<u32>,
 }
 
+/// `doc.get`'s reply: the opaque value and the version it belongs to. An
+/// absent document is `value: null, version: 0`.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DocGetResult {
+    #[serde(default)]
+    pub value: Value,
+    #[serde(default)]
+    pub version: u64,
+}
+
+/// `doc.set`'s reply: the version the write created.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DocSetResult {
+    pub version: u64,
+}
+
 /// `terminal.attach`'s reply: the stream channel and the terminal record.
 #[derive(Clone, Debug, Deserialize)]
 pub struct AttachResult {
@@ -332,7 +354,7 @@ mod tests {
         let Err(Mismatch::MissingMethods(methods)) = missing.check() else {
             panic!("missing method not detected")
         };
-        assert_eq!(methods, ["terminal.attach"]);
+        assert_eq!(methods, ["terminal.attach", "doc.get", "doc.set"]);
         assert!(
             missing
                 .check()

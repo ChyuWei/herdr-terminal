@@ -53,19 +53,36 @@ impl Run {
     /// Starts the workspace with the first pane running `program` instead of
     /// core's shell, so tests can cover panes with different programs.
     fn spawn_with(session: &Session, cols: u16, rows: u16, program: &[&str]) -> Run {
+        Run::spawn_env(session, cols, rows, program, None)
+    }
+
+    /// A named screen: its own local view on the shared document.
+    fn spawn_as(session: &Session, cols: u16, rows: u16, screen: &str) -> Run {
+        Run::spawn_env(session, cols, rows, &[], Some(screen))
+    }
+
+    fn spawn_env(
+        session: &Session,
+        cols: u16,
+        rows: u16,
+        program: &[&str],
+        screen: Option<&str>,
+    ) -> Run {
         let pty = Pty::open(cols, rows);
         let (stdin, stdout) = pty.stdio();
         let cols_arg = cols.to_string();
         let rows_arg = rows.to_string();
-        let mut child = session
-            .command(HT)
+        let mut command = session.command(HT);
+        command
             .args(["--cols", &cols_arg, "--rows", &rows_arg])
             .args(program)
             .stdin(stdin)
             .stdout(stdout)
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn ht");
+            .stderr(Stdio::piped());
+        if let Some(screen) = screen {
+            command.env("HERDR_TERMINAL_SCREEN", screen);
+        }
+        let mut child = command.spawn().expect("spawn ht");
         let output = Capture::spawn(pty.reader());
         let errors = Capture::spawn(child.stderr.take().expect("stderr"));
         let input = pty.writer();
@@ -726,5 +743,368 @@ fn pressing_the_prefix_twice_sends_the_literal_prefix_byte() {
     run.send(&[DETACH]);
     let status = run.wait_exit(secs(5)).expect("detach");
     assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+/// Every pane address in a workspace document, in document order.
+fn doc_addresses(doc: &Value) -> Vec<String> {
+    fn leaves(layout: &Value, out: &mut Vec<String>) {
+        if let Some(leaf) = layout.get("leaf") {
+            if let Some(address) = leaf.get("address").and_then(Value::as_str) {
+                out.push(address.to_owned());
+            }
+            return;
+        }
+        if let Some(children) = layout.get("children").and_then(Value::as_array) {
+            for child in children {
+                if let Some(layout) = child.get("layout") {
+                    leaves(layout, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for space in doc["spaces"].as_array().into_iter().flatten() {
+        for tab in space["tabs"].as_array().into_iter().flatten() {
+            leaves(&tab["layout"], &mut out);
+        }
+    }
+    out
+}
+
+/// A restart restores the document's layout and titles, adopts the same
+/// terminals without starting new ones, and applies the local focus and zoom.
+#[test]
+fn a_restart_restores_layout_titles_zoom_and_focus() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn(&session, 80, 24);
+    wait_addresses(&session, 1, secs(10));
+    run.command(b'v');
+    let known = wait_addresses(&session, 2, secs(10));
+    let (left, right) = (&known[0], &known[1]);
+    session.hc_json(&["send", left, "printf '\\033]2;LEFT-ONE\\007'"]);
+    session.hc_json(&["send", right, "printf '\\033]2;RIGHT-TWO\\007'"]);
+    assert!(
+        run.wait_screen(secs(10), |screen| {
+            screen.contains("LEFT-ONE") && screen.contains("RIGHT-TWO")
+        }),
+        "titles were not drawn; screen={:?}",
+        run.rendered()
+    );
+
+    // Focus and zoom the left pane: both are local view, saved on detach.
+    run.command(b'h');
+    run.command(b'z');
+    assert!(
+        run.wait_screen(secs(5), |screen| {
+            screen.contains("LEFT-ONE") && !screen.contains("RIGHT-TWO")
+        }),
+        "zoom did not hide the right pane; screen={:?}",
+        run.rendered()
+    );
+    let before = session.doc("herdr-terminal");
+    assert_eq!(
+        doc_addresses(&before),
+        known,
+        "the document names both panes; doc={before}"
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    assert_eq!(
+        addresses(&session),
+        known,
+        "detaching must leave both programs running"
+    );
+    assert!(
+        session.view_file("default").is_file(),
+        "the local view was not saved"
+    );
+
+    // A fresh screen restores the document and its own view: same terminals,
+    // no new ones, the left pane zoomed and focused.
+    let mut run = Run::spawn(&session, 80, 24);
+    assert!(
+        run.wait_screen(secs(10), |screen| {
+            screen.contains("LEFT-ONE") && !screen.contains("RIGHT-TWO")
+        }),
+        "the restored view did not keep the zoom; screen={:?} stderr={:?}",
+        run.rendered(),
+        run.errors()
+    );
+    assert_eq!(
+        addresses(&session),
+        known,
+        "restoring must not start terminals"
+    );
+    assert_eq!(
+        doc_addresses(&session.doc("herdr-terminal")),
+        known,
+        "a clean restore must not change the document"
+    );
+
+    run.command(b'z');
+    assert!(
+        run.wait_text("RIGHT-TWO", secs(5)),
+        "unzooming must show the restored right pane; screen={:?}",
+        run.rendered()
+    );
+    run.title("RESTORED-FOCUS");
+    assert!(
+        wait_title(&session, left, "RESTORED-FOCUS", secs(10)),
+        "the restored focus must reach the left pane; titles={:?}",
+        known
+            .iter()
+            .map(|address| (address, title_of(&session, address)))
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(title_of(&session, right), "RESTORED-FOCUS");
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach after restore");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    assert_eq!(addresses(&session), known);
+    assert_eq!(
+        doc_addresses(&session.doc("herdr-terminal")),
+        known,
+        "detaching must leave the document intact"
+    );
+    cleanup_all(&session);
+}
+
+/// Two screens share one document: a change on one is applied on the other,
+/// while focus/zoom/active tab stay per screen and nothing is duplicated.
+#[test]
+fn two_screens_share_the_layout_and_keep_their_own_view() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut first = Run::spawn_as(&session, 80, 24, "one");
+    wait_addresses(&session, 1, secs(10));
+    first.command(b'v');
+    let known = wait_addresses(&session, 2, secs(10));
+    let (left, right) = (&known[0], &known[1]);
+    session.hc_json(&["send", left, "printf '\\033]2;SCREEN-ONE-A\\007'"]);
+    session.hc_json(&["send", right, "printf '\\033]2;SCREEN-ONE-B\\007'"]);
+    assert!(
+        first.wait_screen(secs(10), |screen| {
+            screen.contains("SCREEN-ONE-A") && screen.contains("SCREEN-ONE-B")
+        }),
+        "the first screen's panes were not drawn; screen={:?}",
+        first.rendered()
+    );
+
+    // The second screen adopts the same two terminals.
+    let mut second = Run::spawn_as(&session, 80, 24, "two");
+    assert!(
+        second.wait_screen(secs(10), |screen| {
+            screen.contains("SCREEN-ONE-A") && screen.contains("SCREEN-ONE-B")
+        }),
+        "the second screen did not restore the shared layout; screen={:?} stderr={:?}",
+        second.rendered(),
+        second.errors()
+    );
+    assert_eq!(
+        addresses(&session),
+        known,
+        "opening a second screen must not start terminals"
+    );
+
+    // A new tab on the second screen reaches the first through the document.
+    second.command(b'c');
+    let three = wait_addresses(&session, 3, secs(10));
+    let added = three
+        .iter()
+        .find(|address| !known.contains(address))
+        .expect("the new tab's terminal")
+        .clone();
+    assert!(
+        first.wait_screen(secs(10), |screen| {
+            screen
+                .lines()
+                .next()
+                .is_some_and(|bar| bar.contains("tab 2"))
+        }),
+        "the doc change did not reach the first screen; screen={:?}",
+        first.rendered()
+    );
+    assert_eq!(
+        addresses(&session),
+        three,
+        "the first screen must not start a duplicate"
+    );
+
+    // The first screen can visit the shared tab and type into its terminal.
+    first.command(b'2');
+    assert!(
+        first.wait_screen(secs(10), |screen| screen
+            .lines()
+            .next()
+            .is_some_and(|bar| { bar.contains("tab 2") })),
+        "the first screen did not switch to the shared tab; screen={:?}",
+        first.rendered()
+    );
+    first.title("FROM-SCREEN-ONE");
+    assert!(
+        wait_title(&session, &added, "FROM-SCREEN-ONE", secs(10)),
+        "the first screen did not attach the tab added by the other; title={:?}",
+        title_of(&session, &added)
+    );
+
+    // Each screen writes its own local view; the shared document has all
+    // three panes and no view state.
+    second.send(&[DETACH]);
+    let status = second.wait_exit(secs(5)).expect("detach second screen");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", second.errors());
+    first.send(&[DETACH]);
+    let status = first.wait_exit(secs(5)).expect("detach first screen");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", first.errors());
+    assert!(
+        session.view_file("one").is_file() && session.view_file("two").is_file(),
+        "each screen keeps its own local view"
+    );
+    let doc = session.doc("herdr-terminal");
+    assert_eq!(
+        doc_addresses(&doc),
+        three,
+        "the document keeps every pane; doc={doc}"
+    );
+    assert!(
+        !doc.to_string().contains("active_space"),
+        "the shared document must not hold the local view; doc={doc}"
+    );
+    assert_eq!(
+        addresses(&session),
+        three,
+        "detaching both screens leaves every program running"
+    );
+    cleanup_all(&session);
+}
+
+/// An explicit PROGRAM on a restored workspace runs in a new tab; the
+/// documented panes are adopted, never duplicated.
+#[test]
+fn an_explicit_program_starts_a_new_tab_after_restore() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn(&session, 80, 24);
+    wait_addresses(&session, 1, secs(10));
+    run.command(b'v');
+    let known = wait_addresses(&session, 2, secs(10));
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    assert_eq!(addresses(&session), known);
+
+    let mut run = Run::spawn_with(
+        &session,
+        80,
+        24,
+        &["--", "sh", "-c", "printf 'PROGRAM-%s\\n' OK; sleep 30"],
+    );
+    assert!(
+        run.wait_text("PROGRAM-OK", secs(10)),
+        "the explicit program did not run; screen={:?} stderr={:?}",
+        run.rendered(),
+        run.errors()
+    );
+    let three = wait_addresses(&session, 3, secs(10));
+    assert!(
+        known.iter().all(|address| three.contains(address)),
+        "the restored terminals must survive; before={known:?} after={three:?}"
+    );
+    let added: Vec<&String> = three
+        .iter()
+        .filter(|address| !known.contains(address))
+        .collect();
+    assert_eq!(added.len(), 1, "exactly one new terminal: {three:?}");
+    let added = added[0];
+    assert_ne!(
+        label(&session, added, "herdr.terminal.tab"),
+        label(&session, &known[0], "herdr.terminal.tab"),
+        "the program must run in a tab of its own"
+    );
+    let doc = session.doc("herdr-terminal");
+    assert_eq!(doc_addresses(&doc), three, "doc={doc}");
+    assert_eq!(
+        doc["spaces"][0]["tabs"].as_array().map(Vec::len),
+        Some(2),
+        "the document must have the restored tab and the program's tab; doc={doc}"
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    assert_eq!(addresses(&session), three);
+    assert_eq!(doc_addresses(&session.doc("herdr-terminal")), three);
+    cleanup_all(&session);
+}
+
+/// A document deleted by another client while the programs run is rebuilt
+/// from the terminals' labels on the next start: same terminals, no new
+/// shell, and one recreated document at the retained version.
+#[test]
+fn a_deleted_document_is_rebuilt_from_live_labeled_terminals() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn(&session, 80, 24);
+    wait_addresses(&session, 1, secs(10));
+    run.command(b'v');
+    let known = wait_addresses(&session, 2, secs(10));
+    assert!(
+        wait_until(secs(5), || doc_addresses(&session.doc("herdr-terminal"))
+            == known),
+        "the document must name both panes; doc={:?}",
+        session.doc("herdr-terminal")
+    );
+    let (_, version) = session.doc_with_version("herdr-terminal");
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    assert_eq!(addresses(&session), known);
+
+    // Another client deletes the document; core keeps its version.
+    let deleted = session.set_doc("herdr-terminal", &Value::Null, version);
+    assert_eq!(deleted, version + 1, "the delete bumps the version");
+    let (value, retained) = session.doc_with_version("herdr-terminal");
+    assert!(value.is_null(), "the document is gone; value={value}");
+    assert_eq!(retained, deleted);
+
+    let mut run = Run::spawn(&session, 80, 24);
+    assert!(
+        wait_until(secs(10), || doc_addresses(&session.doc("herdr-terminal"))
+            == known),
+        "the deleted document was not rebuilt from labels; doc={:?}",
+        session.doc("herdr-terminal")
+    );
+    assert_eq!(
+        addresses(&session),
+        known,
+        "recovery must not start a replacement shell"
+    );
+    let (doc, recreated) = session.doc_with_version("herdr-terminal");
+    assert_eq!(
+        recreated,
+        retained + 1,
+        "the document is recreated once at the retained version"
+    );
+    assert_eq!(doc_addresses(&doc), known);
+    assert_eq!(
+        doc["spaces"][0]["tabs"][0]["layout"]["children"][0]["layout"]["leaf"]["labels"]["herdr.client"],
+        "herdr-terminal",
+        "the recreated panes keep their labels; doc={doc}"
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach after recovery");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    assert_eq!(addresses(&session), known);
+    assert_eq!(
+        doc_addresses(&session.doc("herdr-terminal")),
+        known,
+        "detaching leaves the recreated document intact"
+    );
     cleanup_all(&session);
 }

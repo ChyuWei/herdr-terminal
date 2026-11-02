@@ -122,6 +122,12 @@ impl Screen<'_> {
             link.last_facts = None;
             link.needs_facts = false;
         }
+        // Read the shared document before reattaching: a change made by
+        // another screen while this one was away must not be lost.
+        self.refresh_after_reconnect()?;
+        if self.reconn.is_some() {
+            return Ok(true);
+        }
         self.reconcile_snapshot();
         if self.workspace.pane_count() > 0 {
             self.ui.message = Some("reconnected to core".into());

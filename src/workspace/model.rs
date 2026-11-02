@@ -1,9 +1,10 @@
 //! The pure workspace: spaces, tabs, panes and their split layout.
 //!
-//! This module has no IO and no clock. It owns the stable ids M4 will persist,
-//! the layout tree, focus and zoom, and the rules for starting and closing
-//! panes. The screen runtime turns the model's effects into `terminal.run`,
-//! `terminal.kill` and attach streams.
+//! This module has no IO and no clock. It owns the stable ids, the layout
+//! tree, focus and zoom, the rules for starting and closing panes, the shared
+//! document (capture, restore, merge) and the per-screen local view. The screen
+//! runtime turns the model's effects into `terminal.run`, `terminal.kill`,
+//! attach streams and document writes.
 //!
 //! # Close, keep and kill
 //!
@@ -35,6 +36,18 @@ use super::geometry;
 use ratatui::layout::Rect;
 use std::collections::BTreeMap;
 use std::fmt;
+
+mod doc;
+mod ids;
+mod view;
+
+pub use doc::{
+    CLIENT_LABEL, CLIENT_NAME, Conflict, DOC_NAME, DocChild, DocError, DocLayout, DocPane,
+    DocSpace, DocTab, MergeResult, SharedDoc, TerminalInfo, merge, pane_addresses, pane_ids,
+    recover_orphans, restore,
+};
+pub use ids::IdAllocator;
+pub use view::{LocalView, TabView};
 
 /// A stable workspace id. Ids are never reused, so a persisted layout cannot
 /// point at a different object after a restart.
@@ -180,6 +193,8 @@ pub struct Pane {
     pub address: String,
     /// The display name shown when core has no title; the address at start.
     pub name: String,
+    /// The labels the terminal carries in core, including the pane id label.
+    pub labels: BTreeMap<String, String>,
     /// The terminal title reported by core (OSC 0/2).
     pub title: String,
     /// The OSC 7501 status word reported by core, if any.
@@ -259,6 +274,8 @@ impl Space {
 pub struct StartRequest {
     pub space: SpaceId,
     pub tab: TabId,
+    /// The id reserved for the new pane, sent in its label before `run`.
+    pub pane: PaneId,
     pub placement: Placement,
     pub new_space: bool,
     pub new_tab: bool,
@@ -294,6 +311,7 @@ impl StartRequest {
             ("herdr.client".to_owned(), "herdr-terminal".to_owned()),
             ("herdr.terminal.space".to_owned(), self.space.0.to_string()),
             ("herdr.terminal.tab".to_owned(), self.tab.0.to_string()),
+            ("herdr.terminal.pane".to_owned(), self.pane.0.to_string()),
         ])
     }
 }
@@ -353,7 +371,7 @@ pub struct Workspace {
     spaces: Vec<Space>,
     active: SpaceId,
     panes: BTreeMap<PaneId, Pane>,
-    next_id: u64,
+    ids: IdAllocator,
     next_space_name: u32,
     next_tab_name: u32,
 }
@@ -365,18 +383,36 @@ impl Default for Workspace {
 }
 
 impl Workspace {
-    /// A workspace with one empty space and one empty tab.
+    /// A workspace with one empty space and one empty tab, for the default
+    /// screen.
     pub fn new() -> Workspace {
+        Workspace::for_screen("default")
+    }
+
+    /// A workspace with one empty space and one empty tab whose ids belong to
+    /// `screen`'s namespace, so two screens on one core cannot collide.
+    pub fn for_screen(screen: &str) -> Workspace {
         let mut workspace = Workspace {
             spaces: Vec::new(),
             active: SpaceId(0),
             panes: BTreeMap::new(),
-            next_id: 1,
+            ids: IdAllocator::new(screen),
             next_space_name: 1,
             next_tab_name: 1,
         };
         workspace.add_empty_space();
         workspace
+    }
+
+    /// The allocator, for a rebuild that must keep every id ever used.
+    pub fn allocator(&self) -> &IdAllocator {
+        &self.ids
+    }
+
+    /// The next generated space and tab numbers, so a rebuild can keep them
+    /// monotonic.
+    pub fn name_counters(&self) -> (u32, u32) {
+        (self.next_space_name, self.next_tab_name)
     }
 
     // --- reading ----------------------------------------------------------
@@ -472,12 +508,14 @@ impl Workspace {
     /// changed until [`Workspace::insert_terminal`] succeeds; a failed
     /// `terminal.run` leaves no empty tab behind.
     pub fn start_request(&mut self, kind: StartKind) -> StartRequest {
+        let pane = PaneId(self.ids.alloc());
         match kind {
             StartKind::Initial => {
                 let (space, tab) = self.active_ids();
                 StartRequest {
                     space,
                     tab,
+                    pane,
                     placement: Placement::Only,
                     new_space: false,
                     new_tab: false,
@@ -485,14 +523,16 @@ impl Workspace {
             }
             StartKind::Tab => StartRequest {
                 space: self.active_space_id(),
-                tab: TabId(self.reserve()),
+                tab: TabId(self.ids.alloc()),
+                pane,
                 placement: Placement::Only,
                 new_space: false,
                 new_tab: true,
             },
             StartKind::Space => StartRequest {
-                space: SpaceId(self.reserve()),
-                tab: TabId(self.reserve()),
+                space: SpaceId(self.ids.alloc()),
+                tab: TabId(self.ids.alloc()),
+                pane,
                 placement: Placement::Only,
                 new_space: true,
                 new_tab: true,
@@ -506,6 +546,7 @@ impl Workspace {
                 StartRequest {
                     space,
                     tab,
+                    pane,
                     placement,
                     new_space: false,
                     new_tab: false,
@@ -523,7 +564,8 @@ impl Workspace {
         address: String,
         name: String,
     ) -> PaneId {
-        let pane_id = PaneId(self.reserve());
+        let pane_id = request.pane;
+        self.ids.mark(pane_id.0);
         if !self.spaces.iter().any(|space| space.id == request.space) {
             let space_name = self.space_name();
             let tab_name = self.tab_name();
@@ -562,6 +604,7 @@ impl Workspace {
                 id: pane_id,
                 address,
                 name,
+                labels: request.labels(),
                 title: String::new(),
                 status: None,
                 owned: true,
@@ -876,12 +919,6 @@ impl Workspace {
 
     // --- internals --------------------------------------------------------
 
-    fn reserve(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
     fn active_ids(&self) -> (SpaceId, TabId) {
         let space = self.active_space();
         let tab = space
@@ -922,8 +959,8 @@ impl Workspace {
     }
 
     fn add_empty_space(&mut self) {
-        let space_id = SpaceId(self.reserve());
-        let tab_id = TabId(self.reserve());
+        let space_id = SpaceId(self.ids.alloc());
+        let tab_id = TabId(self.ids.alloc());
         let name = self.space_name();
         let tab_name = self.tab_name();
         self.spaces.push(Space {

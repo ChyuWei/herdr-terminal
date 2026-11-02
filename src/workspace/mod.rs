@@ -1,34 +1,36 @@
-//! The M3 workspace: spaces, tabs and panes over one core connection.
+//! The workspace: spaces, tabs and panes over one core connection, persisted
+//! in the `herdr-terminal` core document and restored on the next start.
 //!
-//! The pure layers are [`model`] (spaces, tabs, layouts, stable pane ids and
-//! labels), [`geometry`] (pane rectangles, minimums, hit testing),
-//! [`commands`] (semantic actions with effects), [`keys`] (the prefix key
-//! map) and [`state`] (help, rename prompt, message, connection). [`ui`]
-//! composes a frame from them; [`runtime`] performs all IO: one framed
-//! connection, one event subscription, one attach stream and one VT per pane.
+//! The pure layers are [`model`] (spaces, tabs, layouts, stable ids, labels,
+//! the shared document and the local view), [`geometry`] (pane rectangles,
+//! minimums, hit testing), [`commands`] (semantic actions with effects),
+//! [`keys`] (the prefix key map) and [`state`] (help, rename prompt, message,
+//! connection). [`ui`] composes a frame from them; [`runtime`] performs all
+//! IO: one framed connection, one event subscription, one attach stream and
+//! one VT per pane.
 //!
-//! `ht` opens a workspace with one pane. New panes are core terminals started
-//! with `keep: true`, `rm: false` and HerdR Terminal labels. Ctrl-] and
-//! `prefix q` detach every pane, leaving the programs running and their
-//! records intact; a later workspace does not rediscover them (M4 owns
-//! persistence and restore).
+//! `ht` opens a workspace by reading (or claiming) the shared document,
+//! adopting the terminals it names, and applying the per-screen local view.
+//! New panes are core terminals started with `keep: true`, `rm: false` and
+//! HerdR Terminal labels. Ctrl-] and `prefix q` detach every pane, leaving the
+//! programs and the document intact.
 
 pub mod commands;
 pub mod geometry;
 pub mod keys;
+mod local;
 pub mod model;
 mod runtime;
+mod startup;
 pub mod state;
+mod sync;
 pub mod ui;
 
-use crate::core::{CoreClient, Result, RunOptions};
-use crate::model::Model;
-use crate::session::{self, Session};
+use crate::core::Result;
+use crate::session;
 use crate::tui::ScreenGuard;
-use model::{StartKind, Workspace};
-use runtime::{Boot, Finish, Screen};
+use runtime::{Finish, Screen};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -41,48 +43,43 @@ pub struct Options {
 }
 
 /// Opens the workspace and runs it until detach. Returns 0 when the person
-/// detaches; programs keep running.
+/// detaches; programs keep running and the document stays.
 pub fn run(options: Options) -> Result<i32> {
     crate::tui::require_tty()?;
     let size = crate::tui::viewport(options.cols, options.rows);
 
-    let client = Arc::new(CoreClient::connect(options.hc.as_deref())?);
-    let events = client.subscribe()?;
-    let model = Model::from_snapshot(events.snapshot());
-
-    // The first pane is started before the alternate screen, so a failure is
-    // a plain error message rather than a broken TUI. Its labels reserve the
-    // workspace and tab ids that the model uses once the run succeeds.
-    let mut workspace = Workspace::new();
-    let request = workspace.start_request(StartKind::Initial);
-    let run = RunOptions {
-        argv: options.argv.clone(),
-        name: Some(session::start_name()),
-        labels: request.labels(),
-        keep: true,
-        rm: false,
-        ..RunOptions::default()
-    };
-    let mut session = Session::start(client.clone(), &run)?;
-    let address = session.address().to_owned();
-    let pane = workspace.insert_terminal(&request, address.clone(), address);
-
+    // Restore or claim the shared document before the alternate screen, so a
+    // failure is a plain error message rather than a broken TUI.
+    let mut opened = startup::open(&options)?;
+    let claim = opened.claim.take();
     let mut guard = match ScreenGuard::enter() {
         Ok(guard) => guard,
         Err(error) => {
-            let _ = session.cleanup();
+            // The sessions drop with Boot: owned terminals are ended, adopted
+            // ones only detached. A claim this screen created is removed.
+            drop(opened.boot);
+            if let Some(claim) = claim
+                && let Some(warning) = claim.rollback()
+            {
+                eprintln!("ht: warning: {warning}");
+            }
             return Err(error);
         }
     };
-    let boot = Boot {
-        client,
-        events,
-        model,
-        workspace,
-        pane,
-        session,
+    let screen = match Screen::new(size, &options, &mut guard, opened.boot) {
+        Ok(screen) => screen,
+        Err(error) => {
+            if let Some(claim) = claim
+                && let Some(warning) = claim.rollback()
+            {
+                eprintln!("ht: warning: {warning}");
+            }
+            return Err(error);
+        }
     };
-    let screen = Screen::new(size, &options, &mut guard, boot)?;
+    // The document is now owned by the running screen; a normal detach keeps
+    // it, and the runtime flushes any last change before returning.
+    drop(claim);
     end_sessions(screen.run()).map(|_| 0)
 }
 

@@ -283,6 +283,9 @@ impl Screen<'_> {
         let session = match Session::start(self.client.clone(), &run) {
             Ok(session) => session,
             Err(error) if session::is_lost(&error) => {
+                // The terminal may exist under this pane id; never let orphan
+                // recovery adopt it before the pending start is resolved.
+                self.seen.insert(request.pane);
                 self.pending = Some(PendingStart { request, name });
                 self.begin_reconnect();
                 return Ok(());
@@ -302,6 +305,7 @@ impl Screen<'_> {
         let pane = self
             .workspace
             .insert_terminal(&request, address.clone(), address);
+        self.seen.insert(pane);
         if let Err(error) = self.add_link(pane, session) {
             // The session is cleaned up as it drops; do not leave a pane in
             // the model with no link behind it.

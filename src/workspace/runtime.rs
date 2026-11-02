@@ -19,10 +19,13 @@ mod events;
 mod input;
 mod panes;
 mod reconnect;
+mod sync;
 
 use super::geometry;
+use super::local::ViewStore;
 use super::model::{PaneId, StartRequest, Workspace};
 use super::state::UiState;
+use super::sync::DocState;
 use super::ui;
 use crate::core::{CoreClient, Error, EventStream, Result, StreamItem};
 use crate::model::Model;
@@ -33,7 +36,7 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::KeyCode;
 use crossterm::execute;
 use ratatui::layout::Rect;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,15 +58,18 @@ const ATTACH_RETRY: Duration = Duration::from_millis(500);
 const HIDDEN_COLS: u16 = crate::screen::DEFAULT_COLS;
 const HIDDEN_ROWS: u16 = crate::screen::DEFAULT_ROWS;
 
-/// Everything needed to enter the loop: the connection, the pure model, and
-/// the workspace with its first terminal already started.
+/// Everything needed to enter the loop: the connection, the pure model, the
+/// restored workspace and its adopted sessions, and the document/view state.
 pub(super) struct Boot {
     pub client: Arc<CoreClient>,
     pub events: EventStream,
     pub model: Model,
     pub workspace: Workspace,
-    pub pane: PaneId,
-    pub session: Session,
+    pub sessions: Vec<(PaneId, Session)>,
+    pub doc: DocState,
+    pub view: ViewStore,
+    pub seen: BTreeSet<PaneId>,
+    pub notice: Option<String>,
 }
 
 /// How the loop ended, and every session it was managing.
@@ -118,6 +124,13 @@ pub(super) struct Screen<'a> {
     model: Model,
     workspace: Workspace,
     links: BTreeMap<PaneId, Link>,
+    /// The shared document's base, version and CAS state.
+    doc: DocState,
+    /// The per-screen focus/zoom file.
+    view: ViewStore,
+    /// Every pane id this screen has seen; recovered orphans never resurrect
+    /// a pane the person closed or another screen removed.
+    seen: BTreeSet<PaneId>,
     /// A start interrupted by the connection loss; resolved after reconnect.
     pending: Option<PendingStart>,
     ui: UiState,
@@ -143,17 +156,35 @@ impl<'a> Screen<'a> {
         boot: Boot,
     ) -> Result<Screen<'a>> {
         let terminal = tui::terminal()?;
+        let Boot {
+            client,
+            events,
+            model,
+            workspace,
+            sessions,
+            doc,
+            view,
+            seen,
+            notice,
+        } = boot;
+        let ui = UiState {
+            message: notice,
+            ..UiState::default()
+        };
         let mut screen = Screen {
             size,
             hc: options.hc.clone(),
             verbose: options.verbose,
-            client: boot.client,
-            events: boot.events,
-            model: boot.model,
-            workspace: boot.workspace,
+            client,
+            events,
+            model,
+            workspace,
             links: BTreeMap::new(),
+            doc,
+            view,
+            seen,
             pending: None,
-            ui: UiState::default(),
+            ui,
             terminal,
             guard,
             reconn: None,
@@ -166,7 +197,11 @@ impl<'a> Screen<'a> {
             swallow: None,
             detach: false,
         };
-        screen.add_link(boot.pane, boot.session)?;
+        let workspace_panes: Vec<PaneId> = screen.workspace.panes().map(|pane| pane.id).collect();
+        screen.seen.extend(workspace_panes);
+        for (pane, session) in sessions {
+            screen.add_link(pane, session)?;
+        }
         Ok(screen)
     }
 
@@ -174,6 +209,14 @@ impl<'a> Screen<'a> {
     /// the caller can detach, leave them alone, or clean up.
     pub(super) fn run(mut self) -> Finish {
         let result = self.play();
+        if self.reconn.is_none() {
+            if let Some(error) = self.view.save_now(&self.workspace) {
+                eprintln!("ht: warning: {error}");
+            }
+            if let Some(error) = self.flush_document() {
+                eprintln!("ht: warning: {error}");
+            }
+        }
         let reconnecting = self.reconn.is_some();
         let sessions = std::mem::take(&mut self.links)
             .into_values()
@@ -228,6 +271,7 @@ impl<'a> Screen<'a> {
         }
         self.poll_input(had_data)?;
         self.sync_mouse()?;
+        self.sync_workspace()?;
         Ok(())
     }
 

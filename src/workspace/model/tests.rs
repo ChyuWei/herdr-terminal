@@ -252,6 +252,7 @@ fn start_requests_reserve_unique_ids_and_write_our_labels() {
     assert_eq!(labels["herdr.client"], "herdr-terminal");
     assert_eq!(labels["herdr.terminal.space"], tab.space.0.to_string());
     assert_eq!(labels["herdr.terminal.tab"], tab.tab.0.to_string());
+    assert_eq!(labels["herdr.terminal.pane"], tab.pane.0.to_string());
     assert!(!labels.contains_key("herdr.space"));
     assert!(!labels.contains_key("herdr.tab"));
     let second = workspace.insert_terminal(&tab, "t2".into(), "t2".into());
@@ -302,6 +303,7 @@ fn a_split_with_a_stale_target_still_inserts_the_pane() {
     let request = StartRequest {
         space: workspace.active_space_id(),
         tab: workspace.active_tab_id().expect("tab"),
+        pane: PaneId(9998),
         placement: Placement::Split {
             axis: Axis::Columns,
             near: PaneId(9999),
@@ -323,6 +325,7 @@ fn close_actions_follow_ownership_and_the_keep_flag() {
         id: PaneId(1),
         address: "t1".into(),
         name: "t1".into(),
+        labels: BTreeMap::new(),
         title: String::new(),
         status: None,
         owned: true,

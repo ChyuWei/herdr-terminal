@@ -18,13 +18,21 @@ usage:
   ht --help
 
 `ht` opens a workspace: a tab bar, a status bar and panes of terminals. It
-starts PROGRAM (or a shell) in the first pane. Prefix Ctrl-b, then:
+restores the spaces, tabs, panes and programs saved in core's `herdr-terminal`
+document; a new workspace starts a shell in the first pane. A pane the event
+snapshot has not reported yet is checked with `terminal.get`, so a live pane is
+not mistaken for a missing one. If another client deleted the document while
+programs were running, their labels rebuild it and no new shell is started. An
+explicit PROGRAM runs in a new tab, so restored panes are never replaced.
+Prefix Ctrl-b, then:
   c new tab   C new space   n/p tab   N/P space   1..9 select tab
   v split left/right   s split top/bottom   h/j/k/l focus   H/J/K/L move
   z zoom   x close   e keep and close   X kill and close
   , rename tab   . rename space   ? help
-Ctrl-] (or prefix q) detaches: every program keeps running. It needs a
-terminal on stdin and stdout.
+Ctrl-] (or prefix q) detaches: every program keeps running and the document
+stays. Focus, zoom and the active tab are local per screen, named by
+HERDR_TERMINAL_SCREEN (default `default`). It needs a terminal on stdin and
+stdout.
 
 `ht screen` is the single-pane screen. It draws one terminal's cells, colors,
 cursor and wide characters; keys and the mouse go to it, including Ctrl-C.

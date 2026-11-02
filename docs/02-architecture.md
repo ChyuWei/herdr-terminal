@@ -119,16 +119,43 @@ The TUI owns the screen. It does not ask core for frames or scrape `terminal.rea
 
 ### 4.5 State and persistence
 
-**Shared workspace** is stored in a document named `herdr-terminal`:
+**Shared workspace** is stored in a document named `herdr-terminal`, schema
+version 1:
 
-- one document per core, with machine-qualified ids for remote spaces;
-- `version` field for schema migration;
-- spaces: id, name, folder, machine;
-- tabs: id, name, layout tree;
-- layout leaves reference terminal addresses and labels; no local focus/zoom/selection;
-- writes use `doc.get`/`doc.set` with optimistic concurrency; a `conflict` means re-read and merge.
+```json
+{"version": 1,
+ "spaces": [{"id": "4294967297", "name": "space 1", "folder": "",
+             "tabs": [{"id": "4294967298", "name": "tab 1",
+                       "layout": {"leaf": {"id": "4294967299", "address": "t7",
+                                           "name": "t7", "labels": {}}}}]}]}
+```
 
-**Local view** stays on the machine running the TUI: focus, zoom, selection, scroll position, sidebar state, theme override. It is not shared across screens.
+- Ids are decimal strings (u64), never reused. The default screen allocates in
+  namespace 1; every other screen id gets an FNV-1a-32 namespace, so two
+  screens cannot mint the same id.
+- A layout is `{leaf: …}` or
+  `{axis: "columns"|"rows", children: [{size, layout}]}`; a tab layout of
+  `null` is the empty tab.
+- Leaves reference terminal addresses and the labels the terminal carries.
+  Focus, zoom, history and the active space/tab are deliberately absent.
+- Writes are compare-and-set via `doc.get`/`doc.set`. A `conflict` re-reads,
+  merges and retries: the merge is per space and per tab. One-sided changes
+  win, a deletion against unchanged content applies, additions from both
+  screens are kept. When both screens changed the same tab the local tab wins
+  and the conflict is reported; the other screen's terminal is then recovered
+  from its labels instead of being lost.
+- Subscribers read the document after subscribing, on a `doc` event, after
+  `missed`, and after reconnecting. Documents are not in snapshots and changes
+  while disconnected are not replayed.
+- Writes are bounded (a 2 s call timeout, at most three CAS rounds per loop);
+  a failure leaves the document dirty and retries, it never spins the UI.
+
+**Local view** is per screen and stays on the machine:
+`$XDG_STATE_HOME/herdr-terminal/view-<screen>.json` (falling back to
+`$HOME/.local/state`). It holds the active space/tab, focus, zoom and focus
+history. The screen id comes from `HERDR_TERMINAL_SCREEN` (1–64 characters of
+`[A-Za-z0-9._-]`, default `default`). A missing or malformed view is a warning,
+not an error; ids that no longer exist are ignored.
 
 **Labels** identify the TUI's own terminals after a restart:
 
@@ -137,10 +164,25 @@ The TUI owns the screen. It does not ask core for frames or scrape `terminal.rea
 | `herdr.client=herdr-terminal` | Terminal was started by HerdR Terminal |
 | `herdr.terminal.space=<id>` | TUI space id |
 | `herdr.terminal.tab=<id>` | TUI tab id |
+| `herdr.terminal.pane=<id>` | TUI pane id, carried before `terminal.run` returns |
 | `herdr.seen` | Shared cross-client convention; last turn seen |
 | `herdr.pinned` | Shared cross-client convention; pinned in the UI |
 
-Terminals are started with `TERM=xterm-256color`, `COLORTERM=truecolor` and `TERM_PROGRAM=herdr` (the Herdr family marker). On restart, list terminals, match the TUI labels, reattach; never spawn duplicates.
+Terminals are started with `TERM=xterm-256color`, `COLORTERM=truecolor` and
+`TERM_PROGRAM=herdr` (the Herdr family marker). On startup, list terminals,
+match the document's panes by exact address and pane label (falling back to a
+unique pane label when a terminal was rediscovered under a new address),
+reattach them, and never spawn duplicates. An address named by the document
+but missing from the subscription snapshot is looked up with `terminal.get`
+before it may be pruned, so a pane created by another screen just after the
+snapshot is still restored. A pane whose terminal is confirmed gone is pruned
+from the document; the tab stays. A deleted document is rebuilt from the
+labels of live terminals at its retained version instead of being replaced by
+a new shell. An explicitly given PROGRAM starts in a new tab (or the empty
+tab), not in place of a restored pane. Restored and
+recovered panes are workspace-owned for close semantics (`x` ends a non-kept
+program, `e` detaches, `X` kills), while their `Session` is adopted so a local
+startup or fatal error never kills a program this process did not start.
 
 ### 4.6 Core client and lifecycle
 
@@ -150,8 +192,21 @@ Terminals are started with `TERM=xterm-256color`, `COLORTERM=truecolor` and `TER
 2. Connect to the socket or `hc connect`; send `hello {"framed": true}`.
 3. Check generation, version, methods and features; fail with a clear message if a required method is missing.
 4. `events.subscribe`; keep the snapshot.
-5. Read the `herdr-terminal` document; reconcile it with the snapshot and labels.
-6. Attach the visible terminals; start missing shells only when the user asks.
+5. Read the `herdr-terminal` document. If it is absent (version 0), claim an
+   empty one at version 0; a lost claim race re-reads the winner. If it was
+   deleted (value null, retained version > 0), recover the live labeled
+   terminals first, apply the local view, and recreate the document at the
+   retained version without starting a shell. Only when no labeled terminal
+   survives does this screen claim an empty document and run the initial
+   shell, and only if it won that claim.
+6. Reconcile an existing document with the snapshot and labels: the snapshot
+   is not authoritative for addresses the document names, so every such
+   address missing from the snapshot is checked with `terminal.get` first. A
+   live record is adopted and must not be pruned; a `not_found` may be pruned.
+   Recover labeled orphans, apply this screen's local view, and never replace
+   a documented pane. Start a shell only for a document this screen created,
+   a won deleted-document claim with no recovered pane, or an explicit
+   PROGRAM.
 
 **Reconnect**
 
@@ -162,7 +217,9 @@ Terminals are started with `TERM=xterm-256color`, `COLORTERM=truecolor` and `TER
 
 **Shutdown**
 
-- Detach streams (CLOSE), restore the terminal, flush the document; do not stop core unless the user explicitly asks.
+- Detach streams (CLOSE), restore the terminal, flush the document with the
+  same bounded conflict/merge budget as a normal write, and save the local
+  view; do not stop core unless the user explicitly asks.
 
 ## 5. Feature scope
 

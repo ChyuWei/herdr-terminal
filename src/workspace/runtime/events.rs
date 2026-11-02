@@ -7,7 +7,7 @@ use crate::screen::lifecycle::{self, Disposition};
 use crate::session;
 use crate::tui::vt_error;
 use crate::vt::Vt;
-use crate::workspace::model::PaneId;
+use crate::workspace::model::{DOC_NAME, PaneId};
 use serde_json::Value;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
@@ -97,7 +97,28 @@ impl Screen<'_> {
                 self.dirty = true;
             }
             match &notification {
-                Notification::Missed { .. } => self.reconcile_snapshot(),
+                Notification::Missed { .. } => {
+                    // A document change may have been missed too; refetch it
+                    // before trusting the local layout.
+                    self.doc.stale = true;
+                    self.reconcile_snapshot();
+                }
+                Notification::Event {
+                    kind: EventKind::Doc,
+                    machine,
+                    data,
+                    ..
+                } => {
+                    if machine.is_none()
+                        && data.get("name").and_then(Value::as_str) == Some(DOC_NAME)
+                    {
+                        if let Some(version) = data.get("version").and_then(Value::as_u64) {
+                            self.doc.note_event(version);
+                        } else {
+                            self.doc.stale = true;
+                        }
+                    }
+                }
                 Notification::Event { kind, terminal, .. } => {
                     if let Some(address) = terminal {
                         let kind = kind.clone();

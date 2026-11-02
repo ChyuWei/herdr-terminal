@@ -16,7 +16,8 @@
 //! the tests can see what the client sent: whether it detached, removed the
 //! record, killed the program, or started a duplicate terminal.
 
-use serde_json::json;
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -57,6 +58,50 @@ fn run_tests() {
     #[cfg(unix)]
     workspace_reclaims_a_start_whose_run_reply_was_lost();
     #[cfg(unix)]
+    workspace_restores_a_document_without_starting_terminals();
+    #[cfg(unix)]
+    workspace_applies_the_local_view();
+    #[cfg(unix)]
+    workspace_focus_and_zoom_do_not_write_the_document();
+    #[cfg(unix)]
+    workspace_repairs_a_rediscovered_terminal();
+    #[cfg(unix)]
+    workspace_prunes_a_pane_whose_terminal_is_gone();
+    #[cfg(unix)]
+    workspace_keeps_a_pane_missing_from_the_snapshot();
+    #[cfg(unix)]
+    workspace_never_adopts_a_terminal_it_did_not_label();
+    #[cfg(unix)]
+    workspace_claims_a_new_document_and_labels_its_terminal();
+    #[cfg(unix)]
+    workspace_reclaims_a_deleted_document_at_its_version();
+    #[cfg(unix)]
+    workspace_recovers_labeled_terminals_when_the_document_is_deleted();
+    #[cfg(unix)]
+    workspace_losing_the_deleted_document_claim_starts_no_shell();
+    #[cfg(unix)]
+    workspace_recovers_a_labeled_orphan_at_startup();
+    #[cfg(unix)]
+    workspace_ignores_an_unlabeled_orphan_at_startup();
+    #[cfg(unix)]
+    workspace_refetches_after_a_doc_event();
+    #[cfg(unix)]
+    workspace_keeps_local_focus_after_a_doc_event();
+    #[cfg(unix)]
+    workspace_removes_a_pane_deleted_by_another_screen();
+    #[cfg(unix)]
+    workspace_refetches_the_document_after_reconnect();
+    #[cfg(unix)]
+    workspace_refetches_the_document_after_missed();
+    #[cfg(unix)]
+    workspace_recreates_a_deleted_document();
+    #[cfg(unix)]
+    workspace_merges_a_concurrent_change_in_another_space();
+    #[cfg(unix)]
+    workspace_keeps_local_on_a_same_tab_conflict_and_recovers_the_other_pane();
+    #[cfg(unix)]
+    workspace_flushes_a_merged_change_on_detach_after_conflicts();
+    #[cfg(unix)]
     workspace_reattaches_every_pane_after_missed();
     #[cfg(unix)]
     screen_detaches_without_killing_the_program();
@@ -88,13 +133,18 @@ struct FakeScreen {
 #[cfg(unix)]
 impl FakeScreen {
     fn spawn(scratch: &Scratch, scenario: &str, args: &[&str]) -> FakeScreen {
-        Self::spawn_parts(scratch, scenario, &["screen"], args)
+        Self::spawn_parts(scratch, scenario, &["screen"], args, None)
     }
 
     /// `ht` with no subcommand: the default workspace, against the same
     /// scripted core.
     fn spawn_workspace(scratch: &Scratch, scenario: &str) -> FakeScreen {
-        Self::spawn_parts(scratch, scenario, &[], &[])
+        Self::spawn_parts(scratch, scenario, &[], &[], None)
+    }
+
+    /// A second screen on the same core, with its own local view.
+    fn spawn_workspace_as(scratch: &Scratch, scenario: &str, screen: &str) -> FakeScreen {
+        Self::spawn_parts(scratch, scenario, &[], &[], Some(screen))
     }
 
     fn spawn_parts(
@@ -102,11 +152,13 @@ impl FakeScreen {
         scenario: &str,
         leading: &[&str],
         args: &[&str],
+        screen: Option<&str>,
     ) -> FakeScreen {
         let exe = std::env::current_exe().expect("test executable");
         let pty = common::pty::Pty::open(80, 24);
         let (stdin, stdout) = pty.stdio();
-        let mut child = Command::new(HT)
+        let mut command = Command::new(HT);
+        command
             .args(leading)
             .arg("--hc")
             .arg(&exe)
@@ -115,7 +167,11 @@ impl FakeScreen {
             .env("FAKE_SCENARIO", scenario)
             .env("FAKE_LOG", scratch.log())
             .env("HOME", &scratch.dir)
-            .env("XDG_STATE_HOME", scratch.state())
+            .env("XDG_STATE_HOME", scratch.state());
+        if let Some(screen) = screen {
+            command.env("HERDR_TERMINAL_SCREEN", screen);
+        }
+        let mut child = command
             .stdin(stdin)
             .stdout(stdout)
             .stderr(Stdio::piped())
@@ -771,6 +827,1254 @@ fn screen_reconnects_to_the_same_terminal() {
     assert!(!log.iter().any(|entry| entry["call"] == "terminal.rm"));
 }
 
+/// Restores the shared document's spaces, tabs, split layout and panes, and
+/// adopts the named terminals instead of starting new ones. A clean restore
+/// writes nothing, and detaching leaves the document and the programs alone.
+#[cfg(unix)]
+fn workspace_restores_a_document_without_starting_terminals() {
+    let scratch = Scratch::new("doc-restore");
+    scratch.seed_doc(doc_same_tab(), 7);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-restore");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)) && workspace.wait_text("PANE-TWO", secs(10)),
+        "both documented panes must be restored and drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        workspace.rendered().contains("shared") && workspace.rendered().contains("main"),
+        "the space and tab names come from the document; screen={:?}",
+        workspace.rendered()
+    );
+
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "a restored pane must never start a replacement; log={log:?}"
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.get("attached").is_some() && entry["terminal"] == target)
+                .count(),
+            1,
+            "{target} must be attached once; log={log:?}"
+        );
+    }
+    assert_eq!(
+        scratch.doc_version(),
+        7,
+        "an unchanged restore must not write the document"
+    );
+
+    // x on a restored pane ends it like any workspace-owned, non-kept pane,
+    // even though the Session itself is adopted (a local error only detaches).
+    workspace.command(b'x');
+    assert!(
+        common::wait_until(secs(10), || {
+            doc_addresses(&scratch.doc_value()) == vec!["t2".to_owned()]
+        }),
+        "closing a restored pane must update the document; doc={:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        common::wait_until(secs(10), || {
+            scratch.entries().iter().any(|entry| {
+                entry["call"] == "terminal.kill" && entry["params"]["terminal"] == "t1"
+            })
+        }),
+        "closing a restored pane must end its program; log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        common::wait_until(secs(10), || {
+            scratch
+                .entries()
+                .iter()
+                .any(|entry| entry["call"] == "terminal.rm" && entry["params"]["terminal"] == "t1")
+        }),
+        "closing a restored pane must remove its record; log={:?}",
+        scratch.entries()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+    assert!(workspace.pty.is_cooked());
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| {
+            entry["params"]["terminal"] == "t2"
+                && (entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm")
+        }),
+        "detaching must leave the remaining program alone; log={log:?}"
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t2".to_owned()],
+        "detaching must leave the remaining pane in the document"
+    );
+}
+
+/// Focus, zoom and the active tab are local: the second screen opens the tab
+/// its view names, while the shared document is untouched.
+#[cfg(unix)]
+fn workspace_applies_the_local_view() {
+    let scratch = Scratch::new("doc-view");
+    scratch.seed_doc(doc_two_tabs(), 3);
+    scratch.seed_view(
+        "work",
+        json!({
+            "version": 1,
+            "active_space": "1",
+            "active_tabs": {"1": "31"},
+            "tabs": {
+                "30": {"focused": "3", "zoomed": null, "history": ["3"]},
+                "31": {"focused": "4", "zoomed": null, "history": ["4"]},
+            },
+        }),
+    );
+    let mut workspace = FakeScreen::spawn_workspace_as(&scratch, "doc-view", "work");
+
+    assert!(
+        workspace.wait_text("TAB-TWO", secs(10)),
+        "the view's active tab must be shown; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        !workspace.rendered().contains("TAB-ONE"),
+        "a pane in a background tab is not drawn; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.command(b'1');
+    assert!(
+        workspace.wait_text("TAB-ONE", secs(5)),
+        "selecting the first tab shows its pane; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        3,
+        "the local view must not be written to the shared document"
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "the local view must not start terminals"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// Focus and zoom change only the local view: no document write, no version
+/// bump, including the final detach flush.
+#[cfg(unix)]
+fn workspace_focus_and_zoom_do_not_write_the_document() {
+    let scratch = Scratch::new("doc-focus");
+    scratch.seed_doc(doc_same_tab(), 7);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-focus");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)) && workspace.wait_text("PANE-TWO", secs(10)),
+        "both panes must be restored; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.command(b'h');
+    workspace.command(b'z');
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(5))
+            && common::wait_until(secs(5), || !workspace.rendered().contains("PANE-TWO")),
+        "zoom must show only the focused pane; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.command(b'z');
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(5)),
+        "unzooming must show both panes; screen={:?}",
+        workspace.rendered()
+    );
+
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "doc.set"),
+        "focus and zoom must not write the shared document; log={log:?}"
+    );
+    assert_eq!(scratch.doc_version(), 7);
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        7,
+        "the detach flush must not write a view-only change"
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "doc.set"),
+        "no document write for focus or zoom"
+    );
+}
+
+/// A terminal rediscovered under a new address is matched by its unique pane
+/// label; the document is repaired with the new address.
+#[cfg(unix)]
+fn workspace_repairs_a_rediscovered_terminal() {
+    let scratch = Scratch::new("doc-mismatch");
+    scratch.seed_doc(one_tab_doc(&[(3, "t9")]), 2);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-mismatch");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the terminal found by label must be drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            let text = scratch.doc_value().to_string();
+            text.contains("\"t1\"") && !text.contains("\"t9\"")
+        }),
+        "the repaired address must be written back; doc={:?}",
+        scratch.doc_value()
+    );
+    assert_eq!(scratch.doc_version(), 3, "one repaired write");
+    let log = scratch.entries();
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.run"));
+    assert!(
+        log.iter()
+            .any(|entry| entry.get("attached").is_some() && entry["terminal"] == "t1"),
+        "the rediscovered terminal is attached by its current address; log={log:?}"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A pane whose terminal no longer exists is pruned; the tab stays and the
+/// pruned pane is removed from the document.
+#[cfg(unix)]
+fn workspace_prunes_a_pane_whose_terminal_is_gone() {
+    let scratch = Scratch::new("doc-missing");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "t9")]), 2);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-missing");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the live pane must be drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(5), || !scratch.doc_value().to_string().contains("t9")),
+        "the pruned pane must leave the document; doc={:?}",
+        scratch.doc_value()
+    );
+    assert_eq!(scratch.doc_version(), 3, "one repair write");
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned()],
+        "only the live pane remains"
+    );
+    let log = scratch.entries();
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.run"));
+    assert!(
+        log.iter().any(|entry| {
+            entry["call"] == "terminal.get" && entry["params"]["terminal"] == "t9"
+        }),
+        "a missing address must be checked with terminal.get before pruning; log={log:?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|entry| entry.get("attached").is_some() && entry["terminal"] == "t9"),
+        "a missing terminal must not be attached; log={log:?}"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// The document names a terminal that the subscription snapshot predates
+/// (another screen created it just after this screen subscribed). Startup
+/// must check the address with terminal.get, keep the live pane, and never
+/// write a prune over the shared document.
+#[cfg(unix)]
+fn workspace_keeps_a_pane_missing_from_the_snapshot() {
+    let scratch = Scratch::new("doc-stale-snapshot");
+    scratch.seed_doc(doc_same_tab(), 7);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-stale-snapshot");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)) && workspace.wait_text("PANE-TWO", secs(10)),
+        "the pane newer than the snapshot must be restored; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    let log = scratch.entries();
+    assert!(
+        log.iter().any(|entry| {
+            entry["call"] == "terminal.get" && entry["params"]["terminal"] == "t2"
+        }),
+        "the document address absent from the snapshot must be looked up; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "a live documented pane must never be replaced; log={log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|entry| { entry.get("attached").is_some() && entry["terminal"] == "t2" }),
+        "the pane restored from the lookup must be attached; log={log:?}"
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        7,
+        "a clean restore must not prune the pane the snapshot missed; doc={:?}",
+        scratch.doc_value()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned(), "t2".to_owned()]
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A terminal at the same address but without this client's pane label is not
+/// adopted; the pane is pruned rather than claiming a stranger's program.
+#[cfg(unix)]
+fn workspace_never_adopts_a_terminal_it_did_not_label() {
+    let scratch = Scratch::new("doc-foreign");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-foreign");
+
+    assert!(
+        workspace.wait_text("no terminals in this tab", secs(10)),
+        "the foreign terminal was not adopted; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            scratch.doc_value()["spaces"][0]["tabs"][0]["layout"] == json!(null)
+        }),
+        "the pruned pane must leave the document; doc={:?}",
+        scratch.doc_value()
+    );
+    let log = scratch.entries();
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.run"));
+    assert!(
+        !log.iter().any(|entry| entry.get("attached").is_some()),
+        "a foreign terminal must not be attached; log={log:?}"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// With no document, the first screen claims an empty one at version 0, starts
+/// its shell with the pane label, and saves the layout.
+#[cfg(unix)]
+fn workspace_claims_a_new_document_and_labels_its_terminal() {
+    let scratch = Scratch::new("doc-fresh");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-fresh");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the first shell was not started; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1"]),
+        "the claimed document must gain the first pane; doc={:?}",
+        scratch.doc_value()
+    );
+    let run = scratch
+        .entries()
+        .into_iter()
+        .find(|entry| entry["call"] == "terminal.run")
+        .expect("one terminal was started");
+    let label = run["params"]["labels"]["herdr.terminal.pane"]
+        .as_str()
+        .expect("the pane label was sent with terminal.run")
+        .to_owned();
+    assert_eq!(
+        scratch.doc_value()["spaces"][0]["tabs"][0]["layout"]["leaf"]["id"],
+        json!(label),
+        "the document pane id is the label the terminal carries"
+    );
+    assert_eq!(
+        scratch.doc_value()["spaces"][0]["tabs"][0]["layout"]["leaf"]["labels"]["herdr.terminal.pane"],
+        json!(label)
+    );
+    assert_eq!(
+        scratch
+            .entries()
+            .iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .count(),
+        1,
+        "the initial shell must start once"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+    let log = scratch.entries();
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.kill"));
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.rm"));
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned()],
+        "detaching leaves the program and the document intact"
+    );
+}
+
+/// A document deleted at a retained version (for example by a failed claim)
+/// is claimed again at that version instead of being treated as malformed.
+#[cfg(unix)]
+fn workspace_reclaims_a_deleted_document_at_its_version() {
+    let scratch = Scratch::new("doc-deleted-start");
+    scratch.seed_doc(json!(null), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-deleted-start");
+
+    assert!(
+        workspace.wait_text("PAINT", secs(10)),
+        "the first shell was not started; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            doc_addresses(&scratch.doc_value()) == vec!["t1".to_owned()]
+        }),
+        "the reclaimed document must gain the first pane; doc={:?}",
+        scratch.doc_value()
+    );
+    let versions: Vec<u64> = scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["call"] == "doc.set")
+        .filter_map(|entry| entry["params"]["version"].as_u64())
+        .collect();
+    assert_eq!(
+        versions,
+        vec![5, 6],
+        "the claim uses the deleted document's version, then the pane write uses the claim's"
+    );
+    assert_eq!(
+        scratch
+            .entries()
+            .iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .count(),
+        1,
+        "the reclaiming screen starts exactly one shell"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A document deleted at a retained version is rebuilt from the live labeled
+/// terminals: both panes come back, the local view is applied, and no new
+/// shell is started.
+#[cfg(unix)]
+fn workspace_recovers_labeled_terminals_when_the_document_is_deleted() {
+    let scratch = Scratch::new("doc-deleted-recover");
+    scratch.seed_doc(json!(null), 5);
+    scratch.seed_view(
+        "default",
+        json!({
+            "version": 1,
+            "active_space": "1",
+            "active_tabs": {"1": "2"},
+            "tabs": {"2": {"focused": "3", "zoomed": "3", "history": ["3"]}},
+        }),
+    );
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-deleted-recover");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the recovered pane must be drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        !workspace.rendered().contains("PANE-TWO"),
+        "the local view's zoom must hide the other recovered pane; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            doc_addresses(&scratch.doc_value()) == vec!["t1".to_owned(), "t2".to_owned()]
+        }),
+        "the recreated document must contain both recovered panes; doc={:?}",
+        scratch.doc_value()
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        6,
+        "the document is recreated once at the retained version"
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "a recovered terminal must never be replaced by a new shell; log={log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|entry| { entry.get("attached").is_some() && entry["terminal"] == "t1" }),
+        "the recovered pane is attached; log={log:?}"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// When no labeled terminal survives a deleted document, the claim winner
+/// starts the initial shell; a screen that loses the recreate race starts
+/// nothing and restores the winner's empty document.
+#[cfg(unix)]
+fn workspace_losing_the_deleted_document_claim_starts_no_shell() {
+    let scratch = Scratch::new("doc-deleted-claim-lost");
+    scratch.seed_doc(json!(null), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-deleted-claim-lost");
+
+    assert!(
+        workspace.wait_text("no terminals in this tab", secs(10)),
+        "the lost claim must restore the winner's empty document; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        6,
+        "the winner's document is version 6; doc={:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        scratch.doc_value()["spaces"][0]["tabs"][0]["layout"] == json!(null),
+        "the recreated document is the empty one; doc={:?}",
+        scratch.doc_value()
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "a screen that lost the claim must not start a shell; log={log:?}"
+    );
+    let sets: Vec<u64> = log
+        .iter()
+        .filter(|entry| entry["call"] == "doc.set")
+        .filter_map(|entry| entry["params"]["version"].as_u64())
+        .collect();
+    assert_eq!(
+        sets,
+        vec![5],
+        "the loser makes one CAS attempt at the retained version"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A labeled terminal absent from the document is recovered into its own
+/// recovered space and tab at startup, without starting a program.
+#[cfg(unix)]
+fn workspace_recovers_a_labeled_orphan_at_startup() {
+    let scratch = Scratch::new("doc-orphan");
+    scratch.seed_doc(doc_one_pane(), 4);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-orphan");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the documented pane must be drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            doc_addresses(&scratch.doc_value()) == vec!["t1".to_owned(), "t7".to_owned()]
+        }),
+        "the recovered pane must be written to the document; doc={:?}",
+        scratch.doc_value()
+    );
+    // The orphan lands in a recovered space; switch to it to see it.
+    workspace.command(b'N');
+    assert!(
+        workspace.wait_text("ORPHAN-PANE", secs(10)),
+        "the recovered orphan must be drawn in its recovered space; screen={:?}",
+        workspace.rendered()
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "a recovered terminal must never be started; log={log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|entry| { entry.get("attached").is_some() && entry["terminal"] == "t7" }),
+        "the recovered terminal is attached; log={log:?}"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A live terminal without this client's labels is never adopted as an
+/// orphan, even at startup.
+#[cfg(unix)]
+fn workspace_ignores_an_unlabeled_orphan_at_startup() {
+    let scratch = Scratch::new("doc-orphan-invalid");
+    scratch.seed_doc(doc_one_pane(), 4);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-orphan-invalid");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the documented pane must be drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned()],
+        "an unlabeled terminal is not added to the document; doc={:?}",
+        scratch.doc_value()
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        4,
+        "a clean restore of the documented pane writes nothing"
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter()
+            .any(|entry| { entry.get("attached").is_some() && entry["terminal"] == "t9" }),
+        "an unlabeled terminal must not be attached; log={log:?}"
+    );
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.run"));
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A doc event carries no value: the client refetches, adopts the pane the
+/// other screen added and attaches it; nothing is started.
+#[cfg(unix)]
+fn workspace_refetches_after_a_doc_event() {
+    let scratch = Scratch::new("doc-event");
+    scratch.seed_doc(doc_one_pane(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-event");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.send(b"g");
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(10)),
+        "the pane added by the doc event was not adopted; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned(), "t2".to_owned()]
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "a doc event must never start a terminal; log={log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|entry| entry.get("attached").is_some() && entry["terminal"] == "t2"),
+        "the added pane's existing terminal is attached; log={log:?}"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A doc event applies a document from another screen without disturbing
+/// this screen's local view: the focused, zoomed pane stays in front.
+#[cfg(unix)]
+fn workspace_keeps_local_focus_after_a_doc_event() {
+    let scratch = Scratch::new("doc-event-focus");
+    scratch.seed_doc(doc_same_tab(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-event-focus");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)) && workspace.wait_text("PANE-TWO", secs(10)),
+        "both panes must be restored; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.command(b'l');
+    workspace.command(b'z');
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(5))
+            && common::wait_until(secs(5), || !workspace.rendered().contains("PANE-ONE")),
+        "the zoomed right pane must fill the tab; screen={:?}",
+        workspace.rendered()
+    );
+
+    // A key to the focused pane makes another screen add a third pane.
+    workspace.send(b"g");
+    assert!(
+        common::wait_until(secs(10), || {
+            let log = scratch.entries();
+            log.iter()
+                .any(|entry| entry.get("attached").is_some() && entry["terminal"] == "t3")
+        }),
+        "the pane added by the doc event must be adopted; screen={:?} log={:?}",
+        workspace.rendered(),
+        scratch.entries()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned(), "t2".to_owned(), "t3".to_owned()]
+    );
+    assert!(
+        workspace.rendered().contains("PANE-TWO")
+            && !workspace.rendered().contains("PANE-ONE")
+            && !workspace.rendered().contains("SPLIT-PANE"),
+        "the local focus and zoom must survive the doc event; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a doc event must never start a terminal"
+    );
+
+    workspace.command(b'z');
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(5)) && workspace.wait_text("SPLIT-PANE", secs(5)),
+        "unzooming shows the adopted pane; screen={:?}",
+        workspace.rendered()
+    );
+
+    // Closing the focused pane proves focus survived the document change:
+    // the right pane (t2) leaves, not t1 or the adopted t3.
+    workspace.command(b'x');
+    assert!(
+        common::wait_until(secs(10), || {
+            doc_addresses(&scratch.doc_value()) == vec!["t1".to_owned(), "t3".to_owned()]
+        }),
+        "the focused pane must still be t2 after the doc event; doc={:?}",
+        scratch.doc_value()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A pane another screen closed leaves this workspace; its program is only
+/// detached, never killed or removed.
+#[cfg(unix)]
+fn workspace_removes_a_pane_deleted_by_another_screen() {
+    let scratch = Scratch::new("doc-remove");
+    scratch.seed_doc(doc_same_tab(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-remove");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)) && workspace.wait_text("PANE-TWO", secs(10)),
+        "both restored panes were not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.send(b"g");
+    assert!(
+        common::wait_until(secs(10), || !workspace.rendered().contains("PANE-TWO")),
+        "the removed pane must leave the screen; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            doc_addresses(&scratch.doc_value()) == vec!["t1".to_owned()]
+        }),
+        "the document must lose the pane; doc={:?}",
+        scratch.doc_value()
+    );
+    let log = scratch.entries();
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.kill"));
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.rm"));
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// The connection drops, another screen changes the document meanwhile, and
+/// the fresh connection refetches it before reattaching; no duplicate starts.
+#[cfg(unix)]
+fn workspace_refetches_the_document_after_reconnect() {
+    let scratch = Scratch::new("doc-reconnect");
+    scratch.seed_doc(doc_one_pane(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-reconnect");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.send(b"g");
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(25)),
+        "the document changed while away was not applied after reconnect; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    let log = scratch.entries();
+    let generations: Vec<u64> = log
+        .iter()
+        .filter_map(|entry| entry["generation"].as_u64())
+        .collect();
+    assert!(
+        generations.contains(&1) && generations.contains(&2),
+        "the client must reconnect; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "a reconnect must never start a terminal; log={log:?}"
+    );
+    assert!(
+        log.iter()
+            .filter(|entry| entry["call"] == "doc.get")
+            .count()
+            >= 2,
+        "the document is read again after the reconnect; log={log:?}"
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned(), "t2".to_owned()]
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// `missed` also means the document may have changed: the client refetches and
+/// adopts the pane the fresh snapshot and document name.
+#[cfg(unix)]
+fn workspace_refetches_the_document_after_missed() {
+    let scratch = Scratch::new("doc-missed");
+    scratch.seed_doc(doc_one_pane(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-missed");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.send(b"g");
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(10)),
+        "the document was not refetched after missed; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a resnapshot must not start a terminal"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A document deleted by another screen is not overwritten blindly: the
+/// client recreates its own capture at the version core kept.
+#[cfg(unix)]
+fn workspace_recreates_a_deleted_document() {
+    let scratch = Scratch::new("doc-deleted");
+    scratch.seed_doc(doc_one_pane(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-deleted");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.send(b"g");
+    assert!(
+        common::wait_until(secs(10), || {
+            let (value, version) = scratch.doc();
+            !value.is_null() && version >= 7
+        }),
+        "the deleted document was not recreated; store={:?}",
+        scratch.doc()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned()],
+        "the recreated document keeps the local pane"
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "recreating a document must not start a terminal"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A CAS conflict on a change in a different space merges both: this screen's
+/// split and the other screen's new space and terminal both survive.
+#[cfg(unix)]
+fn workspace_merges_a_concurrent_change_in_another_space() {
+    let scratch = Scratch::new("doc-conflict-merge");
+    scratch.seed_doc(doc_one_pane(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-conflict-merge");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    // The split's reply arrives after another screen has already written, so
+    // this client's next save is a stale CAS write.
+    workspace.command(b'v');
+    assert!(
+        workspace.wait_text("SPLIT-PANE", secs(10)),
+        "this screen's split was not drawn; screen={:?}",
+        workspace.rendered()
+    );
+    // The other screen's pane lives in its own space; both survive and the
+    // remote space can be visited.
+    workspace.command(b'N');
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(10)),
+        "the other screen's pane was not adopted; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            let addresses = doc_addresses(&scratch.doc_value());
+            addresses.len() == 3
+                && addresses.contains(&"t1".to_owned())
+                && addresses.contains(&"t2".to_owned())
+                && addresses.contains(&"t3".to_owned())
+        }),
+        "the merged document must keep both screens' work; doc={:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        scratch.doc_value()["spaces"].as_array().unwrap().len() == 2,
+        "the other screen's space must survive; doc={:?}",
+        scratch.doc_value()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// Two changes to the same tab conflict: this screen keeps its layout, says
+/// so, and the other screen's terminal is recovered rather than lost.
+#[cfg(unix)]
+fn workspace_keeps_local_on_a_same_tab_conflict_and_recovers_the_other_pane() {
+    let scratch = Scratch::new("doc-conflict-tab");
+    scratch.seed_doc(doc_one_pane(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-conflict-tab");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.command(b'v');
+    assert!(
+        workspace.wait_text("changed on another screen", secs(10)),
+        "a same-tab conflict must be reported; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.wait_text("SPLIT-PANE", secs(10)),
+        "this screen's layout must win; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(10)),
+        "the other screen's terminal must be recovered; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value()).len() == 3),
+        "the recovered pane must be written back; doc={:?}",
+        scratch.doc_value()
+    );
+    let log = scratch.entries();
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.kill"));
+    assert!(!log.iter().any(|entry| entry["call"] == "terminal.rm"));
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// The normal loop exhausts its three conflict rounds, leaving a local change
+/// dirty. The detach flush then loses one more CAS race, merges the other
+/// screen's work, retries, and writes the local change; a one-round flush
+/// would stop after the conflict and lose it.
+#[cfg(unix)]
+fn workspace_flushes_a_merged_change_on_detach_after_conflicts() {
+    let scratch = Scratch::new("doc-conflict-flush");
+    scratch.seed_doc(doc_one_pane(), 5);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-conflict-flush");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane must be drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    // The split is a local change; each CAS round loses to another screen,
+    // so the normal loop cannot write it and leaves it dirty.
+    workspace.command(b'v');
+    assert!(
+        workspace.wait_text("SPLIT-PANE", secs(10)),
+        "the local split must be drawn; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || {
+            scratch
+                .entries()
+                .iter()
+                .filter(|entry| entry["call"] == "doc.set")
+                .count()
+                >= 3
+        }),
+        "the loop must use its conflict rounds; log={:?}",
+        scratch.entries()
+    );
+    let before_detach = scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["call"] == "doc.set")
+        .count();
+    assert_eq!(
+        before_detach, 3,
+        "three CAS rounds before detaching, leaving the split dirty"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+
+    let addresses = doc_addresses(&scratch.doc_value());
+    assert!(
+        addresses.contains(&"t2".to_owned()),
+        "the other screen's terminal must be preserved; doc={:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        addresses.contains(&"t3".to_owned()),
+        "the local split must be flushed on detach; doc={:?}",
+        scratch.doc_value()
+    );
+    let attempts = scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["call"] == "doc.set")
+        .count();
+    assert!(
+        attempts > before_detach,
+        "the detach flush must attempt another write"
+    );
+    assert_eq!(
+        attempts, 5,
+        "the flush's first CAS loses, then the merge retries and writes"
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        10,
+        "the flush conflict is re-read, merged and retried at version 10"
+    );
+}
+
+/// Every document pane address, in document order.
+fn doc_addresses(doc: &serde_json::Value) -> Vec<String> {
+    fn leaves(layout: &serde_json::Value, out: &mut Vec<String>) {
+        if let Some(leaf) = layout.get("leaf") {
+            if let Some(address) = leaf.get("address").and_then(|value| value.as_str()) {
+                out.push(address.to_owned());
+            }
+            return;
+        }
+        if let Some(children) = layout.get("children").and_then(|value| value.as_array()) {
+            for child in children {
+                if let Some(layout) = child.get("layout") {
+                    leaves(layout, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let spaces = doc.get("spaces").and_then(|value| value.as_array());
+    for space in spaces.into_iter().flatten() {
+        let tabs = space.get("tabs").and_then(|value| value.as_array());
+        for tab in tabs.into_iter().flatten() {
+            if let Some(layout) = tab.get("layout") {
+                leaves(layout, &mut out);
+            }
+        }
+    }
+    out
+}
+
 fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -898,11 +2202,16 @@ fn fake_connect() -> io::Result<()> {
     let scenario = std::env::var("FAKE_SCENARIO").unwrap_or_else(|_| "finished".into());
     let log_path = std::env::var_os("FAKE_LOG").map(PathBuf::from);
     let log_path = log_path.as_deref();
+    let doc_path = log_path.map(|path| path.with_file_name("docs.json"));
+    let doc_path = doc_path.as_deref();
     let generation = bump_generation(log_path);
     log(log_path, json!({"generation": generation}));
     // The name of the start whose reply will be dropped, so the next
     // connection can present the terminal it created.
     let pending_name = last_start_name(log_path);
+    // Every run so far, with the labels the client sent: a realistic snapshot
+    // reports the labels the terminal actually carries.
+    let started = started_terminals(log_path);
 
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -922,7 +2231,8 @@ fn fake_connect() -> io::Result<()> {
         "framed": true,
         "methods": [
             "events.subscribe", "terminal.run", "terminal.attach",
-            "terminal.get", "terminal.read", "terminal.rm", "terminal.kill"
+            "terminal.get", "terminal.read", "terminal.rm", "terminal.kill",
+            "doc.get", "doc.set"
         ],
         "features": ["framed", "attach", "events"],
     });
@@ -934,7 +2244,12 @@ fn fake_connect() -> io::Result<()> {
     output.flush()?;
 
     let mut next_channel = ATTACH_CHANNEL;
-    let mut attached_channel: Option<u32> = None;
+    let mut attached_channels: BTreeSet<u32> = BTreeSet::new();
+    let mut attached_once = false;
+    // The last start's labels and address, so later attaches and terminal.get
+    // can present the terminal the client started.
+    let mut last_run_labels: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut last_run_address = "t1".to_owned();
     // A kept terminal whose program was lost and not yet replaced.
     let mut parked = false;
     let mut triggered = false;
@@ -944,6 +2259,10 @@ fn fake_connect() -> io::Result<()> {
     let mut t1_attaches = 0u32;
     let mut t2_attaches = 0u32;
     let mut missed_sent = false;
+    // `doc-conflict-flush`: the first four CAS writes lose to another screen:
+    // three exhaust one loop's retry budget, the fourth lands on the detach
+    // flush so its merge-and-retry path is what writes the local change.
+    let mut flush_conflicts = 4u32;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         log(
@@ -951,9 +2270,16 @@ fn fake_connect() -> io::Result<()> {
             json!({"frame": {"channel": channel, "kind": kind, "len": payload.len()}}),
         );
 
-        // A key on the attach stream drives the scripted lifecycle. Ctrl-]
+        // The client closing its stream: forget the channel, so a later
+        // attach is treated as a fresh paint.
+        if kind == CLOSE {
+            attached_channels.remove(&channel);
+            continue;
+        }
+
+        // A key on an attach stream drives the scripted lifecycle. Ctrl-]
         // never arrives here: the client handles it locally.
-        if kind == DATA && attached_channel == Some(channel) {
+        if kind == DATA && attached_channels.contains(&channel) {
             if !triggered {
                 triggered = true;
                 match scenario.as_str() {
@@ -979,6 +2305,38 @@ fn fake_connect() -> io::Result<()> {
                     )?,
                     // Drop the connection: the client must make a new one.
                     "screen-reconnect" if generation == 1 => return Ok(()),
+                    // Another screen added a pane: the doc event carries no
+                    // value, the client must refetch and adopt it.
+                    "doc-event" | "doc-missed" | "doc-event-focus" => {
+                        let doc = if scenario == "doc-event-focus" {
+                            one_tab_doc(&[(3, "t1"), (4, "t2"), (5, "t3")])
+                        } else {
+                            doc_same_tab()
+                        };
+                        let version = replace_doc(doc_path, doc);
+                        if scenario == "doc-missed" {
+                            notify(&mut output, missed_two_panes_event())?;
+                        } else {
+                            notify(&mut output, doc_event_message(version))?;
+                        }
+                    }
+                    // Another screen closed a pane.
+                    "doc-remove" => {
+                        let version = replace_doc(doc_path, doc_one_pane());
+                        notify(&mut output, doc_event_message(version))?;
+                    }
+                    // The connection drops after another screen changed the
+                    // document; the fresh connection must refetch it.
+                    "doc-reconnect" => {
+                        replace_doc(doc_path, doc_same_tab());
+                        return Ok(());
+                    }
+                    // Another screen deleted the document. Core keeps the
+                    // version, so it is recreated at that version.
+                    "doc-deleted" => {
+                        let version = replace_doc(doc_path, Value::Null);
+                        notify(&mut output, doc_event_message(version))?;
+                    }
                     _ => {}
                 }
             }
@@ -998,25 +2356,8 @@ fn fake_connect() -> io::Result<()> {
         );
         match method {
             "events.subscribe" => {
-                let snapshot = if scenario == "workspace-pending" && generation > 1 {
-                    // The interrupted start did reach core: the fresh snapshot
-                    // has both terminals, the second under the requested name.
-                    let mut terminals = vec![live_record(4242)];
-                    terminals.push(named_record(
-                        "t2",
-                        pending_name.as_deref().unwrap_or("ht-0-2"),
-                        5151,
-                    ));
-                    json!({"seq": 1, "terminals": terminals, "channel": EVENTS_CHANNEL})
-                } else if scripted_terminal(&scenario) {
-                    json!({
-                        "seq": 1,
-                        "terminals": [live_record(4242)],
-                        "channel": EVENTS_CHANNEL,
-                    })
-                } else {
-                    json!({"seq": 1, "terminals": [], "channel": EVENTS_CHANNEL})
-                };
+                let snapshot =
+                    snapshot_for(&scenario, generation, pending_name.as_deref(), &started);
                 reply(&mut output, &id, snapshot)?;
             }
             "terminal.run" => {
@@ -1027,6 +2368,10 @@ fn fake_connect() -> io::Result<()> {
                     return Ok(());
                 }
                 let name = message["params"]["name"].as_str().unwrap_or_default();
+                last_run_labels = message["params"]["labels"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
                 let record = if scenario == "workspace-pending" {
                     if runs == 1 {
                         named_record("t1", name, 4242)
@@ -1039,9 +2384,29 @@ fn fake_connect() -> io::Result<()> {
                     record("finished")
                 } else if scenario == "workspace-missed" && runs > 1 {
                     named_record("t2", name, 4444)
+                } else if doc_scenario(&scenario) {
+                    // A split's terminal, with the labels the client sent.
+                    let address = if scenario.starts_with("doc-conflict") {
+                        "t3"
+                    } else {
+                        "t1"
+                    };
+                    let mut record = live_record(7000 + runs);
+                    record["address"] = json!(address);
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    if scenario == "doc-conflict-merge" {
+                        // Another screen wrote while this client was starting
+                        // the split: its next write sees a stale version.
+                        replace_doc(doc_path, doc_remote_space());
+                    } else if scenario == "doc-conflict-tab" {
+                        replace_doc(doc_path, doc_same_tab());
+                    }
+                    record
                 } else {
                     live_record(4242)
                 };
+                last_run_address = record["address"].as_str().unwrap_or("t1").to_owned();
                 reply(&mut output, &id, record)?;
             }
             "terminal.attach" => {
@@ -1074,15 +2439,26 @@ fn fake_connect() -> io::Result<()> {
                         event_message(3, "restarted", live_record(4343)),
                     )?;
                 } else {
-                    let first = attached_channel.is_none();
+                    let first = !attached_once;
+                    attached_once = true;
                     let channel = next_channel;
                     next_channel += 1;
-                    attached_channel = Some(channel);
+                    attached_channels.insert(channel);
                     log(log_path, json!({"attached": channel, "terminal": target}));
                     let second_pane = target == "t2"
                         && matches!(scenario.as_str(), "workspace-pending" | "workspace-missed");
                     let attached_record = if second_pane {
                         named_record("t2", pending_name.as_deref().unwrap_or("ht-0-2"), 5151)
+                    } else if doc_scenario(&scenario)
+                        && target == last_run_address
+                        && target != "t1"
+                    {
+                        let mut record = live_record(8000);
+                        record["address"] = json!(target);
+                        record["labels"] = Value::Object(last_run_labels.clone());
+                        record
+                    } else if doc_scenario(&scenario) {
+                        doc_record_for(&scenario, &target)
                     } else {
                         live_record(4242)
                     };
@@ -1125,6 +2501,49 @@ fn fake_connect() -> io::Result<()> {
                             };
                             write_frame(&mut output, channel, DATA, text)?;
                         }
+                        // Restored panes paint from core, and a terminal the
+                        // document added later paints when it is adopted.
+                        "doc-restore"
+                        | "doc-remove"
+                        | "doc-stale-snapshot"
+                        | "doc-deleted-recover"
+                        | "doc-focus" => {
+                            let text: &[u8] = if target == "t2" {
+                                b"PANE-TWO\n"
+                            } else {
+                                b"PANE-ONE\n"
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
+                        }
+                        "doc-view" => {
+                            let text: &[u8] = if target == "t2" {
+                                b"TAB-TWO\n"
+                            } else {
+                                b"TAB-ONE\n"
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
+                        }
+                        "doc-orphan" => {
+                            let text: &[u8] = if target == "t7" {
+                                b"ORPHAN-PANE\n"
+                            } else {
+                                b"PANE-ONE\n"
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
+                        }
+                        "doc-event" | "doc-event-focus" | "doc-missed" | "doc-reconnect"
+                        | "doc-conflict-merge" | "doc-conflict-tab" | "doc-conflict-flush" => {
+                            let text: &[u8] = match target.as_str() {
+                                "t2" => b"PANE-TWO\n",
+                                "t3" => b"SPLIT-PANE\n",
+                                _ => b"PANE-ONE\n",
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
+                        }
+                        "doc-mismatch" | "doc-missing" | "doc-foreign" | "doc-fresh"
+                        | "doc-deleted" | "doc-orphan-invalid" => {
+                            write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
+                        }
                         // Two panes attach, then the subscriber falls behind.
                         // The `missed` snapshot must reattach both in place.
                         "workspace-missed" => {
@@ -1145,7 +2564,10 @@ fn fake_connect() -> io::Result<()> {
                             if !missed_sent && t1_attaches > 0 && t2_attaches > 0 {
                                 missed_sent = true;
                                 let name = last_start_name(log_path);
-                                notify(&mut output, missed_workspace_event(name.as_deref()))?;
+                                notify(
+                                    &mut output,
+                                    missed_workspace_event(name.as_deref(), &started),
+                                )?;
                             }
                         }
                         "screen-detach" => {
@@ -1183,7 +2605,32 @@ fn fake_connect() -> io::Result<()> {
                     }
                 }
             }
-            "terminal.get" => reply(&mut output, &id, record("finished"))?,
+            "terminal.get" => {
+                let target = message["params"]["terminal"].as_str().unwrap_or("t1");
+                if scenario == "doc-missing" && target == "t9" {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "not_found",
+                        "no terminal t9",
+                        "it is gone",
+                    )?;
+                    continue;
+                }
+                let record = if doc_scenario(&scenario) {
+                    if target == last_run_address && target != "t1" {
+                        let mut record = live_record(8000);
+                        record["address"] = json!(target);
+                        record["labels"] = Value::Object(last_run_labels.clone());
+                        record
+                    } else {
+                        doc_record_for(&scenario, target)
+                    }
+                } else {
+                    record("finished")
+                };
+                reply(&mut output, &id, record)?;
+            }
             "terminal.read" => reply(
                 &mut output,
                 &id,
@@ -1191,22 +2638,369 @@ fn fake_connect() -> io::Result<()> {
             )?,
             "terminal.rm" => reply(&mut output, &id, json!({"removed": "t1"}))?,
             "terminal.kill" => reply(&mut output, &id, record("finished"))?,
+            // Documents live in one file next to the log so every connection
+            // and every screen sees the same store, like core's state file.
+            "doc.get" => {
+                let (value, version) = read_doc(doc_path);
+                reply(
+                    &mut output,
+                    &id,
+                    json!({"value": value, "version": version}),
+                )?;
+            }
+            "doc.set" => {
+                let requested = message["params"]["version"].as_u64().unwrap_or(0);
+                let (stored, current) = read_doc(doc_path);
+                if requested != current {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "conflict",
+                        &format!("document is at version {current}, not {requested}"),
+                        "read doc.get and retry with its version",
+                    )?;
+                } else if scenario == "doc-deleted-claim-lost"
+                    && stored.is_null()
+                    && requested == current
+                {
+                    // Another screen recreates the deleted document first and
+                    // wins the CAS; this screen must restore it without a run.
+                    let version = current + 1;
+                    write_doc(doc_path, &empty_doc(), version);
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "conflict",
+                        &format!("document is at version {version}, not {requested}"),
+                        "read doc.get and retry with its version",
+                    )?;
+                } else if scenario == "doc-conflict-flush" && flush_conflicts > 0 {
+                    // Another screen writes before the next CAS attempt: the
+                    // first three exhaust the loop's rounds, the fourth
+                    // makes the detach flush merge and retry.
+                    flush_conflicts -= 1;
+                    replace_doc(doc_path, doc_remote_space());
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "conflict",
+                        "document changed while writing",
+                        "read doc.get and retry with its version",
+                    )?;
+                } else {
+                    let value = message["params"]["value"].clone();
+                    let version = current + 1;
+                    write_doc(doc_path, &value, version);
+                    reply(&mut output, &id, json!({"version": version}))?;
+                    notify(&mut output, doc_event_message(version))?;
+                }
+            }
             _ => reply(&mut output, &id, json!({}))?,
         }
     }
     Ok(())
 }
 
-/// Scenarios whose snapshot already contains the terminal to adopt.
+/// Scenarios whose snapshot already contains the terminal to adopt, or whose
+/// document names one.
 fn scripted_terminal(scenario: &str) -> bool {
+    doc_scenario(scenario)
+        || matches!(
+            scenario,
+            "screen-lost-restarted"
+                | "screen-missed"
+                | "screen-removed"
+                | "screen-reconnect"
+                | "screen-repaint"
+        )
+}
+
+/// M4 scenarios: a workspace document drives what is restored.
+fn doc_scenario(scenario: &str) -> bool {
     matches!(
         scenario,
-        "screen-lost-restarted"
-            | "screen-missed"
-            | "screen-removed"
-            | "screen-reconnect"
-            | "screen-repaint"
+        "doc-restore"
+            | "doc-view"
+            | "doc-mismatch"
+            | "doc-missing"
+            | "doc-foreign"
+            | "doc-event"
+            | "doc-remove"
+            | "doc-conflict-merge"
+            | "doc-conflict-tab"
+            | "doc-reconnect"
+            | "doc-missed"
+            | "doc-deleted"
+            | "doc-stale-snapshot"
+            | "doc-deleted-recover"
+            | "doc-deleted-claim-lost"
+            | "doc-conflict-flush"
+            | "doc-focus"
+            | "doc-event-focus"
+            | "doc-orphan"
+            | "doc-orphan-invalid"
     )
+}
+
+fn snapshot_for(
+    scenario: &str,
+    generation: u32,
+    pending_name: Option<&str>,
+    started: &[(String, serde_json::Map<String, Value>)],
+) -> Value {
+    if scenario == "workspace-pending" && generation > 1 {
+        // The interrupted start did reach core: the fresh snapshot has both
+        // terminals, the second under the requested name.
+        let t1 = started.first().map_or_else(
+            || live_record(4242),
+            |(name, labels)| started_record("t1", name, labels, 4242),
+        );
+        let t2 = started.get(1).map_or_else(
+            || named_record("t2", pending_name.unwrap_or("ht-0-2"), 5151),
+            |(name, labels)| started_record("t2", name, labels, 5151),
+        );
+        return json!({
+            "seq": 1,
+            "terminals": [t1, t2],
+            "channel": EVENTS_CHANNEL,
+        });
+    }
+    let terminals: Vec<Value> = match scenario {
+        "doc-restore" | "doc-remove" | "doc-deleted-recover" | "doc-focus" | "doc-event-focus" => {
+            vec![
+                doc_record_for(scenario, "t1"),
+                doc_record_for(scenario, "t2"),
+            ]
+        }
+        "doc-view" => vec![
+            doc_record_for(scenario, "t1"),
+            doc_record_for(scenario, "t2"),
+        ],
+        "doc-reconnect" if generation > 1 => {
+            vec![
+                doc_record_for(scenario, "t1"),
+                doc_record_for(scenario, "t2"),
+            ]
+        }
+        "doc-mismatch" | "doc-missing" | "doc-event" | "doc-conflict-merge"
+        | "doc-conflict-tab" | "doc-reconnect" | "doc-missed" | "doc-deleted"
+        | "doc-stale-snapshot" | "doc-conflict-flush" => {
+            vec![doc_record_for(scenario, "t1")]
+        }
+        "doc-deleted-claim-lost" => Vec::new(),
+        "doc-orphan" => vec![doc_record_for(scenario, "t1"), orphan_record("t7", 5, 6, 9)],
+        "doc-orphan-invalid" => vec![doc_record_for(scenario, "t1"), unlabeled_record("t9")],
+        "doc-foreign" => vec![foreign_record("t1")],
+        scenario if scripted_terminal(scenario) => vec![live_record(4242)],
+        _ => Vec::new(),
+    };
+    json!({"seq": 1, "terminals": terminals, "channel": EVENTS_CHANNEL})
+}
+
+fn client_labels(space: u64, tab: u64, pane: u64) -> Value {
+    json!({
+        "herdr.client": "herdr-terminal",
+        "herdr.terminal.space": space.to_string(),
+        "herdr.terminal.tab": tab.to_string(),
+        "herdr.terminal.pane": pane.to_string(),
+    })
+}
+
+/// A live terminal carrying the labels a document pane expects.
+fn doc_terminal(address: &str, space: u64, tab: u64, pane: u64) -> Value {
+    let mut record = live_record(9000 + pane as u32);
+    record["address"] = json!(address);
+    record["labels"] = client_labels(space, tab, pane);
+    record
+}
+
+fn doc_record_for(scenario: &str, address: &str) -> Value {
+    match (scenario, address) {
+        ("doc-view", "t1") => doc_terminal("t1", 1, 30, 3),
+        ("doc-view", "t2") => doc_terminal("t2", 1, 31, 4),
+        ("doc-conflict-merge", "t2") | ("doc-conflict-flush", "t2") => {
+            doc_terminal("t2", 20, 21, 22)
+        }
+        ("doc-event-focus", "t3") => doc_terminal("t3", 1, 2, 5),
+        (_, "t2") => doc_terminal("t2", 1, 2, 4),
+        (_, "t1") => doc_terminal("t1", 1, 2, 3),
+        _ => {
+            let mut record = live_record(9999);
+            record["address"] = json!(address);
+            record
+        }
+    }
+}
+
+/// A terminal without the pane label: the same address is not enough.
+fn foreign_record(address: &str) -> Value {
+    let mut record = live_record(9191);
+    record["address"] = json!(address);
+    record["labels"] = json!({"herdr.client": "herdr-terminal"});
+    record
+}
+
+/// A labeled terminal that belongs to no document pane yet.
+fn orphan_record(address: &str, space: u64, tab: u64, pane: u64) -> Value {
+    let mut record = live_record(7373);
+    record["address"] = json!(address);
+    record["labels"] = client_labels(space, tab, pane);
+    record
+}
+
+/// A live terminal carrying none of this client's labels.
+fn unlabeled_record(address: &str) -> Value {
+    let mut record = live_record(9292);
+    record["address"] = json!(address);
+    record["labels"] = json!({"herdr.client": "someone-else"});
+    record
+}
+
+fn pane_leaf(pane: u64, address: &str, space: u64, tab: u64) -> Value {
+    json!({"leaf": {
+        "id": pane.to_string(),
+        "address": address,
+        "name": address,
+        "labels": client_labels(space, tab, pane),
+    }})
+}
+
+fn tab_doc(id: u64, name: &str, layout: Value) -> Value {
+    json!({"id": id.to_string(), "name": name, "layout": layout})
+}
+
+fn space_doc(id: u64, name: &str, tabs: Vec<Value>) -> Value {
+    json!({"id": id.to_string(), "name": name, "folder": "", "tabs": tabs})
+}
+
+fn split_layout(leaves: Vec<Value>) -> Value {
+    if leaves.len() == 1 {
+        return leaves.into_iter().next().expect("one leaf");
+    }
+    json!({
+        "axis": "columns",
+        "children": leaves
+            .into_iter()
+            .map(|layout| json!({"size": 1, "layout": layout}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// One space, one tab, the given panes side by side.
+fn one_tab_doc(panes: &[(u64, &str)]) -> Value {
+    let layout = split_layout(
+        panes
+            .iter()
+            .map(|(pane, address)| pane_leaf(*pane, address, 1, 2))
+            .collect(),
+    );
+    doc_value(vec![space_doc(
+        1,
+        "shared",
+        vec![tab_doc(2, "main", layout)],
+    )])
+}
+
+fn doc_value(spaces: Vec<Value>) -> Value {
+    json!({"version": 1, "spaces": spaces})
+}
+
+fn doc_one_pane() -> Value {
+    one_tab_doc(&[(3, "t1")])
+}
+
+/// The document a screen claims when it has no panes.
+fn empty_doc() -> Value {
+    doc_value(vec![space_doc(
+        1,
+        "space 1",
+        vec![tab_doc(2, "tab 1", Value::Null)],
+    )])
+}
+
+fn doc_same_tab() -> Value {
+    one_tab_doc(&[(3, "t1"), (4, "t2")])
+}
+
+/// Another screen added a pane in a space of its own.
+fn doc_remote_space() -> Value {
+    doc_value(vec![
+        space_doc(
+            1,
+            "shared",
+            vec![tab_doc(2, "main", pane_leaf(3, "t1", 1, 2))],
+        ),
+        space_doc(
+            20,
+            "remote",
+            vec![tab_doc(21, "remote tab", pane_leaf(22, "t2", 20, 21))],
+        ),
+    ])
+}
+
+/// Two tabs, one pane each; the local view picks the second.
+fn doc_two_tabs() -> Value {
+    doc_value(vec![space_doc(
+        1,
+        "shared",
+        vec![
+            tab_doc(30, "one", pane_leaf(3, "t1", 1, 30)),
+            tab_doc(31, "two", pane_leaf(4, "t2", 1, 31)),
+        ],
+    )])
+}
+
+// --- document store --------------------------------------------------------
+
+fn read_doc(path: Option<&Path>) -> (Value, u64) {
+    let Some(path) = path else {
+        return (Value::Null, 0);
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return (Value::Null, 0);
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(store) => (
+            store.get("value").cloned().unwrap_or(Value::Null),
+            store.get("version").and_then(Value::as_u64).unwrap_or(0),
+        ),
+        Err(_) => (Value::Null, 0),
+    }
+}
+
+fn write_doc(path: Option<&Path>, value: &Value, version: u64) {
+    let Some(path) = path else { return };
+    let store = json!({"version": version, "value": value});
+    let _ = std::fs::write(path, store.to_string());
+}
+
+/// Replaces the store as another screen would, returning the new version.
+fn replace_doc(path: Option<&Path>, value: Value) -> u64 {
+    let (_, current) = read_doc(path);
+    let version = current + 1;
+    write_doc(path, &value, version);
+    version
+}
+
+fn doc_event_message(version: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "seq": 50 + version,
+            "type": "doc",
+            "data": {"name": "herdr-terminal", "version": version},
+        },
+    })
+}
+
+/// A fresh snapshot with both restored panes, as core sends after `missed`.
+fn missed_two_panes_event() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "missed",
+        "params": {"seq": 9, "terminals": [doc_terminal("t1", 1, 2, 3), doc_terminal("t2", 1, 2, 4)]},
+    })
 }
 
 /// A live record, or a finished one with exit status 7.
@@ -1256,6 +3050,37 @@ fn last_start_name(path: Option<&Path>) -> Option<String> {
         .next_back()
 }
 
+/// Every `terminal.run` in the log, in order, with the labels it carried.
+fn started_terminals(path: Option<&Path>) -> Vec<(String, serde_json::Map<String, Value>)> {
+    let Some(path) = path else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["call"] == "terminal.run")
+        .filter_map(|entry| {
+            let name = entry["params"]["name"].as_str()?.to_owned();
+            let labels = entry["params"]["labels"].as_object()?.clone();
+            Some((name, labels))
+        })
+        .collect()
+}
+
+/// A live record carrying the labels the start sent.
+fn started_record(
+    address: &str,
+    name: &str,
+    labels: &serde_json::Map<String, Value>,
+    pid: u32,
+) -> Value {
+    let mut record = live_record(pid);
+    record["address"] = json!(address);
+    record["name"] = json!(name);
+    record["labels"] = Value::Object(labels.clone());
+    record
+}
+
 /// One `event` notification, on the events stream.
 fn event_message(seq: u64, kind: &str, data: serde_json::Value) -> serde_json::Value {
     json!({
@@ -1283,17 +3108,22 @@ fn missed_event() -> serde_json::Value {
 }
 
 /// A fresh snapshot with both workspace panes, as core sends after `missed`.
-fn missed_workspace_event(name: Option<&str>) -> serde_json::Value {
+fn missed_workspace_event(
+    name: Option<&str>,
+    started: &[(String, serde_json::Map<String, Value>)],
+) -> serde_json::Value {
+    let t1 = started.first().map_or_else(
+        || live_record(4242),
+        |(name, labels)| started_record("t1", name, labels, 4242),
+    );
+    let t2 = started.get(1).map_or_else(
+        || named_record("t2", name.unwrap_or("ht-0-2"), 5151),
+        |(name, labels)| started_record("t2", name, labels, 5151),
+    );
     json!({
         "jsonrpc": "2.0",
         "method": "missed",
-        "params": {
-            "seq": 9,
-            "terminals": [
-                live_record(4242),
-                named_record("t2", name.unwrap_or("ht-0-2"), 5151)
-            ]
-        },
+        "params": {"seq": 9, "terminals": [t1, t2]},
     })
 }
 
@@ -1410,6 +3240,36 @@ impl Scratch {
 
     fn state(&self) -> PathBuf {
         self.dir.join("state")
+    }
+
+    fn docs(&self) -> PathBuf {
+        self.dir.join("docs.json")
+    }
+
+    /// Writes the document store as if another screen had saved it.
+    fn seed_doc(&self, value: serde_json::Value, version: u64) {
+        write_doc(Some(&self.docs()), &value, version);
+    }
+
+    fn doc(&self) -> (serde_json::Value, u64) {
+        read_doc(Some(&self.docs()))
+    }
+
+    fn doc_value(&self) -> serde_json::Value {
+        self.doc().0
+    }
+
+    fn doc_version(&self) -> u64 {
+        self.doc().1
+    }
+
+    /// Writes the per-screen local view where the client looks for it.
+    #[cfg(unix)]
+    fn seed_view(&self, screen: &str, view: serde_json::Value) {
+        let dir = self.state().join("herdr-terminal");
+        std::fs::create_dir_all(&dir).expect("local view dir");
+        std::fs::write(dir.join(format!("view-{screen}.json")), view.to_string())
+            .expect("seed local view");
     }
 
     fn entries(&self) -> Vec<serde_json::Value> {

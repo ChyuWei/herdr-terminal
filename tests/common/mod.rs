@@ -119,6 +119,96 @@ impl Session {
         self.root.join("state")
     }
 
+    /// Reads a core document over a short framed connection. Documents are
+    /// API-only, so tests need their own `hc connect`.
+    pub fn doc(&self, name: &str) -> serde_json::Value {
+        self.framed_call("doc.get", serde_json::json!({"name": name}))["value"].clone()
+    }
+
+    /// The document value and the version it is stored at.
+    pub fn doc_with_version(&self, name: &str) -> (serde_json::Value, u64) {
+        let result = self.framed_call("doc.get", serde_json::json!({"name": name}));
+        (
+            result["value"].clone(),
+            result["version"].as_u64().unwrap_or(0),
+        )
+    }
+
+    /// Replaces a document at `version`; returns the new version.
+    pub fn set_doc(&self, name: &str, value: &serde_json::Value, version: u64) -> u64 {
+        let result = self.framed_call(
+            "doc.set",
+            serde_json::json!({"name": name, "value": value, "version": version}),
+        );
+        result["version"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("doc.set failed: {result}"))
+    }
+
+    /// One framed JSON-RPC call on a short-lived `hc connect`.
+    fn framed_call(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        use std::io::BufRead;
+        let mut child = self
+            .command(&self.hc)
+            .arg("connect")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hc connect for a document call");
+        let mut stdin = child.stdin.take().expect("connect stdin");
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("connect stdout"));
+        let hello = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "hello",
+            "params": {"framed": true},
+        });
+        writeln!(stdin, "{hello}").expect("write hello");
+        stdin.flush().expect("flush hello");
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read hello reply");
+        let reply: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("hello reply is JSON");
+        assert_eq!(
+            reply["result"]["framed"],
+            serde_json::json!(true),
+            "core did not switch to framed mode: {reply}"
+        );
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": method,
+            "params": params,
+        });
+        write_frame(&mut stdin, 0, 0, request.to_string().as_bytes());
+        let result = loop {
+            let (channel, kind, payload) = read_frame(&mut stdout);
+            if channel == 0 && kind == 0 {
+                let message: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("reply is JSON");
+                if message["id"] == serde_json::json!(2) {
+                    assert!(
+                        message.get("error").is_none_or(|error| error.is_null()),
+                        "{method} failed: {message}"
+                    );
+                    break message["result"].clone();
+                }
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        result
+    }
+
+    /// This screen's local view file, if it was written.
+    pub fn view_file(&self, screen: &str) -> PathBuf {
+        self.state_home()
+            .join("herdr-terminal")
+            .join(format!("view-{screen}.json"))
+    }
+
     pub fn stop(&mut self) {
         if self.started {
             let _ = self
@@ -284,6 +374,27 @@ impl Drop for Probe {
             let _ = self.child.wait();
         }
     }
+}
+
+fn write_frame(out: &mut impl Write, channel: u32, kind: u8, payload: &[u8]) {
+    let mut wire = Vec::with_capacity(9 + payload.len());
+    wire.extend_from_slice(&channel.to_le_bytes());
+    wire.push(kind);
+    wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    wire.extend_from_slice(payload);
+    out.write_all(&wire).expect("write frame");
+    out.flush().expect("flush frame");
+}
+
+fn read_frame(input: &mut impl Read) -> (u32, u8, Vec<u8>) {
+    let mut header = [0u8; 9];
+    input.read_exact(&mut header).expect("read frame header");
+    let channel = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
+    let kind = header[4];
+    let len = u32::from_le_bytes(header[5..9].try_into().expect("four bytes")) as usize;
+    let mut payload = vec![0u8; len];
+    input.read_exact(&mut payload).expect("read frame payload");
+    (channel, kind, payload)
 }
 
 #[cfg(unix)]

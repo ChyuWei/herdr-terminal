@@ -8,7 +8,9 @@
 use super::discovery;
 use super::events::{self, EventStream, Notification};
 use super::frames::{Frame, FrameDecoder};
-use super::rpc::{AttachResult, Hello, ReadResult, RpcError, Snapshot, Terminal};
+use super::rpc::{
+    AttachResult, DocGetResult, DocSetResult, Hello, ReadResult, RpcError, Snapshot, Terminal,
+};
 use super::{Error, Result};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -371,6 +373,30 @@ impl CoreClient {
             terminal: result.terminal,
             stream: rx,
         })
+    }
+
+    /// Reads a versioned opaque document. An absent document is
+    /// `value: null, version: 0`.
+    pub fn doc_get(&self, name: &str, timeout: Duration) -> Result<DocGetResult> {
+        let value = self.call_timeout("doc.get", json!({"name": name}), timeout)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Writes a versioned opaque document, or deletes it with a null value.
+    /// A stale `version` fails with error kind `conflict`.
+    pub fn doc_set(
+        &self,
+        name: &str,
+        value: &Value,
+        version: u64,
+        timeout: Duration,
+    ) -> Result<DocSetResult> {
+        let value = self.call_timeout(
+            "doc.set",
+            json!({"name": name, "value": value, "version": version}),
+            timeout,
+        )?;
+        Ok(serde_json::from_value(value)?)
     }
 
     /// The terminal's record, live or finished.
