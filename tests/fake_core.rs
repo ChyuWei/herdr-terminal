@@ -51,6 +51,14 @@ fn run_tests() {
     #[cfg(unix)]
     screen_draws_the_final_frame_when_data_and_close_arrive_together();
     #[cfg(unix)]
+    workspace_keeps_the_final_screen_and_status_when_the_program_exited_before_attach();
+    #[cfg(unix)]
+    workspace_draws_the_final_frame_and_status_when_data_and_close_arrive_together();
+    #[cfg(unix)]
+    workspace_reclaims_a_start_whose_run_reply_was_lost();
+    #[cfg(unix)]
+    workspace_reattaches_every_pane_after_missed();
+    #[cfg(unix)]
     screen_detaches_without_killing_the_program();
     #[cfg(unix)]
     screen_waits_for_a_restarted_terminal();
@@ -80,11 +88,26 @@ struct FakeScreen {
 #[cfg(unix)]
 impl FakeScreen {
     fn spawn(scratch: &Scratch, scenario: &str, args: &[&str]) -> FakeScreen {
+        Self::spawn_parts(scratch, scenario, &["screen"], args)
+    }
+
+    /// `ht` with no subcommand: the default workspace, against the same
+    /// scripted core.
+    fn spawn_workspace(scratch: &Scratch, scenario: &str) -> FakeScreen {
+        Self::spawn_parts(scratch, scenario, &[], &[])
+    }
+
+    fn spawn_parts(
+        scratch: &Scratch,
+        scenario: &str,
+        leading: &[&str],
+        args: &[&str],
+    ) -> FakeScreen {
         let exe = std::env::current_exe().expect("test executable");
         let pty = common::pty::Pty::open(80, 24);
         let (stdin, stdout) = pty.stdio();
         let mut child = Command::new(HT)
-            .arg("screen")
+            .args(leading)
             .arg("--hc")
             .arg(&exe)
             .args(["--cols", "80", "--rows", "24"])
@@ -97,7 +120,7 @@ impl FakeScreen {
             .stdout(stdout)
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn ht screen");
+            .expect("spawn ht");
         let output = Capture::spawn(pty.reader());
         let stderr = Capture::spawn(child.stderr.take().expect("stderr"));
         let input = pty.writer();
@@ -124,6 +147,11 @@ impl FakeScreen {
     fn send(&mut self, bytes: &[u8]) {
         self.input.write_all(bytes).expect("write to the screen");
         self.input.flush().expect("flush the screen");
+    }
+
+    /// The workspace prefix (Ctrl-b) followed by one command key.
+    fn command(&mut self, key: u8) {
+        self.send(&[0x02, key]);
     }
 
     fn wait_exit(&mut self, timeout: std::time::Duration) -> Option<std::process::ExitStatus> {
@@ -183,6 +211,259 @@ fn screen_draws_the_final_frame_when_data_and_close_arrive_together() {
         !log.iter().any(|entry| entry["call"] == "terminal.kill"),
         "a program that ended by itself must not be killed; log={log:?}"
     );
+}
+
+/// A program that exited before the workspace's first attach: the pane must
+/// show core's kept final screen and the finished record's exact status, stay
+/// on screen, and only remove the record when the person closes it.
+#[cfg(unix)]
+fn workspace_keeps_the_final_screen_and_status_when_the_program_exited_before_attach() {
+    let scratch = Scratch::new("workspace-finished");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "finished");
+
+    assert!(
+        workspace.wait_text("FAST", secs(10)),
+        "the recovered final screen was not drawn; raw={:?} stderr={:?}",
+        workspace.output.text(),
+        workspace.stderr.text()
+    );
+    assert!(
+        workspace.wait_text("exited (7)", secs(5)),
+        "the finished record's status was not shown; screen={:?} raw={:?}",
+        workspace.rendered(),
+        workspace.output.text()
+    );
+    assert!(
+        !workspace.rendered().contains("no terminals in this tab"),
+        "the finished pane must stay visible; screen={:?}",
+        workspace.rendered()
+    );
+
+    let log = scratch.entries();
+    assert!(
+        log.iter().any(|entry| entry["call"] == "terminal.get"),
+        "the finished record must be read; log={log:?}"
+    );
+    assert!(
+        log.iter().any(|entry| entry["call"] == "terminal.read"),
+        "the final screen must be read; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.rm"),
+        "the record must not be removed before the screen has been shown; log={log:?}"
+    );
+
+    // x closes the finished view; only now is its record removed.
+    workspace.command(b'x');
+    assert!(
+        common::wait_until(secs(5), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.rm")),
+        "closing the finished pane must remove its record; log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        workspace.wait_text("no terminals in this tab", secs(5)),
+        "the empty state did not follow the close; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+    assert!(workspace.pty.is_cooked(), "the terminal was not restored");
+}
+
+/// DATA and CLOSE in one attach burst: the workspace must draw the final text
+/// and the exact status before the record is removed.
+#[cfg(unix)]
+fn workspace_draws_the_final_frame_and_status_when_data_and_close_arrive_together() {
+    let scratch = Scratch::new("workspace-final");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "workspace-final");
+
+    assert!(
+        workspace.wait_text("READY", secs(10)),
+        "the final frame is missing READY; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        workspace.wait_text("END", secs(5)),
+        "the final frame is missing END; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.wait_text("exited (7)", secs(5)),
+        "the close reason's status was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !workspace.rendered().contains("no terminals in this tab"),
+        "the finished pane was removed before its final frame; screen={:?}",
+        workspace.rendered()
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.rm"),
+        "the record must not be removed before the final frame is shown; log={log:?}"
+    );
+
+    workspace.command(b'x');
+    assert!(
+        common::wait_until(secs(5), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.rm")),
+        "closing the finished pane must remove its record; log={:?}",
+        scratch.entries()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+    assert!(workspace.pty.is_cooked(), "the terminal was not restored");
+}
+
+/// The connection dies after core creates a split's terminal but before the
+/// `terminal.run` reply reaches the client. Reconnect must reclaim that
+/// terminal by its unique name, not start a duplicate or lose the pane.
+#[cfg(unix)]
+fn workspace_reclaims_a_start_whose_run_reply_was_lost() {
+    let scratch = Scratch::new("workspace-pending");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "workspace-pending");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the first pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    // The split's terminal.run is answered by core (it exists in the next
+    // snapshot) but the reply never arrives; this is the race the test at
+    // tests/workspace.rs:reconnecting... used to hit.
+    workspace.command(b'v');
+    assert!(
+        workspace.wait_text("reconnected to core", secs(20)),
+        "the workspace did not reconnect; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(10)),
+        "the created pane was not reclaimed; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    let log = scratch.entries();
+    let runs: Vec<&serde_json::Value> = log
+        .iter()
+        .filter(|entry| entry["call"] == "terminal.run")
+        .collect();
+    assert_eq!(
+        runs.len(),
+        2,
+        "the interrupted start must not run a second terminal; log={log:?}"
+    );
+    let attaches: Vec<&serde_json::Value> = log
+        .iter()
+        .filter(|entry| entry.get("terminal").is_some())
+        .collect();
+    assert_eq!(
+        attaches
+            .iter()
+            .filter(|entry| entry["terminal"] == "t2")
+            .count(),
+        1,
+        "the reclaimed t2 must be attached once; log={log:?}"
+    );
+    assert_eq!(
+        attaches
+            .iter()
+            .filter(|entry| entry["terminal"] == "t1")
+            .count(),
+        2,
+        "t1 is attached once per connection; log={log:?}"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+    assert!(workspace.pty.is_cooked(), "the terminal was not restored");
+}
+
+/// `missed` carries a fresh snapshot with both panes: each pane reattaches and
+/// no terminal is started again.
+#[cfg(unix)]
+fn workspace_reattaches_every_pane_after_missed() {
+    let scratch = Scratch::new("workspace-missed");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "workspace-missed");
+
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the first pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    workspace.command(b'v');
+    // `missed` follows the second attach, so the split pane's first paint may
+    // be replaced by its reattach paint before a poll can see it.
+    assert!(
+        workspace.wait_text("ONE-AGAIN", secs(10)),
+        "the first pane did not reattach after missed; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        workspace.wait_text("TWO-AGAIN", secs(10)),
+        "the second pane did not reattach after missed; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    let log = scratch.entries();
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .count(),
+        2,
+        "a resnapshot must not start terminals; log={log:?}"
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.get("attached").is_some() && entry["terminal"] == target)
+                .count(),
+            2,
+            "{target} must attach once per snapshot; log={log:?}"
+        );
+    }
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+    assert!(workspace.pty.is_cooked(), "the terminal was not restored");
 }
 
 /// Ctrl-] detaches: the attach stream is closed, the program keeps running,
@@ -619,6 +900,9 @@ fn fake_connect() -> io::Result<()> {
     let log_path = log_path.as_deref();
     let generation = bump_generation(log_path);
     log(log_path, json!({"generation": generation}));
+    // The name of the start whose reply will be dropped, so the next
+    // connection can present the terminal it created.
+    let pending_name = last_start_name(log_path);
 
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -654,6 +938,12 @@ fn fake_connect() -> io::Result<()> {
     // A kept terminal whose program was lost and not yet replaced.
     let mut parked = false;
     let mut triggered = false;
+    let mut runs = 0u32;
+    // Two-pane `missed` script: attach counts drive both the first paint and
+    // the resnapshot once both panes have attached.
+    let mut t1_attaches = 0u32;
+    let mut t2_attaches = 0u32;
+    let mut missed_sent = false;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         log(
@@ -708,7 +998,17 @@ fn fake_connect() -> io::Result<()> {
         );
         match method {
             "events.subscribe" => {
-                let snapshot = if scripted_terminal(&scenario) {
+                let snapshot = if scenario == "workspace-pending" && generation > 1 {
+                    // The interrupted start did reach core: the fresh snapshot
+                    // has both terminals, the second under the requested name.
+                    let mut terminals = vec![live_record(4242)];
+                    terminals.push(named_record(
+                        "t2",
+                        pending_name.as_deref().unwrap_or("ht-0-2"),
+                        5151,
+                    ));
+                    json!({"seq": 1, "terminals": terminals, "channel": EVENTS_CHANNEL})
+                } else if scripted_terminal(&scenario) {
                     json!({
                         "seq": 1,
                         "terminals": [live_record(4242)],
@@ -720,14 +1020,35 @@ fn fake_connect() -> io::Result<()> {
                 reply(&mut output, &id, snapshot)?;
             }
             "terminal.run" => {
-                let record = if scenario == "finished" {
+                runs += 1;
+                if scenario == "workspace-pending" && generation == 1 && runs == 2 {
+                    // The terminal exists from now on, but the client never
+                    // sees the reply: the whole connection ends here.
+                    return Ok(());
+                }
+                let name = message["params"]["name"].as_str().unwrap_or_default();
+                let record = if scenario == "workspace-pending" {
+                    if runs == 1 {
+                        named_record("t1", name, 4242)
+                    } else {
+                        // If the client repeats the run, the duplicate is
+                        // visible in the log and gets a different address.
+                        named_record("t3", name, 6161)
+                    }
+                } else if scenario == "finished" {
                     record("finished")
+                } else if scenario == "workspace-missed" && runs > 1 {
+                    named_record("t2", name, 4444)
                 } else {
                     live_record(4242)
                 };
                 reply(&mut output, &id, record)?;
             }
             "terminal.attach" => {
+                let target = message["params"]["terminal"]
+                    .as_str()
+                    .unwrap_or("t1")
+                    .to_owned();
                 if scenario == "finished" {
                     reply_error(
                         &mut output,
@@ -757,11 +1078,18 @@ fn fake_connect() -> io::Result<()> {
                     let channel = next_channel;
                     next_channel += 1;
                     attached_channel = Some(channel);
-                    log(log_path, json!({"attached": channel, "terminal": "t1"}));
+                    log(log_path, json!({"attached": channel, "terminal": target}));
+                    let second_pane = target == "t2"
+                        && matches!(scenario.as_str(), "workspace-pending" | "workspace-missed");
+                    let attached_record = if second_pane {
+                        named_record("t2", pending_name.as_deref().unwrap_or("ht-0-2"), 5151)
+                    } else {
+                        live_record(4242)
+                    };
                     reply(
                         &mut output,
                         &id,
-                        json!({"channel": channel, "terminal": live_record(4242)}),
+                        json!({"channel": channel, "terminal": attached_record}),
                     )?;
                     match scenario.as_str() {
                         // The whole ending arrives as one burst: two DATA
@@ -776,6 +1104,49 @@ fn fake_connect() -> io::Result<()> {
                                 CLOSE,
                                 br#"{"reason":"exited","exit_code":0}"#,
                             )?;
+                        }
+                        // The same simultaneous DATA+CLOSE ending for the
+                        // default workspace, with a non-zero status.
+                        "workspace-final" => {
+                            write_frame(&mut output, channel, DATA, b"\x1b[38;2;1;2;3mREADY\n")?;
+                            write_frame(&mut output, channel, DATA, b"END\n")?;
+                            write_frame(
+                                &mut output,
+                                channel,
+                                CLOSE,
+                                br#"{"reason":"exited","exit_code":7}"#,
+                            )?;
+                        }
+                        "workspace-pending" => {
+                            let text: &[u8] = if target == "t2" {
+                                b"PANE-TWO\n"
+                            } else {
+                                b"PANE-ONE\n"
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
+                        }
+                        // Two panes attach, then the subscriber falls behind.
+                        // The `missed` snapshot must reattach both in place.
+                        "workspace-missed" => {
+                            let nth = if target == "t2" {
+                                t2_attaches += 1;
+                                t2_attaches
+                            } else {
+                                t1_attaches += 1;
+                                t1_attaches
+                            };
+                            let text: &[u8] = match (target.as_str(), nth) {
+                                ("t2", 1) => b"PANE-TWO\n",
+                                ("t2", _) => b"TWO-AGAIN\n",
+                                (_, 1) => b"PANE-ONE\n",
+                                (_, _) => b"ONE-AGAIN\n",
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
+                            if !missed_sent && t1_attaches > 0 && t2_attaches > 0 {
+                                missed_sent = true;
+                                let name = last_start_name(log_path);
+                                notify(&mut output, missed_workspace_event(name.as_deref()))?;
+                            }
                         }
                         "screen-detach" => {
                             write_frame(&mut output, channel, DATA, b"READY\n")?;
@@ -866,6 +1237,25 @@ fn live_record(pid: u32) -> serde_json::Value {
     record
 }
 
+/// A live record with its own address and the client's unique start name.
+fn named_record(address: &str, name: &str, pid: u32) -> serde_json::Value {
+    let mut record = live_record(pid);
+    record["address"] = json!(address);
+    record["name"] = json!(name);
+    record
+}
+
+/// The name sent by the most recent `terminal.run` in the log. On the second
+/// connection this is the start whose reply the first connection dropped.
+fn last_start_name(path: Option<&Path>) -> Option<String> {
+    let text = std::fs::read_to_string(path?).ok()?;
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["call"] == "terminal.run")
+        .filter_map(|entry| entry["params"]["name"].as_str().map(str::to_owned))
+        .next_back()
+}
+
 /// One `event` notification, on the events stream.
 fn event_message(seq: u64, kind: &str, data: serde_json::Value) -> serde_json::Value {
     json!({
@@ -889,6 +1279,21 @@ fn missed_event() -> serde_json::Value {
         "jsonrpc": "2.0",
         "method": "missed",
         "params": {"seq": 9, "terminals": [live_record(5555)]},
+    })
+}
+
+/// A fresh snapshot with both workspace panes, as core sends after `missed`.
+fn missed_workspace_event(name: Option<&str>) -> serde_json::Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "missed",
+        "params": {
+            "seq": 9,
+            "terminals": [
+                live_record(4242),
+                named_record("t2", name.unwrap_or("ht-0-2"), 5151)
+            ]
+        },
     })
 }
 

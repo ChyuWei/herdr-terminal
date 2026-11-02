@@ -1,0 +1,1008 @@
+//! The pure workspace: spaces, tabs, panes and their split layout.
+//!
+//! This module has no IO and no clock. It owns the stable ids M4 will persist,
+//! the layout tree, focus and zoom, and the rules for starting and closing
+//! panes. The screen runtime turns the model's effects into `terminal.run`,
+//! `terminal.kill` and attach streams.
+//!
+//! # Close, keep and kill
+//!
+//! Every pane has a terminal address and an `owned` flag (this client ran it)
+//! and a `keep` flag (leave the program running when the pane closes):
+//!
+//! * `x` close: a kept or adopted pane is **detached** (the program keeps
+//!   running); an owned, not kept pane is **ended** (`terminal.kill` then
+//!   `terminal.rm`, so no untracked program is left behind).
+//! * `e` keep: close the pane and detach, leaving the program running. The
+//!   screen shows the address so the user knows what still runs.
+//! * `X` kill: close and **end** the terminal even if it was kept.
+//!
+//! A pane whose program already ended keeps its final screen as a **finished
+//! pane**: every close key only forgets its record (`terminal.rm`), because
+//! there is no program left to detach or kill. The pane stays visible until
+//! the person closes it explicitly; nothing silently discards the final
+//! screen.
+//!
+//! The proposed M3 key table used `k`/`K` for keep/kill; those keys are the
+//! conventional focus/move-up family, so [`super::keys`] maps keep/kill to
+//! `e`/`X` and the help overlay lists them.
+//!
+//! Closing the last pane of a tab closes the tab; closing the last tab of a
+//! space closes the space. The workspace always keeps one space with one
+//! (possibly empty) tab, which gives the empty state a place to live.
+
+use super::geometry;
+use ratatui::layout::Rect;
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// A stable workspace id. Ids are never reused, so a persisted layout cannot
+/// point at a different object after a restart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpaceId(pub u64);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TabId(pub u64);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PaneId(pub u64);
+
+impl fmt::Display for SpaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl fmt::Display for TabId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl fmt::Display for PaneId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// How a split lays its children out. `Columns` puts them left to right (a
+/// vertical divider); `Rows` puts them top to bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    Columns,
+    Rows,
+}
+
+/// A focus or move direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+/// One child of a split and its relative size (a weight).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Child {
+    pub size: u32,
+    pub layout: Layout,
+}
+
+impl Child {
+    pub fn new(layout: Layout) -> Child {
+        Child { size: 1, layout }
+    }
+}
+
+/// The split tree. Leaves are panes; a split has at least two children.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Layout {
+    Leaf(PaneId),
+    Split { axis: Axis, children: Vec<Child> },
+}
+
+impl Layout {
+    pub fn contains(&self, pane: PaneId) -> bool {
+        match self {
+            Layout::Leaf(id) => *id == pane,
+            Layout::Split { children, .. } => {
+                children.iter().any(|child| child.layout.contains(pane))
+            }
+        }
+    }
+
+    pub fn first_leaf(&self) -> Option<PaneId> {
+        match self {
+            Layout::Leaf(id) => Some(*id),
+            Layout::Split { children, .. } => {
+                children.iter().find_map(|child| child.layout.first_leaf())
+            }
+        }
+    }
+
+    /// Every pane in tree order (tests and diagnostics).
+    pub fn leaves(&self) -> Vec<PaneId> {
+        let mut leaves = Vec::new();
+        self.collect(&mut leaves);
+        leaves
+    }
+
+    fn collect(&self, leaves: &mut Vec<PaneId>) {
+        match self {
+            Layout::Leaf(id) => leaves.push(*id),
+            Layout::Split { children, .. } => {
+                for child in children {
+                    child.layout.collect(leaves);
+                }
+            }
+        }
+    }
+
+    /// Adds `new` next to the leaf `near`. In a split of the same axis the new
+    /// leaf becomes a sibling; otherwise the leaf becomes a split of the other
+    /// axis. False when `near` is not in this tree.
+    fn split(&mut self, near: PaneId, axis: Axis, new: PaneId) -> bool {
+        match self {
+            Layout::Leaf(id) if *id == near => {
+                let old = Layout::Leaf(*id);
+                *self = Layout::Split {
+                    axis,
+                    children: vec![Child::new(old), Child::new(Layout::Leaf(new))],
+                };
+                true
+            }
+            Layout::Leaf(_) => false,
+            Layout::Split {
+                axis: split_axis,
+                children,
+            } => {
+                if *split_axis == axis
+                    && let Some(at) = children
+                        .iter()
+                        .position(|child| child.layout == Layout::Leaf(near))
+                {
+                    children.insert(at + 1, Child::new(Layout::Leaf(new)));
+                    return true;
+                }
+                for child in children {
+                    if child.layout.split(near, axis, new) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// A pane: the pure record of one terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pane {
+    pub id: PaneId,
+    /// The core terminal address (`t7`, or `machine/t7`).
+    pub address: String,
+    /// The display name shown when core has no title; the address at start.
+    pub name: String,
+    /// The terminal title reported by core (OSC 0/2).
+    pub title: String,
+    /// The OSC 7501 status word reported by core, if any.
+    pub status: Option<String>,
+    /// This client ran the terminal (as opposed to adopting one).
+    pub owned: bool,
+    /// Leave the program running when this pane closes.
+    pub keep: bool,
+    /// The program's exit status once it has finished, if it has. A finished
+    /// pane keeps its final screen until the person closes it.
+    pub exit: Option<i32>,
+}
+
+impl Pane {
+    pub fn finished(&self) -> bool {
+        self.exit.is_some()
+    }
+}
+
+/// A tab's split layout and its local view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tab {
+    pub id: TabId,
+    pub name: String,
+    /// `None` is an empty tab (the empty state).
+    pub layout: Option<Layout>,
+    pub focused: Option<PaneId>,
+    pub zoomed: Option<PaneId>,
+    /// Most recently focused pane last.
+    pub history: Vec<PaneId>,
+}
+
+impl Tab {
+    pub fn new(id: TabId, name: String) -> Tab {
+        Tab {
+            id,
+            name,
+            layout: None,
+            focused: None,
+            zoomed: None,
+            history: Vec::new(),
+        }
+    }
+
+    /// Every pane in this tab; empty for an empty tab.
+    pub fn panes(&self) -> Vec<PaneId> {
+        self.layout.as_ref().map(Layout::leaves).unwrap_or_default()
+    }
+
+    pub fn contains(&self, pane: PaneId) -> bool {
+        self.layout
+            .as_ref()
+            .is_some_and(|layout| layout.contains(pane))
+    }
+}
+
+/// A space: a named group of tabs and the folder a future file UI would use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Space {
+    pub id: SpaceId,
+    pub name: String,
+    pub folder: String,
+    pub tabs: Vec<Tab>,
+    pub active: TabId,
+}
+
+impl Space {
+    pub fn tab(&self, id: TabId) -> Option<&Tab> {
+        self.tabs.iter().find(|tab| tab.id == id)
+    }
+}
+
+/// A request to start a terminal. The runtime runs it, then calls
+/// [`Workspace::insert_terminal`]; the reserved ids are used for the labels
+/// sent with `terminal.run`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartRequest {
+    pub space: SpaceId,
+    pub tab: TabId,
+    pub placement: Placement,
+    pub new_space: bool,
+    pub new_tab: bool,
+}
+
+/// Where the new pane goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// The tab is empty (or the caller asked for a tab of its own).
+    Only,
+    /// Split the tab next to the pane `near`.
+    Split { axis: Axis, near: PaneId },
+}
+
+/// What kind of terminal to request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartKind {
+    /// The first pane of an empty workspace.
+    Initial,
+    /// A new tab in the current space.
+    Tab,
+    /// A new space with one tab.
+    Space,
+    /// A split of the focused pane.
+    Split(Axis),
+}
+
+impl StartRequest {
+    /// Labels written on `terminal.run`. They are HerdR Terminal's own
+    /// namespace, never the Herdr App's `herdr.space`/`herdr.tab`.
+    pub fn labels(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("herdr.client".to_owned(), "herdr-terminal".to_owned()),
+            ("herdr.terminal.space".to_owned(), self.space.0.to_string()),
+            ("herdr.terminal.tab".to_owned(), self.tab.0.to_string()),
+        ])
+    }
+}
+
+/// What a close request does to the terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseKind {
+    /// `x`: end an owned, not kept terminal; detach a kept or adopted one.
+    Close,
+    /// `e`: leave the program running.
+    Keep,
+    /// `X`: end the program and remove its record.
+    Kill,
+}
+
+/// The literal action the runtime performs for a closing pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseAction {
+    /// Close the attach stream; the program keeps running.
+    Detach,
+    /// Detach, `terminal.kill`, then `terminal.rm`.
+    End,
+    /// Forget a finished terminal (`terminal.rm`); its program already ended.
+    Forget,
+}
+
+pub fn close_action(pane: &Pane, kind: CloseKind) -> CloseAction {
+    if pane.finished() {
+        // There is no program left to detach or kill: closing a finished pane
+        // only forgets the record after its final screen has been shown.
+        return CloseAction::Forget;
+    }
+    match kind {
+        CloseKind::Keep => CloseAction::Detach,
+        CloseKind::Kill => CloseAction::End,
+        CloseKind::Close => {
+            if pane.keep || !pane.owned {
+                CloseAction::Detach
+            } else {
+                CloseAction::End
+            }
+        }
+    }
+}
+
+/// A pane that a command removed from the workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedPane {
+    pub pane: PaneId,
+    pub address: String,
+    pub action: CloseAction,
+}
+
+/// The whole workspace.
+#[derive(Clone, Debug)]
+pub struct Workspace {
+    spaces: Vec<Space>,
+    active: SpaceId,
+    panes: BTreeMap<PaneId, Pane>,
+    next_id: u64,
+    next_space_name: u32,
+    next_tab_name: u32,
+}
+
+impl Default for Workspace {
+    fn default() -> Workspace {
+        Workspace::new()
+    }
+}
+
+impl Workspace {
+    /// A workspace with one empty space and one empty tab.
+    pub fn new() -> Workspace {
+        let mut workspace = Workspace {
+            spaces: Vec::new(),
+            active: SpaceId(0),
+            panes: BTreeMap::new(),
+            next_id: 1,
+            next_space_name: 1,
+            next_tab_name: 1,
+        };
+        workspace.add_empty_space();
+        workspace
+    }
+
+    // --- reading ----------------------------------------------------------
+
+    pub fn spaces(&self) -> &[Space] {
+        &self.spaces
+    }
+
+    pub fn active_space_id(&self) -> SpaceId {
+        self.active
+    }
+
+    pub fn active_space(&self) -> &Space {
+        self.spaces
+            .iter()
+            .find(|space| space.id == self.active)
+            .unwrap_or_else(|| self.spaces.first().expect("a workspace has a space"))
+    }
+
+    pub fn space(&self, id: SpaceId) -> Option<&Space> {
+        self.spaces.iter().find(|space| space.id == id)
+    }
+
+    pub fn active_tab(&self) -> Option<&Tab> {
+        let space = self.active_space();
+        space
+            .tabs
+            .iter()
+            .find(|tab| tab.id == space.active)
+            .or_else(|| space.tabs.first())
+    }
+
+    pub fn active_tab_id(&self) -> Option<TabId> {
+        self.active_tab().map(|tab| tab.id)
+    }
+
+    /// The focused pane of the active tab, when it still exists in the layout.
+    pub fn focused_pane(&self) -> Option<PaneId> {
+        let tab = self.active_tab()?;
+        let focused = tab.focused?;
+        tab.contains(focused).then_some(focused)
+    }
+
+    pub fn focused_location(&self) -> Option<(SpaceId, TabId, PaneId)> {
+        let space = self.active_space();
+        let tab = self.active_tab()?;
+        Some((space.id, tab.id, self.focused_pane()?))
+    }
+
+    pub fn pane(&self, id: PaneId) -> Option<&Pane> {
+        self.panes.get(&id)
+    }
+
+    pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
+        self.panes.get_mut(&id)
+    }
+
+    pub fn panes(&self) -> impl Iterator<Item = &Pane> {
+        self.panes.values()
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.panes.len()
+    }
+
+    pub fn pane_by_address(&self, address: &str) -> Option<&Pane> {
+        self.panes.values().find(|pane| pane.address == address)
+    }
+
+    pub fn pane_id_by_address(&self, address: &str) -> Option<PaneId> {
+        self.pane_by_address(address).map(|pane| pane.id)
+    }
+
+    /// The space/tab that owns a pane, if it is in a layout.
+    pub fn location(&self, pane: PaneId) -> Option<(SpaceId, TabId)> {
+        for space in &self.spaces {
+            for tab in &space.tabs {
+                if tab.contains(pane) {
+                    return Some((space.id, tab.id));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn tab(&self, space: SpaceId, tab: TabId) -> Option<&Tab> {
+        self.space(space)?.tab(tab)
+    }
+
+    // --- starting terminals ----------------------------------------------
+
+    /// Reserves ids and describes the terminal to start. The model is not
+    /// changed until [`Workspace::insert_terminal`] succeeds; a failed
+    /// `terminal.run` leaves no empty tab behind.
+    pub fn start_request(&mut self, kind: StartKind) -> StartRequest {
+        match kind {
+            StartKind::Initial => {
+                let (space, tab) = self.active_ids();
+                StartRequest {
+                    space,
+                    tab,
+                    placement: Placement::Only,
+                    new_space: false,
+                    new_tab: false,
+                }
+            }
+            StartKind::Tab => StartRequest {
+                space: self.active_space_id(),
+                tab: TabId(self.reserve()),
+                placement: Placement::Only,
+                new_space: false,
+                new_tab: true,
+            },
+            StartKind::Space => StartRequest {
+                space: SpaceId(self.reserve()),
+                tab: TabId(self.reserve()),
+                placement: Placement::Only,
+                new_space: true,
+                new_tab: true,
+            },
+            StartKind::Split(axis) => {
+                let (space, tab) = self.active_ids();
+                let placement = self
+                    .focused_pane()
+                    .map(|near| Placement::Split { axis, near })
+                    .unwrap_or(Placement::Only);
+                StartRequest {
+                    space,
+                    tab,
+                    placement,
+                    new_space: false,
+                    new_tab: false,
+                }
+            }
+        }
+    }
+
+    /// Inserts a successfully started terminal. Creates the requested space or
+    /// tab when needed, makes it active, focuses the pane and clears zoom.
+    /// The returned id is stable for the life of the workspace.
+    pub fn insert_terminal(
+        &mut self,
+        request: &StartRequest,
+        address: String,
+        name: String,
+    ) -> PaneId {
+        let pane_id = PaneId(self.reserve());
+        if !self.spaces.iter().any(|space| space.id == request.space) {
+            let space_name = self.space_name();
+            let tab_name = self.tab_name();
+            self.spaces.push(Space {
+                id: request.space,
+                name: space_name,
+                folder: String::new(),
+                tabs: vec![Tab::new(request.tab, tab_name)],
+                active: request.tab,
+            });
+        }
+        let si = self
+            .spaces
+            .iter()
+            .position(|space| space.id == request.space)
+            .unwrap_or(0);
+        let ti = match self.spaces[si]
+            .tabs
+            .iter()
+            .position(|tab| tab.id == request.tab)
+        {
+            Some(ti) => ti,
+            None => {
+                let name = self.tab_name();
+                self.spaces[si].tabs.push(Tab::new(request.tab, name));
+                self.spaces[si].tabs.len() - 1
+            }
+        };
+        let tab_id = self.spaces[si].tabs[ti].id;
+        self.active = self.spaces[si].id;
+        self.spaces[si].active = tab_id;
+
+        self.panes.insert(
+            pane_id,
+            Pane {
+                id: pane_id,
+                address,
+                name,
+                title: String::new(),
+                status: None,
+                owned: true,
+                keep: false,
+                exit: None,
+            },
+        );
+
+        let tab = &mut self.spaces[si].tabs[ti];
+        let leaf = Layout::Leaf(pane_id);
+        tab.layout = Some(match (tab.layout.take(), request.placement) {
+            (None, _) => leaf,
+            (Some(root), Placement::Only) => Layout::Split {
+                axis: Axis::Columns,
+                children: vec![Child::new(root), Child::new(leaf)],
+            },
+            (Some(mut root), Placement::Split { axis, near }) => {
+                if root.split(near, axis, pane_id) {
+                    root
+                } else if let Some(target) = tab.focused.filter(|pane| root.contains(*pane))
+                    && root.split(target, axis, pane_id)
+                {
+                    root
+                } else {
+                    Layout::Split {
+                        axis,
+                        children: vec![Child::new(root), Child::new(leaf)],
+                    }
+                }
+            }
+        });
+        focus(tab, pane_id);
+        tab.zoomed = None;
+        pane_id
+    }
+
+    // --- removing panes and closing tabs/spaces --------------------------
+
+    /// Removes a pane from its layout and the workspace. Closes the tab when
+    /// it was its last pane and the space when it was its last tab. Keeps one
+    /// empty space/tab, so the workspace is never invalid.
+    pub fn remove_pane(&mut self, pane: PaneId) -> bool {
+        if self.panes.remove(&pane).is_none() {
+            return false;
+        }
+        let Some((space_id, tab_id)) = self.location(pane) else {
+            return true;
+        };
+        let Some(si) = self.spaces.iter().position(|space| space.id == space_id) else {
+            return true;
+        };
+        let Some(ti) = self.spaces[si].tabs.iter().position(|tab| tab.id == tab_id) else {
+            return true;
+        };
+        {
+            let tab = &mut self.spaces[si].tabs[ti];
+            if let Some(root) = tab.layout.take() {
+                tab.layout = remove_layout(root, pane);
+            }
+            tab.history.retain(|id| *id != pane);
+            if tab.zoomed == Some(pane) {
+                tab.zoomed = None;
+            }
+            if tab.focused == Some(pane) {
+                refocus(tab);
+            }
+        }
+        if self.spaces[si].tabs[ti].layout.is_some() {
+            return true;
+        }
+
+        // The tab is empty: close it.
+        let space = &mut self.spaces[si];
+        space.tabs.remove(ti);
+        if space.tabs.is_empty() {
+            self.spaces.remove(si);
+            if self.active == space_id {
+                self.active = self
+                    .spaces
+                    .get(si.min(self.spaces.len().saturating_sub(1)))
+                    .map(|space| space.id)
+                    .unwrap_or(SpaceId(0));
+            }
+            if self.spaces.is_empty() {
+                self.add_empty_space();
+            }
+        } else if space.active == tab_id || !space.tabs.iter().any(|tab| tab.id == space.active) {
+            let next = ti.min(space.tabs.len().saturating_sub(1));
+            space.active = space.tabs[next].id;
+        }
+        true
+    }
+
+    // --- focus, move, zoom ------------------------------------------------
+
+    /// Focuses the nearest pane in `direction`, using the full layout even
+    /// while zoomed. A successful focus leaves zoom, so the target is visible.
+    pub fn focus_direction(&mut self, viewport: Rect, direction: Direction) -> bool {
+        let Some(tab) = self.active_tab() else {
+            return false;
+        };
+        let Some(focused) = tab.focused else {
+            return false;
+        };
+        let rects = geometry::compute_without_zoom(Some(tab), viewport);
+        let Some(next) = geometry::neighbor(&rects, focused, direction) else {
+            return false;
+        };
+        let Some(tab) = self.active_tab_mut() else {
+            return false;
+        };
+        focus(tab, next);
+        tab.zoomed = None;
+        true
+    }
+
+    /// Swaps the focused pane with its nearest neighbour in `direction`.
+    /// The pane id and the focus stay the same; only the layout positions
+    /// move. Only panes in the same tab take part.
+    pub fn move_direction(&mut self, viewport: Rect, direction: Direction) -> bool {
+        let Some(tab) = self.active_tab() else {
+            return false;
+        };
+        let Some(focused) = tab.focused else {
+            return false;
+        };
+        let rects = geometry::compute_without_zoom(Some(tab), viewport);
+        let Some(next) = geometry::neighbor(&rects, focused, direction) else {
+            return false;
+        };
+        let Some(tab) = self.active_tab_mut() else {
+            return false;
+        };
+        let Some(root) = tab.layout.as_mut() else {
+            return false;
+        };
+        swap_leaves(root, focused, next);
+        true
+    }
+
+    /// Toggles zoom on the focused pane. Zoom is per tab.
+    pub fn toggle_zoom(&mut self) -> bool {
+        let Some(tab) = self.active_tab_mut() else {
+            return false;
+        };
+        let Some(focused) = tab.focused else {
+            return false;
+        };
+        tab.zoomed = if tab.zoomed == Some(focused) {
+            None
+        } else {
+            Some(focused)
+        };
+        true
+    }
+
+    // --- tabs and spaces --------------------------------------------------
+
+    pub fn next_tab(&mut self) -> bool {
+        self.step_tab(1)
+    }
+
+    pub fn prev_tab(&mut self) -> bool {
+        self.step_tab(-1)
+    }
+
+    fn step_tab(&mut self, step: isize) -> bool {
+        let Some(space) = self.active_space_mut() else {
+            return false;
+        };
+        let Some(index) = space.tabs.iter().position(|tab| tab.id == space.active) else {
+            return false;
+        };
+        let len = space.tabs.len() as isize;
+        let next = (index as isize + step).rem_euclid(len) as usize;
+        let id = space.tabs[next].id;
+        if space.active == id {
+            return false;
+        }
+        space.active = id;
+        true
+    }
+
+    /// Selects the `tab`th tab of the active space (1-based).
+    pub fn select_tab(&mut self, tab: u8) -> bool {
+        let Some(space) = self.active_space_mut() else {
+            return false;
+        };
+        let Some(index) = usize::from(tab).checked_sub(1) else {
+            return false;
+        };
+        let Some(target) = space.tabs.get(index) else {
+            return false;
+        };
+        let id = target.id;
+        if space.active == id {
+            return false;
+        }
+        space.active = id;
+        true
+    }
+
+    pub fn next_space(&mut self) -> bool {
+        self.step_space(1)
+    }
+
+    pub fn prev_space(&mut self) -> bool {
+        self.step_space(-1)
+    }
+
+    fn step_space(&mut self, step: isize) -> bool {
+        let Some(index) = self.spaces.iter().position(|space| space.id == self.active) else {
+            return false;
+        };
+        let len = self.spaces.len() as isize;
+        let next = (index as isize + step).rem_euclid(len) as usize;
+        let id = self.spaces[next].id;
+        if self.active == id {
+            return false;
+        }
+        self.active = id;
+        true
+    }
+
+    // --- naming -----------------------------------------------------------
+
+    pub fn rename_tab(&mut self, space_id: SpaceId, tab_id: TabId, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(space) = self
+            .spaces
+            .iter_mut()
+            .find(|candidate| candidate.id == space_id)
+        else {
+            return false;
+        };
+        let Some(tab) = space.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return false;
+        };
+        if tab.name == name {
+            return false;
+        }
+        tab.name = name.to_owned();
+        true
+    }
+
+    pub fn rename_space(&mut self, space: SpaceId, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(space) = self
+            .spaces
+            .iter_mut()
+            .find(|candidate| candidate.id == space)
+        else {
+            return false;
+        };
+        if space.name == name {
+            return false;
+        }
+        space.name = name.to_owned();
+        true
+    }
+
+    // --- display facts from core -----------------------------------------
+
+    pub fn set_title(&mut self, pane: PaneId, title: String) -> bool {
+        match self.panes.get_mut(&pane) {
+            Some(record) if record.title != title => {
+                record.title = title;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_status(&mut self, pane: PaneId, status: Option<String>) -> bool {
+        match self.panes.get_mut(&pane) {
+            Some(record) if record.status != status => {
+                record.status = status;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Marks a pane as a finished view with its exit status. Its final screen
+    /// stays drawn until the person closes the pane.
+    pub fn mark_finished(&mut self, pane: PaneId, code: i32) -> bool {
+        match self.panes.get_mut(&pane) {
+            Some(record) if record.exit != Some(code) => {
+                record.exit = Some(code);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A kept terminal that got a fresh shell is no longer a finished view.
+    pub fn mark_live(&mut self, pane: PaneId) -> bool {
+        match self.panes.get_mut(&pane) {
+            Some(record) if record.exit.is_some() => {
+                record.exit = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // --- internals --------------------------------------------------------
+
+    fn reserve(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn active_ids(&self) -> (SpaceId, TabId) {
+        let space = self.active_space();
+        let tab = space
+            .tabs
+            .iter()
+            .find(|tab| tab.id == space.active)
+            .or_else(|| space.tabs.first())
+            .expect("a space has a tab");
+        (space.id, tab.id)
+    }
+
+    fn active_tab_mut(&mut self) -> Option<&mut Tab> {
+        let active = self.active;
+        let space = self.spaces.iter_mut().find(|space| space.id == active)?;
+        let tab_id = space.active;
+        let index = space
+            .tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)
+            .or_else(|| (!space.tabs.is_empty()).then_some(0))?;
+        space.tabs.get_mut(index)
+    }
+
+    fn active_space_mut(&mut self) -> Option<&mut Space> {
+        self.spaces.iter_mut().find(|space| space.id == self.active)
+    }
+
+    fn space_name(&mut self) -> String {
+        let number = self.next_space_name;
+        self.next_space_name += 1;
+        format!("space {number}")
+    }
+
+    fn tab_name(&mut self) -> String {
+        let number = self.next_tab_name;
+        self.next_tab_name += 1;
+        format!("tab {number}")
+    }
+
+    fn add_empty_space(&mut self) {
+        let space_id = SpaceId(self.reserve());
+        let tab_id = TabId(self.reserve());
+        let name = self.space_name();
+        let tab_name = self.tab_name();
+        self.spaces.push(Space {
+            id: space_id,
+            name,
+            folder: String::new(),
+            tabs: vec![Tab::new(tab_id, tab_name)],
+            active: tab_id,
+        });
+        self.active = space_id;
+    }
+}
+
+fn focus(tab: &mut Tab, pane: PaneId) {
+    tab.history.retain(|id| *id != pane);
+    tab.history.push(pane);
+    tab.focused = Some(pane);
+}
+
+fn refocus(tab: &mut Tab) {
+    let contains = |pane: PaneId| tab.contains(pane);
+    let candidate = tab
+        .history
+        .iter()
+        .rev()
+        .copied()
+        .find(|pane| contains(*pane))
+        .or_else(|| tab.layout.as_ref().and_then(Layout::first_leaf));
+    match candidate {
+        Some(pane) => {
+            tab.focused = Some(pane);
+            tab.history.retain(|id| *id != pane);
+            tab.history.push(pane);
+        }
+        None => {
+            tab.focused = None;
+            tab.history.clear();
+        }
+    }
+}
+
+fn remove_layout(layout: Layout, pane: PaneId) -> Option<Layout> {
+    match layout {
+        Layout::Leaf(id) => (id != pane).then_some(Layout::Leaf(id)),
+        Layout::Split { axis, children } => {
+            let children: Vec<Child> = children
+                .into_iter()
+                .filter_map(|child| {
+                    remove_layout(child.layout, pane).map(|layout| Child {
+                        size: child.size,
+                        layout,
+                    })
+                })
+                .collect();
+            match children.len() {
+                0 => None,
+                1 => children.into_iter().next().map(|child| child.layout),
+                _ => Some(Layout::Split { axis, children }),
+            }
+        }
+    }
+}
+
+fn swap_leaves(layout: &mut Layout, a: PaneId, b: PaneId) {
+    match layout {
+        Layout::Leaf(id) => {
+            if *id == a {
+                *id = b;
+            } else if *id == b {
+                *id = a;
+            }
+        }
+        Layout::Split { children, .. } => {
+            for child in children {
+                swap_leaves(&mut child.layout, a, b);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

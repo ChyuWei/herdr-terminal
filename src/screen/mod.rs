@@ -1,4 +1,5 @@
-//! The default single-pane screen: one terminal, rendered with ratatui.
+//! The single-pane screen behind `ht screen`: one terminal, rendered with
+//! ratatui.
 //!
 //! It is built from the M0 wire client, the M1 local Ghostty VT and one
 //! `events.subscribe` stream. The VT and the pure [`crate::model::Model`] are
@@ -12,29 +13,22 @@
 //! the terminal record stays, so a later `ht` finds it again. The terminal is
 //! restored on every exit path by [`ScreenGuard`].
 
-mod lifecycle;
+pub(crate) mod lifecycle;
 mod play;
 mod pointer;
-mod view;
+pub(crate) mod view;
 
-use crate::core::{CoreClient, Display, Error, Result, RunOptions};
+use crate::core::{CoreClient, Error, Result, RunOptions};
 use crate::model::Model;
 use crate::session::{self, Session};
-use crate::term::{self, RawMode};
-use crate::vt::{Color, Screen};
-use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{
-    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use std::io::{IsTerminal, stdout};
+use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+// The outer-terminal guard, facts and VT error mapping are shared with the
+// workspace screen. `play` uses them through `super::`.
+pub(crate) use crate::tui::{ScreenGuard, ScreenTerminal, display, vt_error};
 
 /// Default attach size when there is no terminal and no explicit size.
 pub const DEFAULT_COLS: u16 = 80;
@@ -50,8 +44,6 @@ const DRAIN_BYTES: usize = 256 * 1024;
 /// The longest one drain may take, for floods of many small chunks.
 const DRAIN_TIME: Duration = Duration::from_millis(8);
 
-type ScreenTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
-
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub cols: Option<u16>,
@@ -66,20 +58,8 @@ pub struct Options {
 /// Runs one full-screen terminal. Returns the program's exit code, or 0 when
 /// the viewer detaches with Ctrl-].
 pub fn run(options: Options) -> Result<i32> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(Error::Usage(
-            "ht needs a terminal on stdin and stdout (use ht probe for pipes)".into(),
-        ));
-    }
-    let size = term::window_size();
-    let cols = options
-        .cols
-        .or(size.map(|(cols, _)| cols))
-        .unwrap_or(DEFAULT_COLS);
-    let rows = options
-        .rows
-        .or(size.map(|(_, rows)| rows))
-        .unwrap_or(DEFAULT_ROWS);
+    crate::tui::require_tty()?;
+    let (cols, rows) = crate::tui::viewport(options.cols, options.rows);
 
     let client = Arc::new(CoreClient::connect(options.hc.as_deref())?);
     let events = client.subscribe()?;
@@ -216,131 +196,6 @@ fn finish_error(session: &mut Session, core_id: &str, error: Error) -> Error {
         pointer::pointer(core_id, session.address()).clear();
     }
     error
-}
-
-/// The viewer's display facts: the terminal's current default colors. A TUI
-/// has no cell pixel size, so `cell` is left out.
-fn display(screen: &Screen) -> Display {
-    Display {
-        fg: hex(screen.default_fg),
-        bg: hex(screen.default_bg),
-        cursor: None,
-        cell: None,
-    }
-}
-
-fn hex(color: Color) -> Option<String> {
-    match color {
-        Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
-        Color::Default => None,
-    }
-}
-
-fn vt_error(error: crate::vt::VtError) -> Error {
-    Error::Protocol(error.to_string())
-}
-
-/// Owns the outer terminal: raw mode, the alternate screen, focus reporting,
-/// keyboard enhancement and mouse capture. `restore` is idempotent and runs
-/// on drop, so every return path puts the terminal back.
-struct ScreenGuard {
-    raw: Option<RawMode>,
-    alternate: bool,
-    focus: bool,
-    keyboard: bool,
-    mouse: bool,
-    restored: bool,
-}
-
-impl ScreenGuard {
-    fn enter() -> Result<ScreenGuard> {
-        let raw = RawMode::enter()?
-            .ok_or_else(|| Error::Usage("ht needs a terminal on stdin and stdout".into()))?;
-        let mut guard = ScreenGuard {
-            raw: Some(raw),
-            alternate: false,
-            focus: false,
-            keyboard: false,
-            mouse: false,
-            restored: false,
-        };
-        let mut out = stdout();
-        execute!(out, EnterAlternateScreen).map_err(Error::Io)?;
-        guard.alternate = true;
-        // Focus and keyboard enhancement are nice-to-have: a terminal that
-        // does not know them still renders and accepts input.
-        if execute!(out, EnableFocusChange).is_ok() {
-            guard.focus = true;
-        }
-        if execute!(
-            out,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-            )
-        )
-        .is_ok()
-        {
-            guard.keyboard = true;
-        }
-        Ok(guard)
-    }
-
-    /// Turns the outer terminal's mouse reporting on or off to match the
-    /// program's tracking mode.
-    fn set_mouse(&mut self, on: bool) -> Result<()> {
-        if self.mouse == on {
-            return Ok(());
-        }
-        let mut out = stdout();
-        if on {
-            execute!(out, EnableMouseCapture).map_err(Error::Io)?;
-        } else {
-            execute!(out, DisableMouseCapture).map_err(Error::Io)?;
-        }
-        self.mouse = on;
-        Ok(())
-    }
-
-    fn restore(&mut self) {
-        if self.restored {
-            return;
-        }
-        self.restored = true;
-        let mut out = stdout();
-        if self.mouse {
-            let _ = execute!(out, DisableMouseCapture);
-            self.mouse = false;
-        }
-        if self.keyboard {
-            let _ = execute!(out, PopKeyboardEnhancementFlags);
-            self.keyboard = false;
-        }
-        if self.focus {
-            let _ = execute!(out, DisableFocusChange);
-            self.focus = false;
-        }
-        // Ratatui and the program's DECSCUSR both change the outer cursor.
-        // Show it again and hand the shape back to the user's default: there
-        // is no portable query for the shape or visibility from before.
-        let _ = execute!(
-            out,
-            crossterm::cursor::Show,
-            SetCursorStyle::DefaultUserShape
-        );
-        if self.alternate {
-            let _ = execute!(out, LeaveAlternateScreen);
-            self.alternate = false;
-        }
-        // Restores the termios captured before raw mode.
-        self.raw.take();
-    }
-}
-
-impl Drop for ScreenGuard {
-    fn drop(&mut self) {
-        self.restore();
-    }
 }
 
 #[cfg(test)]

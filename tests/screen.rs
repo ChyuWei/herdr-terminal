@@ -184,6 +184,12 @@ fn cleanup(session: &Session, address: &str) {
 
 /// The `hc connect` child of `parent`, once it exists.
 fn connect_child(parent: u32, timeout: Duration) -> Option<u32> {
+    connect_child_other(parent, None, timeout)
+}
+
+/// A child of `parent` other than `old`; after killing the first `hc connect`,
+/// this is the replacement the reconnect spawned.
+fn connect_child_other(parent: u32, old: Option<u32>, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     loop {
         let output = std::process::Command::new("pgrep")
@@ -192,7 +198,8 @@ fn connect_child(parent: u32, timeout: Duration) -> Option<u32> {
             .ok()?;
         if let Some(pid) = String::from_utf8_lossy(&output.stdout)
             .split_whitespace()
-            .find_map(|pid| pid.parse::<u32>().ok())
+            .filter_map(|pid| pid.parse::<u32>().ok())
+            .find(|pid| Some(*pid) != old)
         {
             return Some(pid);
         }
@@ -542,7 +549,12 @@ fn a_program_that_ends_while_detached_is_recovered_by_the_next_ht() {
     let Some(mut session) = session() else { return };
     session.start();
 
-    let mut first = ScreenRun::spawn(&session, &["--cols", "40", "--rows", "10"], 40, 10);
+    let mut first = ScreenRun::spawn(
+        &session,
+        &["screen", "--cols", "40", "--rows", "10"],
+        40,
+        10,
+    );
     let address = wait_only_labelled(&session, secs(10));
     first.send(&[0x1d]);
     first.wait_exit(secs(5)).expect("the first client detaches");
@@ -560,7 +572,12 @@ fn a_program_that_ends_while_detached_is_recovered_by_the_next_ht() {
 
     // The next client finds the finished terminal through its pointer, reads
     // its final screen, reports its status, and removes the record.
-    let mut second = ScreenRun::spawn(&session, &["--cols", "40", "--rows", "10"], 40, 10);
+    let mut second = ScreenRun::spawn(
+        &session,
+        &["screen", "--cols", "40", "--rows", "10"],
+        40,
+        10,
+    );
     let status = second
         .wait_exit(secs(10))
         .expect("the next ht recovers the finished terminal");
@@ -607,7 +624,12 @@ fn two_live_labelled_terminals_are_a_clear_failure_not_a_duplicate() {
     let addresses = labelled_live(&session);
     assert_eq!(addresses.len(), 2, "setup: {addresses:?}");
 
-    let mut run = ScreenRun::spawn(&session, &["--cols", "40", "--rows", "10"], 40, 10);
+    let mut run = ScreenRun::spawn(
+        &session,
+        &["screen", "--cols", "40", "--rows", "10"],
+        40,
+        10,
+    );
     let status = run
         .wait_exit(secs(10))
         .expect("ht fails instead of guessing");
@@ -644,7 +666,12 @@ fn ht_reattaches_to_the_terminal_a_previous_client_left() {
     let Some(mut session) = session() else { return };
     session.start();
 
-    let mut first = ScreenRun::spawn(&session, &["--cols", "40", "--rows", "10"], 40, 10);
+    let mut first = ScreenRun::spawn(
+        &session,
+        &["screen", "--cols", "40", "--rows", "10"],
+        40,
+        10,
+    );
     let address = wait_only_labelled(&session, secs(10));
     // The marker cannot appear in the typed line's echo: only a running shell
     // turns `%s` into the word.
@@ -666,7 +693,12 @@ fn ht_reattaches_to_the_terminal_a_previous_client_left() {
     );
 
     // The second client must adopt the same terminal, not start a duplicate.
-    let mut second = ScreenRun::spawn(&session, &["--cols", "40", "--rows", "10"], 40, 10);
+    let mut second = ScreenRun::spawn(
+        &session,
+        &["screen", "--cols", "40", "--rows", "10"],
+        40,
+        10,
+    );
     assert!(
         second.wait_text("FIRST-DONE", secs(10)),
         "the second client did not reattach to the running shell; raw={:?} stderr={:?}",
@@ -699,7 +731,12 @@ fn ht_reconnects_when_its_connection_child_dies() {
     let Some(mut session) = session() else { return };
     session.start();
 
-    let mut run = ScreenRun::spawn(&session, &["--cols", "40", "--rows", "10"], 40, 10);
+    let mut run = ScreenRun::spawn(
+        &session,
+        &["screen", "--cols", "40", "--rows", "10"],
+        40,
+        10,
+    );
     let address = wait_only_labelled(&session, secs(10));
     run.send(b"printf 'BEFORE-RECONNECT-%s\\n' DONE\n");
     assert!(
@@ -714,9 +751,13 @@ fn ht_reconnects_when_its_connection_child_dies() {
     // SAFETY: the pid is this test's child process of its own ht.
     assert_eq!(unsafe { libc::kill(child as i32, libc::SIGKILL) }, 0);
 
-    // Input sent while reconnecting is dropped; keep sending until the new
-    // connection carries one. That also proves input still works afterwards.
-    // The marker cannot come from the typed line's echo.
+    // Input sent while reconnecting can be dropped mid-line, leaving the
+    // shell on a continuation prompt; wait for the replacement connection
+    // before typing. That also proves input works afterwards. The marker
+    // cannot come from the typed line's echo.
+    let replacement = connect_child_other(run.probe.id(), Some(child), secs(20))
+        .expect("ht spawned a replacement hc connect after the outage");
+    assert_ne!(replacement, child);
     let deadline = Instant::now() + secs(20);
     let mut seen = false;
     while Instant::now() < deadline {
@@ -754,7 +795,12 @@ fn ht_reattaches_after_a_core_restart() {
     let Some(mut session) = session() else { return };
     session.start();
 
-    let mut run = ScreenRun::spawn(&session, &["--cols", "40", "--rows", "10"], 40, 10);
+    let mut run = ScreenRun::spawn(
+        &session,
+        &["screen", "--cols", "40", "--rows", "10"],
+        40,
+        10,
+    );
     let address = wait_only_labelled(&session, secs(10));
     run.send(b"printf 'BEFORE-RESTART-%s\\n' DONE\n");
     assert!(

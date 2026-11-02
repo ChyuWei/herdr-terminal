@@ -1,8 +1,8 @@
 //! `ht`: the HerdR Terminal command line. With no subcommand it opens the
-//! single-pane screen; `screen` and `probe` remain explicit forms.
+//! workspace; `screen` is the M2 single-pane screen and `probe` the raw pipe.
 
 use herdr_terminal::core::{Error, Result};
-use herdr_terminal::{probe, screen};
+use herdr_terminal::{probe, screen, workspace};
 use std::ffi::OsString;
 use std::iter::once;
 use std::path::PathBuf;
@@ -17,12 +17,19 @@ usage:
   ht --version
   ht --help
 
-`ht` (and `ht screen`) is one full-screen terminal rendered with ratatui. It
-draws a shell's cells, colors, cursor and wide characters; keys and the mouse
-go to it, including Ctrl-C. Without PROGRAM it reattaches to the terminal a
-previous client left running, or starts a shell. Ctrl-] detaches: the program
-keeps running, and the next `ht` reattaches to it. It needs a terminal on
-stdin and stdout.
+`ht` opens a workspace: a tab bar, a status bar and panes of terminals. It
+starts PROGRAM (or a shell) in the first pane. Prefix Ctrl-b, then:
+  c new tab   C new space   n/p tab   N/P space   1..9 select tab
+  v split left/right   s split top/bottom   h/j/k/l focus   H/J/K/L move
+  z zoom   x close   e keep and close   X kill and close
+  , rename tab   . rename space   ? help
+Ctrl-] (or prefix q) detaches: every program keeps running. It needs a
+terminal on stdin and stdout.
+
+`ht screen` is the single-pane screen. It draws one terminal's cells, colors,
+cursor and wide characters; keys and the mouse go to it, including Ctrl-C.
+Without PROGRAM it reattaches to the terminal a previous client left running,
+or starts a shell. Ctrl-] detaches.
 
 `ht probe` copies the program's raw bytes to stdout; Ctrl-C quits.
 
@@ -51,7 +58,7 @@ fn main() {
 fn run(args: Vec<OsString>) -> Result<i32> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
-        return screen::run(screen::Options::default());
+        return workspace::run(workspace::Options::default());
     };
     let command = text(command)?;
     match command.as_str() {
@@ -77,12 +84,28 @@ fn run(args: Vec<OsString>) -> Result<i32> {
                 verbose: options.verbose,
             }),
         },
-        // Options without a subcommand open the screen: `ht --cols 100`.
+        // Options without a subcommand open the workspace: `ht --cols 100`.
         _ if command.starts_with('-') => {
             let options = command_options("ht", once(OsString::from(command)).chain(args))?;
-            screen_command(options)
+            workspace_command(options)
         }
         other => Err(Error::Usage(format!("unknown command {other:?}\n\n{HELP}"))),
+    }
+}
+
+fn workspace_command(options: Option<CommandOptions>) -> Result<i32> {
+    match options {
+        None => {
+            print!("{HELP}");
+            Ok(0)
+        }
+        Some(options) => workspace::run(workspace::Options {
+            cols: options.cols,
+            rows: options.rows,
+            hc: options.hc,
+            argv: options.argv,
+            verbose: options.verbose,
+        }),
     }
 }
 
@@ -102,7 +125,7 @@ fn screen_command(options: Option<CommandOptions>) -> Result<i32> {
     }
 }
 
-/// Options shared by `screen` and `probe`.
+/// Options shared by the workspace, `screen` and `probe`.
 struct CommandOptions {
     cols: Option<u16>,
     rows: Option<u16>,

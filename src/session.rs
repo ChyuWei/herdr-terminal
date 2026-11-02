@@ -17,6 +17,7 @@ use crate::core::{Attached, CoreClient, Error, Result, RpcError, Terminal};
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A terminal managed by this client, with cleanup on every path.
 ///
@@ -55,6 +56,18 @@ impl Session {
             channel: None,
             done: false,
             owned: false,
+        }
+    }
+
+    /// Reclaims a terminal this process started whose `terminal.run` reply was
+    /// lost with the connection. Core created it; it is still ours to clean up.
+    pub fn reclaim(client: Arc<CoreClient>, address: String) -> Session {
+        Session {
+            client,
+            address,
+            channel: None,
+            done: false,
+            owned: true,
         }
     }
 
@@ -114,6 +127,13 @@ impl Session {
         self.done = true;
         self.channel = None;
         missing_ok(self.client.rm(&self.address))
+    }
+
+    /// The program ended and its attach stream closed. The record and final
+    /// screen stay until the pane is closed; no `terminal.rm` is sent yet.
+    pub fn finished(&mut self) {
+        self.done = true;
+        self.channel = None;
     }
 
     /// A local error after `terminal.run`: end the terminal this process
@@ -177,6 +197,15 @@ impl Drop for Session {
             let _ = self.cleanup();
         }
     }
+}
+
+/// A name unique among live terminals, used only so a workspace can reclaim a
+/// terminal whose `terminal.run` reply was lost. Core accepts 1-32 characters
+/// from `a-z0-9-_.`; the process id and a counter keep it unique in practice.
+pub fn start_name() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("ht-{:x}-{:x}", std::process::id(), seq)
 }
 
 /// A program that exits before `terminal.attach` lands has no stream, but core
@@ -279,6 +308,18 @@ pub fn exit_code_from(reason: Option<&Value>) -> i32 {
     }
 }
 
+/// The exit status to show when a program ended: a finished record is
+/// authoritative; a record that still looks live must not override the CLOSE
+/// reason core just sent (a live record has no status of its own).
+pub fn finished_exit_code(record: Option<&Terminal>, reason: Option<&Value>) -> i32 {
+    match record {
+        Some(record) if record.state == "finished" => record_exit_code(record),
+        _ if reason.is_some() => exit_code_from(reason),
+        Some(record) => record_exit_code(record),
+        None => 0,
+    }
+}
+
 /// The exit status to report for a finished terminal record.
 pub fn record_exit_code(record: &Terminal) -> i32 {
     if let Some(code) = record.exit_code {
@@ -333,5 +374,32 @@ mod tests {
         assert_eq!(record_exit_code(&record), 1);
         record.reason = Some("exited".into());
         assert_eq!(record_exit_code(&record), 0);
+    }
+
+    #[test]
+    fn a_live_record_does_not_hide_the_close_reason() {
+        let live = Terminal {
+            state: "live".into(),
+            keep: true,
+            pid: Some(1),
+            ..Terminal::default()
+        };
+        let finished = Terminal {
+            state: "finished".into(),
+            exit_code: Some(7),
+            ..live.clone()
+        };
+
+        // The model still has the live record when the CLOSE arrives: its lack
+        // of a status must not turn exit 7 into "exited (1)".
+        let reason = json!({"reason": "exited", "exit_code": 7});
+        assert_eq!(finished_exit_code(Some(&live), Some(&reason)), 7);
+        // A finished record wins over a stale reason.
+        let stale = json!({"reason": "exited", "exit_code": 0});
+        assert_eq!(finished_exit_code(Some(&finished), Some(&stale)), 7);
+        // Without either, the old record is all there is.
+        assert_eq!(finished_exit_code(Some(&live), None), 1);
+        assert_eq!(finished_exit_code(None, Some(&reason)), 7);
+        assert_eq!(finished_exit_code(None, None), 0);
     }
 }

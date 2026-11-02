@@ -7,11 +7,11 @@ use serde_json::Value;
 use std::time::Duration;
 
 /// The first reconnect delay; it doubles up to [`RECONNECT_MAX`].
-pub(super) const RECONNECT_BASE: Duration = Duration::from_millis(250);
-pub(super) const RECONNECT_MAX: Duration = Duration::from_secs(5);
+pub(crate) const RECONNECT_BASE: Duration = Duration::from_millis(250);
+pub(crate) const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 /// What a closed attach stream means.
-pub(super) enum Disposition {
+pub(crate) enum Disposition {
     Finished,
     Lost,
     Removed,
@@ -19,7 +19,7 @@ pub(super) enum Disposition {
 
 /// A kept terminal whose program was lost stays alive and waits; everything
 /// else is the program ending (or the record being removed).
-pub(super) fn disposition(
+pub(crate) fn disposition(
     record: Option<&Terminal>,
     finished: bool,
     removed: bool,
@@ -62,7 +62,7 @@ pub(super) fn disposition(
 
 /// Whether a failed reconnect attempt is worth retrying. A wrong core version
 /// or a bad command line will not fix itself.
-pub(super) fn retryable(error: &Error) -> bool {
+pub(crate) fn retryable(error: &Error) -> bool {
     matches!(
         error,
         Error::Io(_)
@@ -74,7 +74,7 @@ pub(super) fn retryable(error: &Error) -> bool {
     )
 }
 
-pub(super) fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     let shift = attempt.min(5);
     let millis = RECONNECT_BASE
         .as_millis()
@@ -83,7 +83,7 @@ pub(super) fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(millis as u64)
 }
 
-pub(super) fn reconnect_message(attempt: u32) -> String {
+pub(crate) fn reconnect_message(attempt: u32) -> String {
     if attempt == 0 {
         "reconnecting to core…".into()
     } else {

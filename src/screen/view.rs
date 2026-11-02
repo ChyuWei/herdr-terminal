@@ -38,7 +38,9 @@ pub fn draw_buffer(buffer: &mut Buffer, area: Rect, screen: &Screen) {
             let Some(cell) = screen.cell(x, y) else {
                 continue;
             };
-            let target = &mut buffer[(x, y)];
+            let target_x = area.x.saturating_add(x);
+            let target_y = area.y.saturating_add(y);
+            let target = &mut buffer[(target_x, target_y)];
             if cell.width == 0 {
                 // Covered by the wide character to the left.
                 target.set_symbol("").set_diff_option(CellDiffOption::Skip);
@@ -47,7 +49,7 @@ pub fn draw_buffer(buffer: &mut Buffer, area: Rect, screen: &Screen) {
             target.set_symbol(&cell.text);
             target.set_style(style(cell));
             if cell.width == 2 && x + 1 < cols {
-                buffer[(x + 1, y)]
+                buffer[(area.x.saturating_add(x + 1), target_y)]
                     .set_symbol("")
                     .set_diff_option(CellDiffOption::Skip);
             }

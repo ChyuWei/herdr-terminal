@@ -53,6 +53,9 @@ pub struct Attached {
 pub struct RunOptions {
     /// Program and arguments; empty starts core's own shell.
     pub argv: Vec<String>,
+    /// A name unique among live terminals. It lets a client reclaim its own
+    /// terminal when the `terminal.run` reply is lost with the connection.
+    pub name: Option<String>,
     /// Set on top of core's environment.
     pub env: BTreeMap<String, String>,
     /// Labels stored with the terminal.
@@ -69,6 +72,7 @@ impl Default for RunOptions {
     fn default() -> RunOptions {
         RunOptions {
             argv: Vec::new(),
+            name: None,
             env: client_env(),
             labels: client_labels(),
             rm: false,
@@ -310,7 +314,7 @@ impl CoreClient {
 
     /// Starts a program in a new core terminal.
     pub fn run(&self, options: &RunOptions) -> Result<Terminal> {
-        let params = json!({
+        let mut params = json!({
             "argv": &options.argv,
             "env": &options.env,
             "labels": &options.labels,
@@ -318,6 +322,9 @@ impl CoreClient {
             "keep": options.keep,
             "no_parent": options.no_parent,
         });
+        if let Some(name) = &options.name {
+            params["name"] = json!(name);
+        }
         let value = self.call("terminal.run", params)?;
         let terminal: Terminal = serde_json::from_value(value.clone())?;
         if terminal.address.is_empty() {
