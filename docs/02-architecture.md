@@ -152,8 +152,9 @@ version 1:
 
 **Local view** is per screen and stays on the machine:
 `$XDG_STATE_HOME/herdr-terminal/view-<screen>.json` (falling back to
-`$HOME/.local/state`). It holds the active space/tab, focus, zoom and focus
-history. The screen id comes from `HERDR_TERMINAL_SCREEN` (1–64 characters of
+`$HOME/.local/state`). It holds the active space/tab, focus, zoom, focus
+history and whether the agent sidebar is open. The screen id comes from
+`HERDR_TERMINAL_SCREEN` (1–64 characters of
 `[A-Za-z0-9._-]`, default `default`). A missing or malformed view is a warning,
 not an error; ids that no longer exist are ignored.
 
@@ -184,7 +185,60 @@ recovered panes are workspace-owned for close semantics (`x` ends a non-kept
 program, `e` detaches, `X` kills), while their `Session` is adopted so a local
 startup or fatal error never kills a program this process did not start.
 
-### 4.6 Core client and lifecycle
+### 4.6 Agents, attention and the sidebar
+
+An **agent** is a terminal in this workspace whose core record is `reported`
+or has a current `status`; both come only from OSC 7501. The client never
+infers agency or status from screen text, titles, argv, process names or a
+vendor registry. Each row derives a word from core's status:
+
+| Word | Meaning |
+|---|---|
+| `blocked` | reported `blocked` or `error` |
+| `working` | reported `working` |
+| `done` | reported `done`, or no status on an unseen turn |
+| `idle` | no status on a seen turn |
+| other | the program's own state string |
+
+A turn is unseen when its number is greater than `herdr.seen`; a terminal
+without a valid label falls back to a transient local flag that is set by
+looking and cleared by a hidden busy→non-busy transition. Nothing local is
+persisted.
+
+**Sidebar** (`a`) lists every agent across all spaces and tabs. Pinned agents
+first, then blocked > done > working > idle (unknown sorts with idle), then
+workspace order and address. `j`/`k` move, `g`/`G` go to the first/last row,
+`Enter` jumps, `i` peeks, `p` toggles the pin, `u` marks unread; `Esc` or `a`
+closes. Selection is by pane id and follows reordering. Only the open flag is
+local view state (`sidebar_open`, schema v1); the selection is not persisted.
+
+**Peek** (`prefix i`, or `i` on a sidebar row) draws the pane's existing local
+VT plus core facts (title, address, word, turn, pin, app, progress, kind,
+message). It never calls `terminal.read` and never infers status from the
+text. Any key closes it; `Ctrl-]` still detaches.
+
+**Jump** (`prefix g`/`G`) cycles agents in sidebar order, clears zoom, and does
+not write the document.
+
+**Attention**: after a baseline built from the first snapshot, a newly
+`blocked` row and a hidden busy→non-busy transition produce one in-app
+status-bar notice and one BEL; no OS notification. Looking at a terminal
+suppresses the "finished" alert. A `missed`/reconnect rebuilds the baseline so
+old transitions are not replayed.
+
+**Seen and pin** are shared core labels, raised through `terminal.label`:
+`herdr.seen` is written once per visible or peeked `(address, turn)` and only
+raised (a missing label is written with the current turn, including 0). `u`
+writes `turn - 1`, the only lower write. `herdr.pinned` is `"1"` or removed.
+Writes are optimistic, use core's returned record as authoritative, give a
+failed seen write at most three attempts in total per turn (the first try and
+two retries), and are dropped when the turn changes, the pane disappears or a
+`labels` event confirms the value. New
+terminals start with `herdr.seen=0`. These labels are deliberately excluded
+from document capture and from restore's repair comparison: seen/pin changes
+must never dirty the layout document.
+
+### 4.7 Core client and lifecycle
 
 **Startup**
 
@@ -251,7 +305,6 @@ Statuses:
 |---|---|---|
 | 1 | Layout persistence and restore | Space/tab/pane tree in the document |
 | 1 | Resize, drag, tab reorder | Mouse and keyboard |
-| 2 | Agent sidebar, peek, notifications | Status/turn/title/foreground from core |
 | 2 | Command palette, keybindings, help, settings | Native widgets |
 | 3 | Machines: add/connect/list/rename/rm | Remote terminals and events |
 | 3 | Files: read/write/edit, diff, external editor | Core `file.*`; no embedded editor |

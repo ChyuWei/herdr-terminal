@@ -7,6 +7,7 @@
 //! running) and `X` (end the terminal). This is the only deviation from the
 //! proposed table, and the help overlay lists the keys that actually work.
 
+use super::agents::Jump;
 use super::commands::Command;
 use super::model::{Axis, CloseKind, Direction};
 
@@ -45,6 +46,10 @@ pub fn command(key: char) -> Option<Command> {
         'X' => Some(Command::Close(CloseKind::Kill)),
         ',' => Some(Command::RenameTab),
         '.' => Some(Command::RenameSpace),
+        'a' => Some(Command::Agents),
+        'i' => Some(Command::Peek),
+        'g' => Some(Command::JumpAgent(Jump::Next)),
+        'G' => Some(Command::JumpAgent(Jump::Previous)),
         'q' => Some(Command::Detach),
         _ => None,
     }
@@ -80,6 +85,10 @@ mod tests {
             ('X', Command::Close(CloseKind::Kill)),
             (',', Command::RenameTab),
             ('.', Command::RenameSpace),
+            ('a', Command::Agents),
+            ('i', Command::Peek),
+            ('g', Command::JumpAgent(Jump::Next)),
+            ('G', Command::JumpAgent(Jump::Previous)),
             ('q', Command::Detach),
         ];
         for (key, expected) in bindings {
@@ -92,7 +101,7 @@ mod tests {
 
     #[test]
     fn unbound_keys_are_consumed_without_a_command() {
-        for key in ['a', 'b', 'd', '0', ' ', '!', 'Z'] {
+        for key in ['b', 'd', '0', ' ', '!', 'Z'] {
             assert_eq!(command(key), None, "key {key:?}");
         }
     }

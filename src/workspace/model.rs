@@ -43,8 +43,8 @@ mod view;
 
 pub use doc::{
     CLIENT_LABEL, CLIENT_NAME, Conflict, DOC_NAME, DocChild, DocError, DocLayout, DocPane,
-    DocSpace, DocTab, MergeResult, SharedDoc, TerminalInfo, merge, pane_addresses, pane_ids,
-    recover_orphans, restore,
+    DocSpace, DocTab, MergeResult, PINNED_LABEL, SEEN_LABEL, SharedDoc, TerminalInfo,
+    identity_labels, is_attention_label, merge, pane_addresses, pane_ids, recover_orphans, restore,
 };
 pub use ids::IdAllocator;
 pub use view::{LocalView, TabView};
@@ -312,6 +312,9 @@ impl StartRequest {
             ("herdr.terminal.space".to_owned(), self.space.0.to_string()),
             ("herdr.terminal.tab".to_owned(), self.tab.0.to_string()),
             ("herdr.terminal.pane".to_owned(), self.pane.0.to_string()),
+            // Every terminal this client starts begins seen at turn 0, so a
+            // fresh agent never shows an unread turn just for existing.
+            ("herdr.seen".to_owned(), "0".to_owned()),
         ])
     }
 }
@@ -745,6 +748,33 @@ impl Workspace {
         true
     }
 
+    /// Selects the space and tab holding `pane`, focuses it and clears zoom.
+    /// A jump is local: no layout, label or document changes.
+    pub fn jump_to(&mut self, pane: PaneId) -> bool {
+        let Some((space_id, tab_id)) = self.location(pane) else {
+            return false;
+        };
+        let Some(space_index) = self.spaces.iter().position(|space| space.id == space_id) else {
+            return false;
+        };
+        let Some(tab_index) = self.spaces[space_index]
+            .tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)
+        else {
+            return false;
+        };
+        self.active = space_id;
+        self.spaces[space_index].active = tab_id;
+        let tab = &mut self.spaces[space_index].tabs[tab_index];
+        if !tab.contains(pane) {
+            return false;
+        }
+        focus(tab, pane);
+        tab.zoomed = None;
+        true
+    }
+
     /// Toggles zoom on the focused pane. Zoom is per tab.
     pub fn toggle_zoom(&mut self) -> bool {
         let Some(tab) = self.active_tab_mut() else {
@@ -888,6 +918,43 @@ impl Workspace {
         match self.panes.get_mut(&pane) {
             Some(record) if record.status != status => {
                 record.status = status;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Synchronizes only the live attention labels (`herdr.seen`,
+    /// `herdr.pinned`) from a core record. Pane identity labels are this
+    /// client's and are never dropped by a partial or older snapshot record.
+    pub fn set_attention_labels(
+        &mut self,
+        pane: PaneId,
+        labels: &BTreeMap<String, String>,
+    ) -> bool {
+        let Some(record) = self.panes.get_mut(&pane) else {
+            return false;
+        };
+        let before = record.labels.clone();
+        for key in [SEEN_LABEL, PINNED_LABEL] {
+            match labels.get(key) {
+                Some(value) => {
+                    record.labels.insert(key.to_owned(), value.clone());
+                }
+                None => {
+                    record.labels.remove(key);
+                }
+            }
+        }
+        record.labels != before
+    }
+
+    /// Replaces a live pane's whole label map (an optimistic shared-label
+    /// update or core's `terminal.label` reply).
+    pub fn set_labels(&mut self, pane: PaneId, labels: BTreeMap<String, String>) -> bool {
+        match self.panes.get_mut(&pane) {
+            Some(record) if record.labels != labels => {
+                record.labels = labels;
                 true
             }
             _ => false,

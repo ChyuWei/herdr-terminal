@@ -17,7 +17,7 @@
 //! record, killed the program, or started a duplicate terminal.
 
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -115,6 +115,38 @@ fn run_tests() {
     screen_exits_when_the_terminal_is_removed();
     #[cfg(unix)]
     screen_reconnects_to_the_same_terminal();
+    #[cfg(unix)]
+    workspace_marks_visible_turns_seen_and_alerts_for_hidden_finishes();
+    #[cfg(unix)]
+    workspace_alerts_once_for_a_hidden_finish_and_keeps_the_turn_unseen();
+    #[cfg(unix)]
+    workspace_honors_another_clients_pin_label();
+    #[cfg(unix)]
+    workspace_pins_unpins_and_marks_unread_with_exact_labels();
+    #[cfg(unix)]
+    workspace_sidebar_toggle_and_close_do_not_write_the_document();
+    #[cfg(unix)]
+    workspace_sidebar_consumes_unhandled_keys();
+    #[cfg(unix)]
+    workspace_jumps_to_an_agent_and_marks_it_seen();
+    #[cfg(unix)]
+    workspace_peeks_an_agent_without_reading_its_screen();
+    #[cfg(unix)]
+    workspace_sidebar_and_peek_do_not_resize_panes();
+    #[cfg(unix)]
+    workspace_retries_a_failed_seen_write_with_a_bounded_delay();
+    #[cfg(unix)]
+    workspace_gives_up_after_a_timed_out_seen_write();
+    #[cfg(unix)]
+    workspace_reconnects_after_a_lost_label_write();
+    #[cfg(unix)]
+    workspace_startup_baseline_does_not_alert_for_blocked_agents();
+    #[cfg(unix)]
+    workspace_reconnect_baseline_does_not_replay_an_alert();
+    #[cfg(unix)]
+    workspace_missed_baseline_does_not_replay_an_alert();
+    #[cfg(unix)]
+    workspace_restores_an_open_sidebar_from_the_local_view();
     println!("fake-core tests passed");
 }
 
@@ -128,6 +160,8 @@ struct FakeScreen {
     output: Capture,
     stderr: Capture,
     input: std::fs::File,
+    cols: u16,
+    rows: u16,
 }
 
 #[cfg(unix)]
@@ -147,6 +181,11 @@ impl FakeScreen {
         Self::spawn_parts(scratch, scenario, &[], &[], Some(screen))
     }
 
+    /// The default workspace at a size wide enough for untruncated notices.
+    fn spawn_workspace_wide(scratch: &Scratch, scenario: &str, cols: u16, rows: u16) -> FakeScreen {
+        Self::spawn_parts_size(scratch, scenario, &[], &[], None, cols, rows)
+    }
+
     fn spawn_parts(
         scratch: &Scratch,
         scenario: &str,
@@ -154,15 +193,27 @@ impl FakeScreen {
         args: &[&str],
         screen: Option<&str>,
     ) -> FakeScreen {
+        Self::spawn_parts_size(scratch, scenario, leading, args, screen, 80, 24)
+    }
+
+    fn spawn_parts_size(
+        scratch: &Scratch,
+        scenario: &str,
+        leading: &[&str],
+        args: &[&str],
+        screen: Option<&str>,
+        cols: u16,
+        rows: u16,
+    ) -> FakeScreen {
         let exe = std::env::current_exe().expect("test executable");
-        let pty = common::pty::Pty::open(80, 24);
+        let pty = common::pty::Pty::open(cols, rows);
         let (stdin, stdout) = pty.stdio();
         let mut command = Command::new(HT);
         command
             .args(leading)
             .arg("--hc")
             .arg(&exe)
-            .args(["--cols", "80", "--rows", "24"])
+            .args(["--cols", &cols.to_string(), "--rows", &rows.to_string()])
             .args(args)
             .env("FAKE_SCENARIO", scenario)
             .env("FAKE_LOG", scratch.log())
@@ -187,6 +238,8 @@ impl FakeScreen {
             output,
             stderr,
             input,
+            cols,
+            rows,
         }
     }
 
@@ -195,7 +248,7 @@ impl FakeScreen {
     }
 
     fn rendered(&self) -> String {
-        let mut vt = herdr_terminal::vt::Vt::new(80, 24).expect("local VT");
+        let mut vt = herdr_terminal::vt::Vt::new(self.cols, self.rows).expect("local VT");
         vt.feed(&self.output.bytes());
         vt.snapshot().expect("snapshot").lines().join("\n")
     }
@@ -2198,12 +2251,851 @@ fn a_local_write_error_stops_and_removes_the_started_terminal() {
 
 // --- fake core -------------------------------------------------------------
 
+// --- M5 agent scenarios ----------------------------------------------------
+
+#[cfg(unix)]
+fn label_calls(scratch: &Scratch) -> Vec<Value> {
+    scratch
+        .entries()
+        .into_iter()
+        .filter(|entry| entry["call"] == "terminal.label")
+        .collect()
+}
+
+#[cfg(unix)]
+fn seen_writes(scratch: &Scratch, address: &str, turn: u64) -> usize {
+    label_calls(scratch)
+        .iter()
+        .filter(|entry| {
+            entry["params"]["terminal"] == json!(address)
+                && entry["params"]["labels"]["herdr.seen"] == json!(turn.to_string())
+        })
+        .count()
+}
+
+#[cfg(unix)]
+fn wait_for_seen(scratch: &Scratch, address: &str, turn: u64) -> bool {
+    common::wait_until(secs(8), || seen_writes(scratch, address, turn) > 0)
+}
+
+#[cfg(unix)]
+fn wait_for_text(screen: &FakeScreen, needle: &str) -> bool {
+    screen.wait_text(needle, secs(10))
+}
+
+#[cfg(unix)]
+fn doc_set_calls(scratch: &Scratch) -> usize {
+    scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["call"] == "doc.set")
+        .count()
+}
+
+/// Asserts a local-only action neither changed the shared document version
+/// nor sent a `doc.set`.
+#[cfg(unix)]
+fn assert_doc_untouched(scratch: &Scratch, version: u64, writes: usize, what: &str) {
+    assert_eq!(
+        scratch.doc_version(),
+        version,
+        "{what} changed the layout document: {:?}",
+        scratch.doc_value()
+    );
+    assert_eq!(
+        doc_set_calls(scratch),
+        writes,
+        "{what} sent doc.set: {:?}",
+        scratch.entries()
+    );
+}
+
+#[cfg(unix)]
+fn wait_doc_has(scratch: &Scratch, address: &str) -> bool {
+    common::wait_until(secs(10), || {
+        doc_addresses(&scratch.doc_value())
+            .iter()
+            .any(|known| known == address)
+    })
+}
+
+#[cfg(unix)]
+fn attach_keys(scratch: &Scratch) -> Vec<String> {
+    scratch
+        .entries()
+        .iter()
+        .filter_map(|entry| entry["attach_data"]["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[cfg(unix)]
+fn resize_frames(scratch: &Scratch) -> usize {
+    scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["frame"]["kind"] == json!(3))
+        .count()
+}
+
+#[cfg(unix)]
+fn generation_count(scratch: &Scratch) -> usize {
+    scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry.get("generation").is_some())
+        .count()
+}
+
+#[cfg(unix)]
+fn attach_count(scratch: &Scratch, address: &str) -> usize {
+    scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry.get("attached").is_some() && entry["terminal"] == json!(address))
+        .count()
+}
+
+/// A visible turn is marked seen once; a hidden busy→non-busy transition is a
+/// notice and one BEL, and never writes a seen label.
+#[cfg(unix)]
+fn workspace_marks_visible_turns_seen_and_alerts_for_hidden_finishes() {
+    let scratch = Scratch::new("agents-turn");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-turn");
+    assert!(
+        wait_for_text(&screen, "[idle]"),
+        "the reported agent was not shown: {:?}",
+        screen.rendered()
+    );
+
+    // A key makes the agent work, then finish at turn 1 while visible.
+    screen.send(b"x");
+    assert!(
+        wait_for_text(&screen, "[working]"),
+        "working status was not shown: {:?}",
+        screen.rendered()
+    );
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+    screen.send(b"x");
+    assert!(
+        wait_for_seen(&scratch, "t1", 1),
+        "visible turn 1 was not marked seen: log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        wait_for_text(&screen, "[idle]"),
+        "the seen agent was not idle: {:?}",
+        screen.rendered()
+    );
+    assert_doc_untouched(&scratch, version, writes, "the automatic seen write");
+    assert_eq!(
+        screen.output.count(7),
+        0,
+        "a finish while looking must not beep"
+    );
+
+    // Same turn, focus away and back: the seen write is not repeated.
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"), "sidebar did not open");
+    screen.send(b"\x1b");
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
+        "sidebar did not close: {:?}",
+        screen.rendered()
+    );
+    // Another event at the same turn gives the refreshed row a visible change
+    // to wait on before counting the seen writes again.
+    screen.send(b"x");
+    assert!(
+        wait_for_text(&screen, "claude3"),
+        "the same-turn event was not applied: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        seen_writes(&scratch, "t1", 1),
+        1,
+        "re-focusing the same turn rewrote seen: {:?}",
+        label_calls(&scratch)
+    );
+}
+
+/// While the sidebar covers the panes, a busy agent finishing is one notice and
+/// one BEL, and its new turn stays unseen.
+#[cfg(unix)]
+fn workspace_alerts_once_for_a_hidden_finish_and_keeps_the_turn_unseen() {
+    let scratch = Scratch::new("agents-hidden");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-hidden-done");
+    assert!(wait_for_text(&screen, "[blocked]"));
+
+    // A new tab makes t1 hidden and gives the working t2 the whole tab.
+    screen.command(b'c');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "the second agent did not attach: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_seen(&scratch, "t2", 1),
+        "visible t2 turn 1 not seen"
+    );
+
+    // Back to the first tab; the sidebar then covers both panes.
+    screen.command(b'1');
+    assert!(wait_for_text(&screen, "Build"));
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"));
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+
+    // A pin write is the deterministic moment the sidebar is open; the fake
+    // then finishes t2 at turn 2 while nobody can see it.
+    screen.send(b"p");
+    assert!(
+        screen.output.wait_count(7, 1, secs(10)),
+        "the hidden finish did not beep: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "finished"),
+        "the hidden finish had no notice: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "unseen"),
+        "the hidden turn was marked seen: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "1 blocked · 1 done"),
+        "attention count is wrong: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        seen_writes(&scratch, "t2", 2),
+        0,
+        "a hidden turn must not be marked seen: {:?}",
+        label_calls(&scratch)
+    );
+    assert_doc_untouched(&scratch, version, writes, "the hidden finish and pin");
+}
+
+/// Another client's pin label re-sorts the sidebar without this client writing
+/// a pin label itself.
+#[cfg(unix)]
+fn workspace_honors_another_clients_pin_label() {
+    let scratch = Scratch::new("agents-pin-event");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-pin-event");
+    assert!(wait_for_text(&screen, "[blocked]"));
+    screen.command(b'v');
+    assert!(wait_for_text(&screen, "PANE-TWO"));
+
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"));
+    let version = scratch.doc_version();
+    assert!(
+        common::wait_until(secs(10), || {
+            let text = screen.rendered();
+            match (text.find("Review"), text.find("Build")) {
+                (Some(review), Some(build)) => review < build,
+                _ => false,
+            }
+        }),
+        "the pinned agent did not move first: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("* idle"),
+        "the pin marker is missing: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        label_calls(&scratch)
+            .iter()
+            .all(|call| call["params"]["labels"]["herdr.pinned"].is_null()),
+        "this client wrote a pin label instead of honoring the event: {:?}",
+        label_calls(&scratch)
+    );
+    assert_eq!(scratch.doc_version(), version);
+}
+
+/// `p` and `u` send exactly the documented merged label maps, and nothing
+/// else about the document changes.
+#[cfg(unix)]
+fn workspace_pins_unpins_and_marks_unread_with_exact_labels() {
+    let scratch = Scratch::new("agents-pin");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-pin");
+    assert!(wait_for_text(&screen, "[blocked]"));
+    assert!(
+        wait_for_seen(&scratch, "t1", 2),
+        "the visible turn was not marked seen: {:?}",
+        scratch.entries()
+    );
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"));
+    assert_doc_untouched(&scratch, version, writes, "opening the sidebar");
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+
+    screen.send(b"p");
+    assert!(
+        common::wait_until(secs(5), || {
+            label_calls(&scratch).iter().any(|call| {
+                call["params"]["terminal"] == json!("t1")
+                    && call["params"]["labels"] == json!({"herdr.pinned": "1"})
+            })
+        }),
+        "the pin map was not exact: {:?}",
+        label_calls(&scratch)
+    );
+    assert_doc_untouched(&scratch, version, writes, "pin");
+
+    screen.send(b"p");
+    assert!(
+        common::wait_until(secs(5), || {
+            label_calls(&scratch).iter().any(|call| {
+                call["params"]["terminal"] == json!("t1")
+                    && call["params"]["labels"] == json!({"herdr.pinned": ""})
+            })
+        }),
+        "the unpin map was not exact: {:?}",
+        label_calls(&scratch)
+    );
+    assert_doc_untouched(&scratch, version, writes, "unpin");
+
+    screen.send(b"u");
+    assert!(
+        common::wait_until(secs(5), || {
+            label_calls(&scratch).iter().any(|call| {
+                call["params"]["terminal"] == json!("t1")
+                    && call["params"]["labels"] == json!({"herdr.seen": "1"})
+            })
+        }),
+        "unread did not write turn-1: {:?}",
+        label_calls(&scratch)
+    );
+    assert_doc_untouched(&scratch, version, writes, "unread");
+}
+
+/// Opening and closing the sidebar is local view state: it never writes the
+/// layout document, whether `a` or Esc closes it.
+#[cfg(unix)]
+fn workspace_sidebar_toggle_and_close_do_not_write_the_document() {
+    let scratch = Scratch::new("agents-sidebar-doc");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-turn");
+    assert!(wait_for_text(&screen, "[idle]"));
+    assert!(
+        wait_doc_has(&scratch, "t1"),
+        "the initial layout was not saved: {:?}",
+        scratch.doc_value()
+    );
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"));
+    assert_doc_untouched(&scratch, version, writes, "opening the sidebar");
+
+    screen.command(b'a');
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
+        "the sidebar did not close with a: {:?}",
+        screen.rendered()
+    );
+    assert_doc_untouched(&scratch, version, writes, "closing the sidebar with a");
+
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"));
+    screen.send(b"\x1b");
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
+        "the sidebar did not close with Esc: {:?}",
+        screen.rendered()
+    );
+    assert_doc_untouched(&scratch, version, writes, "closing the sidebar with Esc");
+}
+
+/// Sidebar keys are modal: an unhandled key is consumed, the sidebar stays
+/// open, and the same key reaches the pane once the sidebar closes.
+#[cfg(unix)]
+fn workspace_sidebar_consumes_unhandled_keys() {
+    let scratch = Scratch::new("agents-sidebar-keys");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-turn");
+    assert!(wait_for_text(&screen, "[idle]"));
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"));
+
+    let before = attach_keys(&scratch).len();
+    screen.send(b"z");
+    // Pinning is a handled sidebar key and writes a label; its log entry is a
+    // barrier proving the client has processed both keys.
+    screen.send(b"p");
+    assert!(
+        common::wait_until(secs(5), || {
+            label_calls(&scratch).iter().any(|call| {
+                call["params"]["terminal"] == json!("t1")
+                    && call["params"]["labels"] == json!({"herdr.pinned": "1"})
+            })
+        }),
+        "the pin barrier was not reached: {:?}",
+        scratch.entries()
+    );
+    assert!(wait_for_text(&screen, "pinned"));
+    assert_eq!(
+        attach_keys(&scratch).len(),
+        before,
+        "the sidebar forwarded an unhandled key: {:?}",
+        attach_keys(&scratch)
+    );
+    assert!(
+        screen.rendered().contains("agents"),
+        "the sidebar closed on an unhandled key: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("working"),
+        "the unhandled key changed the agent status: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(b"\x1b");
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
+        "the sidebar did not close: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("working"),
+        "the agent changed while the sidebar was open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"z");
+    assert!(
+        common::wait_until(secs(5), || attach_keys(&scratch).contains(&"z".to_owned())),
+        "the same key did not reach the pane after closing: {:?}",
+        attach_keys(&scratch)
+    );
+    assert!(
+        wait_for_text(&screen, "[working]"),
+        "the forwarded key did not drive the agent: {:?}",
+        screen.rendered()
+    );
+}
+
+/// Sidebar and peek are overlays: they never send RESIZE after the initial
+/// attach sizing.
+#[cfg(unix)]
+fn workspace_sidebar_and_peek_do_not_resize_panes() {
+    let scratch = Scratch::new("agents-resize");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-two");
+    assert!(wait_for_text(&screen, "[blocked]"));
+    screen.command(b'v');
+    assert!(wait_for_text(&screen, "PANE-TWO"));
+    assert!(
+        common::wait_until(secs(5), || resize_frames(&scratch) >= 1),
+        "the split never sent its initial RESIZE: {:?}",
+        scratch.entries()
+    );
+    let resizes = resize_frames(&scratch);
+
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"));
+    assert_eq!(
+        resize_frames(&scratch),
+        resizes,
+        "opening the sidebar resized a pane: {:?}",
+        scratch.entries()
+    );
+    screen.send(b"\x1b");
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
+        "the sidebar did not close: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        resize_frames(&scratch),
+        resizes,
+        "closing the sidebar resized a pane: {:?}",
+        scratch.entries()
+    );
+
+    screen.command(b'i');
+    assert!(wait_for_text(&screen, "peek · any key closes"));
+    assert_eq!(
+        resize_frames(&scratch),
+        resizes,
+        "opening peek resized a pane: {:?}",
+        scratch.entries()
+    );
+    screen.send(b"z");
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("peek · any key closes")
+        }),
+        "peek did not close: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        resize_frames(&scratch),
+        resizes,
+        "closing peek resized a pane: {:?}",
+        scratch.entries()
+    );
+}
+
+/// The first snapshot only sets the alert baseline: an agent already blocked
+/// when this screen subscribes gets an attention count but no notice and no BEL.
+#[cfg(unix)]
+fn workspace_startup_baseline_does_not_alert_for_blocked_agents() {
+    let scratch = Scratch::new("agents-startup-baseline");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 5);
+    let screen = FakeScreen::spawn_workspace(&scratch, "agents-snapshot-blocked");
+    assert!(
+        wait_for_text(&screen, "[blocked]"),
+        "the startup agent was not shown: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "1 blocked"),
+        "the startup attention count is missing: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        screen.output.count(7),
+        0,
+        "startup replayed an alert: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("needs you"),
+        "startup showed a needs-you notice: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        5,
+        "a restored blocked state must not write the document"
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "the restored agent must not be started again"
+    );
+}
+
+/// A reconnect rebuilds the alert baseline: a blocked state present in the
+/// fresh snapshot is counted, never replayed as a new alert.
+#[cfg(unix)]
+fn workspace_reconnect_baseline_does_not_replay_an_alert() {
+    let scratch = Scratch::new("agents-reconnect-baseline");
+    let screen = FakeScreen::spawn_workspace(&scratch, "agents-reconnect-blocked");
+    assert!(
+        common::wait_until(secs(10), || generation_count(&scratch) >= 2),
+        "the client did not reconnect: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        wait_for_text(&screen, "1 blocked"),
+        "the reconnected attention count is missing: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        screen.output.count(7),
+        0,
+        "the reconnect replayed an alert: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("needs you"),
+        "the reconnect showed a needs-you notice: {:?}",
+        screen.rendered()
+    );
+}
+
+/// The same baseline rule after `missed`: a blocked snapshot is counted, not
+/// replayed as a new alert.
+#[cfg(unix)]
+fn workspace_missed_baseline_does_not_replay_an_alert() {
+    let scratch = Scratch::new("agents-missed-baseline");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-missed-blocked");
+    assert!(wait_for_text(&screen, "[blocked]"));
+    screen.send(b"x");
+    assert!(
+        common::wait_until(secs(10), || attach_count(&scratch, "t1") >= 2),
+        "the terminal was not reattached after missed: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        wait_for_text(&screen, "1 blocked"),
+        "the missed attention count is missing: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        screen.output.count(7),
+        0,
+        "missed replayed an alert: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("needs you"),
+        "missed showed a needs-you notice: {:?}",
+        screen.rendered()
+    );
+}
+
+/// Jumping to a hidden agent focuses it and marks its turn seen; returning to
+/// the same turn later does not write again.
+#[cfg(unix)]
+fn workspace_jumps_to_an_agent_and_marks_it_seen() {
+    let scratch = Scratch::new("agents-jump");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-jump");
+    assert!(wait_for_text(&screen, "[blocked]"));
+    screen.command(b'c');
+    assert!(wait_for_text(&screen, "PANE-TWO"));
+    assert!(
+        screen.output.wait_count(7, 1, secs(10)),
+        "the hidden finish did not alert: {:?}",
+        screen.rendered()
+    );
+    assert!(wait_for_seen(&scratch, "t2", 1));
+
+    // Jumping is local: it must not write the layout document.
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+
+    // Sidebar order puts the done, unseen t1 before idle t2; g cycles to it.
+    screen.command(b'g');
+    assert!(
+        wait_for_text(&screen, "/ t1"),
+        "jump did not focus t1: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_seen(&scratch, "t1", 1),
+        "the jumped-to turn was not marked seen: {:?}",
+        label_calls(&scratch)
+    );
+    assert_doc_untouched(&scratch, version, writes, "jump");
+
+    // Leave and return at the same turn: no second seen write.
+    screen.command(b'2');
+    assert!(wait_for_text(&screen, "/ t2"));
+    screen.command(b'1');
+    assert!(wait_for_text(&screen, "/ t1"));
+    assert_eq!(
+        seen_writes(&scratch, "t1", 1),
+        1,
+        "the same turn was rewritten: {:?}",
+        label_calls(&scratch)
+    );
+}
+
+/// Peek draws the existing local VT plus core facts and never calls
+/// `terminal.read`.
+#[cfg(unix)]
+fn workspace_peeks_an_agent_without_reading_its_screen() {
+    let scratch = Scratch::new("agents-peek");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-two");
+    assert!(wait_for_text(&screen, "[blocked]"));
+    screen.command(b'v');
+    assert!(wait_for_text(&screen, "PANE-TWO"));
+    assert!(
+        wait_for_seen(&scratch, "t2", 1),
+        "the visible split pane was not marked seen"
+    );
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+    screen.command(b'i');
+    assert!(
+        wait_for_text(&screen, "peek · any key closes"),
+        "peek did not open: {:?}",
+        screen.rendered()
+    );
+    assert_doc_untouched(&scratch, version, writes, "peek");
+    let text = screen.rendered();
+    assert!(text.contains("Review") && text.contains("t2"), "{text}");
+    assert!(text.contains("PANE-TWO"), "peek lost the local VT: {text}");
+    assert!(
+        scratch
+            .entries()
+            .iter()
+            .all(|entry| entry["call"] != "terminal.read"),
+        "peek must never read the screen from core"
+    );
+
+    // Any key closes it and is not forwarded.
+    screen.send(b"z");
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("peek · any key closes")
+        }),
+        "peek did not close: {:?}",
+        screen.rendered()
+    );
+}
+
+/// A failed seen write is reported, retried with a delay, and stops at the
+/// bounded count.
+#[cfg(unix)]
+fn workspace_retries_a_failed_seen_write_with_a_bounded_delay() {
+    let scratch = Scratch::new("agents-fail");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-fail");
+    assert!(
+        wait_for_text(&screen, "could not mark t1 seen"),
+        "no failure was reported: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || label_calls(&scratch).len() >= 3),
+        "the seen write was not retried: {:?}",
+        label_calls(&scratch)
+    );
+    assert!(
+        wait_for_seen(&scratch, "t1", 2),
+        "the retry never succeeded: {:?}",
+        label_calls(&scratch)
+    );
+    // Opening the sidebar is a later observable action; by then the bounded
+    // retries must have stopped at three attempts.
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "agents"));
+    assert_eq!(
+        label_calls(&scratch).len(),
+        3,
+        "the retry loop was not bounded: {:?}",
+        label_calls(&scratch)
+    );
+}
+
+/// A label reply delayed past the 2 s timeout, followed by persistent failures,
+/// ends after exactly three attempts with a give-up notice and a live
+/// connection: the 2 s timeout and the total attempt count are both observable.
+#[cfg(unix)]
+fn workspace_gives_up_after_a_timed_out_seen_write() {
+    let scratch = Scratch::new("agents-slow-fail");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-slow-fail", 160, 30);
+    assert!(
+        wait_for_text(&screen, "could not mark t1 seen"),
+        "the 2 s label timeout was not reported: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "retrying"),
+        "the failure did not schedule a retry: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "giving up"),
+        "persistent failures never gave up: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        label_calls(&scratch).len(),
+        3,
+        "the give-up must stop after exactly three attempts: {:?}",
+        label_calls(&scratch)
+    );
+    // No fourth attempt in the next three retry periods.
+    assert!(
+        !common::wait_until(secs(3), || label_calls(&scratch).len() > 3),
+        "the failed write kept retrying after giving up: {:?}",
+        label_calls(&scratch)
+    );
+    // The connection is still live: a key reaches the pane.
+    let keys = attach_keys(&scratch).len();
+    screen.send(b"x");
+    assert!(
+        common::wait_until(secs(5), || attach_keys(&scratch).len() > keys),
+        "the connection or pane input died after giving up: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(label_calls(&scratch).len(), 3);
+}
+
+/// A lost label write takes the normal reconnect path, and the fresh snapshot
+/// makes the seen write again.
+#[cfg(unix)]
+fn workspace_reconnects_after_a_lost_label_write() {
+    let scratch = Scratch::new("agents-lost");
+    let screen = FakeScreen::spawn_workspace(&scratch, "agents-lost");
+    assert!(
+        wait_for_text(&screen, "reconnected to core"),
+        "the client did not recover: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || seen_writes(&scratch, "t1", 2) >= 2),
+        "the write was not retried after reconnecting: {:?}",
+        label_calls(&scratch)
+    );
+    let generations = scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry.get("generation").is_some())
+        .count();
+    assert!(generations >= 2, "the client did not reconnect");
+}
+
+/// A persisted `sidebar_open` is applied before any key, and the rest of the
+/// local view (the active tab) is still honored.
+#[cfg(unix)]
+fn workspace_restores_an_open_sidebar_from_the_local_view() {
+    let scratch = Scratch::new("agents-sidebar-restart");
+    scratch.seed_doc(doc_two_tabs(), 3);
+    scratch.seed_view(
+        "work",
+        json!({
+            "version": 1,
+            "active_space": "1",
+            "active_tabs": {"1": "31"},
+            "tabs": {
+                "30": {"focused": "3", "zoomed": null, "history": ["3"]},
+                "31": {"focused": "4", "zoomed": null, "history": ["4"]},
+            },
+            "sidebar_open": true,
+        }),
+    );
+    let mut screen = FakeScreen::spawn_workspace_as(&scratch, "doc-view", "work");
+    assert!(
+        screen.wait_text("no agents yet", secs(10)),
+        "the persisted sidebar was not drawn open before any key: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        scratch.doc_version(),
+        3,
+        "restoring the sidebar flag must not write the document"
+    );
+
+    // Closing it reveals the tab the rest of the local view selected.
+    screen.command(b'a');
+    assert!(
+        screen.wait_text("TAB-TWO", secs(5)),
+        "the rest of the local view was lost: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("TAB-ONE"),
+        "a background tab was drawn: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
 fn fake_connect() -> io::Result<()> {
     let scenario = std::env::var("FAKE_SCENARIO").unwrap_or_else(|_| "finished".into());
     let log_path = std::env::var_os("FAKE_LOG").map(PathBuf::from);
     let log_path = log_path.as_deref();
     let doc_path = log_path.map(|path| path.with_file_name("docs.json"));
     let doc_path = doc_path.as_deref();
+    let label_path = log_path.map(|path| path.with_file_name("labels.json"));
+    let label_path = label_path.as_deref();
     let generation = bump_generation(log_path);
     log(log_path, json!({"generation": generation}));
     // The name of the start whose reply will be dropped, so the next
@@ -2232,7 +3124,7 @@ fn fake_connect() -> io::Result<()> {
         "methods": [
             "events.subscribe", "terminal.run", "terminal.attach",
             "terminal.get", "terminal.read", "terminal.rm", "terminal.kill",
-            "doc.get", "doc.set"
+            "terminal.label", "doc.get", "doc.set"
         ],
         "features": ["framed", "attach", "events"],
     });
@@ -2250,6 +3142,17 @@ fn fake_connect() -> io::Result<()> {
     // can present the terminal the client started.
     let mut last_run_labels: serde_json::Map<String, Value> = serde_json::Map::new();
     let mut last_run_address = "t1".to_owned();
+    // Every start's address and labels, for merging label calls realistically.
+    let mut run_labels: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
+    // Sequence numbers for scripted agent events, above the snapshot's.
+    let mut event_seq = 100u64;
+    // How far a scripted agent sequence has progressed on attach-stream keys.
+    let mut agent_step = 0u32;
+    // `agents-label-fail`: fail this many label writes before accepting one.
+    let mut label_failures = 2u32;
+    // `agents-slow-fail`: the first label reply is delayed past the client's
+    // timeout; every later call fails. Count every call.
+    let mut label_calls_seen = 0u32;
     // A kept terminal whose program was lost and not yet replaced.
     let mut parked = false;
     let mut triggered = false;
@@ -2280,6 +3183,20 @@ fn fake_connect() -> io::Result<()> {
         // A key on an attach stream drives the scripted lifecycle. Ctrl-]
         // never arrives here: the client handles it locally.
         if kind == DATA && attached_channels.contains(&channel) {
+            log(
+                log_path,
+                json!({
+                    "attach_data": {
+                        "channel": channel,
+                        "text": String::from_utf8_lossy(&payload),
+                    }
+                }),
+            );
+            if scenario.starts_with("agents") {
+                agent_step += 1;
+                agent_key_script(&scenario, agent_step, &mut output, &mut event_seq)?;
+                continue;
+            }
             if !triggered {
                 triggered = true;
                 match scenario.as_str() {
@@ -2380,6 +3297,56 @@ fn fake_connect() -> io::Result<()> {
                         // visible in the log and gets a different address.
                         named_record("t3", name, 6161)
                     }
+                } else if scenario.starts_with("agents") {
+                    let address = if runs > 1 { "t2" } else { "t1" };
+                    let mut record = live_record(4200 + runs);
+                    record["address"] = json!(address);
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    record["reported"] = json!(true);
+                    record["turn"] = json!(if address == "t2" && scenario != "agents-pin-event" {
+                        1
+                    } else if matches!(
+                        scenario.as_str(),
+                        "agents-pin"
+                            | "agents-lost"
+                            | "agents-fail"
+                            | "agents-reconnect-blocked"
+                            | "agents-missed-blocked"
+                            | "agents-slow-fail"
+                    ) {
+                        2
+                    } else {
+                        0
+                    });
+                    record["title"] = json!(if address == "t2" { "Review" } else { "Build" });
+                    record["status"] = if address == "t2" {
+                        if scenario == "agents-hidden-done" {
+                            agent_status("working", "codex", "Review", Some("test"), None, "")
+                        } else if scenario == "agents-pin-event" {
+                            agent_status("idle", "codex", "Review", None, None, "")
+                        } else {
+                            agent_status("done", "codex", "Review", None, None, "")
+                        }
+                    } else if scenario == "agents-turn" {
+                        agent_status("idle", "claude", "Build", None, None, "")
+                    } else {
+                        agent_status(
+                            "blocked",
+                            "claude",
+                            "Build",
+                            Some("permission"),
+                            None,
+                            "allow?",
+                        )
+                    };
+                    record["foreground"] = json!({
+                        "pid": 77,
+                        "name": if address == "t2" { "codex" } else { "claude" },
+                        "argv": [if address == "t2" { "codex" } else { "claude" }, "run"],
+                        "cwd": "/work",
+                    });
+                    record
                 } else if scenario == "finished" {
                     record("finished")
                 } else if scenario == "workspace-missed" && runs > 1 {
@@ -2407,7 +3374,19 @@ fn fake_connect() -> io::Result<()> {
                     live_record(4242)
                 };
                 last_run_address = record["address"].as_str().unwrap_or("t1").to_owned();
+                run_labels.insert(last_run_address.clone(), last_run_labels.clone());
+                let created = record.clone();
                 reply(&mut output, &id, record)?;
+                if scenario.starts_with("agents") {
+                    // A real subscription sees the new terminal as `created`
+                    // with its whole record; the run reply itself is only the
+                    // session the client starts.
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(event_seq, "created", &last_run_address, created),
+                    )?;
+                }
             }
             "terminal.attach" => {
                 let target = message["params"]["terminal"]
@@ -2544,6 +3523,59 @@ fn fake_connect() -> io::Result<()> {
                         | "doc-deleted" | "doc-orphan-invalid" => {
                             write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
                         }
+                        // Agent scenarios paint their whole pane, and some
+                        // emit the events the scenario is about once both
+                        // panes are attached.
+                        scenario if scenario.starts_with("agents") => {
+                            let text: &[u8] = if target == "t2" {
+                                b"PANE-TWO\n"
+                            } else {
+                                b"PANE-ONE\n"
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
+                            if scenario == "agents-jump" && target == "t2" {
+                                event_seq += 1;
+                                notify(
+                                    &mut output,
+                                    agent_event(
+                                        event_seq,
+                                        "status",
+                                        "t1",
+                                        json!({
+                                            "status": agent_status(
+                                                "done", "claude", "Build", None, None, "ready"
+                                            ),
+                                            "records": {},
+                                            "reported": true,
+                                        }),
+                                    ),
+                                )?;
+                                event_seq += 1;
+                                notify(
+                                    &mut output,
+                                    agent_event(
+                                        event_seq,
+                                        "turn",
+                                        "t1",
+                                        json!({"turn": 1, "state": "done"}),
+                                    ),
+                                )?;
+                            }
+                            if scenario == "agents-pin-event" && target == "t2" {
+                                let mut labels = base_labels(scenario, "t2", &run_labels);
+                                labels.insert("herdr.pinned".into(), json!("1"));
+                                event_seq += 1;
+                                notify(
+                                    &mut output,
+                                    agent_event(
+                                        event_seq,
+                                        "labels",
+                                        "t2",
+                                        json!({"labels": labels}),
+                                    ),
+                                )?;
+                            }
+                        }
                         // Two panes attach, then the subscriber falls behind.
                         // The `missed` snapshot must reattach both in place.
                         "workspace-missed" => {
@@ -2638,6 +3670,124 @@ fn fake_connect() -> io::Result<()> {
             )?,
             "terminal.rm" => reply(&mut output, &id, json!({"removed": "t1"}))?,
             "terminal.kill" => reply(&mut output, &id, record("finished"))?,
+            "terminal.label" => {
+                let target = message["params"]["terminal"]
+                    .as_str()
+                    .unwrap_or("t1")
+                    .to_owned();
+                label_calls_seen += 1;
+                if scenario == "agents-slow-fail" {
+                    if label_calls_seen == 1 {
+                        // Past the client's 2 s label timeout, so the first
+                        // call reports a timeout; a 10 s timeout would absorb
+                        // this reply and silently succeed. Do not emit a
+                        // labels event: the client's route has already timed
+                        // out, and a late event would cancel the retry the
+                        // persistent-failure path is meant to exercise.
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let mut record = live_record(6000);
+                        record["address"] = json!(target);
+                        record["labels"] = json!({"herdr.seen": "2"});
+                        reply(&mut output, &id, record)?;
+                    } else {
+                        reply_error(
+                            &mut output,
+                            &id,
+                            "io",
+                            "the terminal store is busy",
+                            "retry later",
+                        )?;
+                    }
+                    continue;
+                }
+                if scenario == "agents-fail" && label_failures > 0 {
+                    // A transient non-connection failure: the client must
+                    // report it and retry with a bounded delay.
+                    label_failures -= 1;
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "io",
+                        "the terminal store is busy",
+                        "retry later",
+                    )?;
+                    continue;
+                }
+                if matches!(
+                    scenario.as_str(),
+                    "agents-lost" | "agents-reconnect-blocked"
+                ) && generation == 1
+                {
+                    // The connection fails under a label write; the client
+                    // must take its normal reconnect path.
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "lost",
+                        "the connection was lost",
+                        "reconnect",
+                    )?;
+                    continue;
+                }
+                let mut store = read_labels(label_path);
+                let mut current = store
+                    .get(&target)
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_else(|| base_labels(&scenario, &target, &run_labels));
+                for (key, value) in message["params"]["labels"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    let text = value.as_str().unwrap_or_default();
+                    if text.is_empty() {
+                        current.remove(&key);
+                    } else {
+                        current.insert(key, value);
+                    }
+                }
+                let labels = Value::Object(current.clone());
+                store.insert(target.clone(), labels.clone());
+                write_labels(label_path, &store);
+                let mut record = live_record(6000);
+                record["address"] = json!(target);
+                record["labels"] = labels.clone();
+                reply(&mut output, &id, record)?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "labels", &target, json!({"labels": labels})),
+                )?;
+                // The hidden-finish script: the label call is the deterministic
+                // moment the sidebar is open, so the terminal can finish while
+                // the person is not looking at it.
+                if scenario == "agents-hidden-done"
+                    && agent_step == 0
+                    && message["params"]["labels"]["herdr.pinned"].is_string()
+                {
+                    agent_step += 1;
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(
+                            event_seq,
+                            "status",
+                            "t2",
+                            json!({
+                                "status": agent_status("done", "codex", "Review", None, None, ""),
+                                "records": {},
+                                "reported": true,
+                            }),
+                        ),
+                    )?;
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(event_seq, "turn", "t2", json!({"turn": 2, "state": "done"})),
+                    )?;
+                }
+            }
             // Documents live in one file next to the log so every connection
             // and every screen sees the same store, like core's state file.
             "doc.get" => {
@@ -2791,6 +3941,11 @@ fn snapshot_for(
         "doc-orphan" => vec![doc_record_for(scenario, "t1"), orphan_record("t7", 5, 6, 9)],
         "doc-orphan-invalid" => vec![doc_record_for(scenario, "t1"), unlabeled_record("t9")],
         "doc-foreign" => vec![foreign_record("t1")],
+        "agents-lost" if generation > 1 => vec![agent_snapshot_record("t1")],
+        "agents-reconnect-blocked" if generation > 1 => {
+            vec![agent_blocked_snapshot_record("t1")]
+        }
+        "agents-snapshot-blocked" => vec![agent_blocked_snapshot_record("t1")],
         scenario if scripted_terminal(scenario) => vec![live_record(4242)],
         _ => Vec::new(),
     };
@@ -2830,6 +3985,55 @@ fn doc_record_for(scenario: &str, address: &str) -> Value {
             record
         }
     }
+}
+
+/// A reported terminal in a fresh snapshot, as the second connection of an
+/// agent scenario sees it: turn 2, seen 0, still working.
+fn agent_snapshot_record(address: &str) -> Value {
+    let mut labels = client_labels(1, 2, 3)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    labels.insert("herdr.seen".into(), json!("0"));
+    let mut record = live_record(4242);
+    record["address"] = json!(address);
+    record["labels"] = Value::Object(labels);
+    record["reported"] = json!(true);
+    record["turn"] = json!(2);
+    record["title"] = json!("Build");
+    record["status"] = agent_status("working", "claude", "Build", Some("edit"), None, "");
+    record
+}
+
+/// A blocked reported terminal in a fresh snapshot, already seen at turn 2.
+/// Used to prove reconnect/missed rebuild the alert baseline.
+fn agent_blocked_snapshot_record(address: &str) -> Value {
+    let mut labels = client_labels(1, 2, 3)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    labels.insert("herdr.seen".into(), json!("2"));
+    let mut record = live_record(4343);
+    record["address"] = json!(address);
+    record["labels"] = Value::Object(labels);
+    record["reported"] = json!(true);
+    record["turn"] = json!(2);
+    record["title"] = json!("Build");
+    record["status"] = agent_status(
+        "blocked",
+        "claude",
+        "Build",
+        Some("permission"),
+        None,
+        "allow?",
+    );
+    record["foreground"] = json!({
+        "pid": 78,
+        "name": "claude",
+        "argv": ["claude", "run"],
+        "cwd": "/work",
+    });
+    record
 }
 
 /// A terminal without the pane label: the same address is not enough.
@@ -3090,6 +4294,155 @@ fn event_message(seq: u64, kind: &str, data: serde_json::Value) -> serde_json::V
     })
 }
 
+/// One agent event for a chosen terminal, as core emits it.
+fn agent_event(seq: u64, kind: &str, terminal: &str, data: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"seq": seq, "type": kind, "terminal": terminal, "data": data},
+    })
+}
+
+fn agent_status(
+    state: &str,
+    app: &str,
+    title: &str,
+    kind: Option<&str>,
+    progress: Option<u8>,
+    msg: &str,
+) -> Value {
+    json!({
+        "state": state,
+        "kind": kind,
+        "progress": progress,
+        "app": app,
+        "title": title,
+        "msg": msg,
+    })
+}
+
+/// The script an agent scenario runs for each key forwarded to its program.
+fn agent_key_script(
+    scenario: &str,
+    step: u32,
+    out: &mut impl Write,
+    seq: &mut u64,
+) -> io::Result<()> {
+    if scenario == "agents-missed-blocked" {
+        if step == 1 {
+            notify(out, missed_agent_event())?;
+        }
+        return Ok(());
+    }
+    if scenario != "agents-turn" {
+        return Ok(());
+    }
+    match step {
+        1 => {
+            *seq += 1;
+            notify(
+                out,
+                agent_event(*seq, "title", "t1", json!({"title": "Build"})),
+            )?;
+            *seq += 1;
+            notify(
+                out,
+                agent_event(
+                    *seq,
+                    "foreground",
+                    "t1",
+                    json!({"pid": 77, "name": "claude", "argv": ["claude"], "cwd": "/work"}),
+                ),
+            )?;
+            *seq += 1;
+            notify(
+                out,
+                agent_event(
+                    *seq,
+                    "status",
+                    "t1",
+                    json!({
+                        "status": agent_status(
+                            "working", "claude", "Build", Some("edit"), Some(42), "writing"
+                        ),
+                        "records": {},
+                        "reported": true,
+                    }),
+                ),
+            )?;
+        }
+        2 => {
+            *seq += 1;
+            notify(
+                out,
+                agent_event(
+                    *seq,
+                    "status",
+                    "t1",
+                    json!({
+                        "status": agent_status("done", "claude", "Build", None, None, "ready"),
+                        "records": {},
+                        "reported": true,
+                    }),
+                ),
+            )?;
+            *seq += 1;
+            notify(
+                out,
+                agent_event(*seq, "turn", "t1", json!({"turn": 1, "state": "done"})),
+            )?;
+        }
+        _ => {
+            // A same-turn event with no word change: a redraw whose seen
+            // write decision must not repeat.
+            *seq += 1;
+            notify(
+                out,
+                agent_event(
+                    *seq,
+                    "status",
+                    "t1",
+                    json!({
+                        "status": agent_status("idle", "claude3", "Build", None, None, ""),
+                        "records": {},
+                        "reported": true,
+                    }),
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn read_labels(path: Option<&Path>) -> serde_json::Map<String, Value> {
+    path.and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_labels(path: Option<&Path>, store: &serde_json::Map<String, Value>) {
+    let Some(path) = path else { return };
+    let _ = std::fs::write(path, Value::Object(store.clone()).to_string());
+}
+
+/// The labels a terminal already carries when its first label call arrives.
+fn base_labels(
+    _scenario: &str,
+    target: &str,
+    run_labels: &BTreeMap<String, serde_json::Map<String, Value>>,
+) -> serde_json::Map<String, Value> {
+    if let Some(labels) = run_labels.get(target) {
+        return labels.clone();
+    }
+    let pane = if target == "t2" { 4 } else { 3 };
+    let mut labels = client_labels(1, 2, pane)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    labels.insert("herdr.seen".into(), json!("0"));
+    labels
+}
+
 fn lost_event() -> serde_json::Value {
     event_message(2, "lost", json!({"reason": "signaled", "signal": 9}))
 }
@@ -3104,6 +4457,15 @@ fn missed_event() -> serde_json::Value {
         "jsonrpc": "2.0",
         "method": "missed",
         "params": {"seq": 9, "terminals": [live_record(5555)]},
+    })
+}
+
+/// A fresh blocked snapshot for the missed-baseline scenario.
+fn missed_agent_event() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "missed",
+        "params": {"seq": 9, "terminals": [agent_blocked_snapshot_record("t1")]},
     })
 }
 
@@ -3283,6 +4645,8 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if std::env::var_os("KEEP_FAKE_SCRATCH").is_none() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }

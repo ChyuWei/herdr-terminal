@@ -16,6 +16,9 @@ pub struct LocalView {
     pub active_space: Option<SpaceId>,
     pub active_tabs: BTreeMap<SpaceId, TabId>,
     pub tabs: BTreeMap<TabId, TabView>,
+    /// The agent sidebar stayed open on this screen. Optional in version 1;
+    /// an old or malformed file simply defaults it closed.
+    pub sidebar_open: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -27,10 +30,17 @@ pub struct TabView {
 
 impl LocalView {
     pub fn capture(workspace: &Workspace) -> LocalView {
+        LocalView::capture_with_sidebar(workspace, false)
+    }
+
+    /// Captures the workspace view plus the one local UI flag the view file
+    /// persists.
+    pub fn capture_with_sidebar(workspace: &Workspace, sidebar_open: bool) -> LocalView {
         let mut view = LocalView {
             active_space: Some(workspace.active),
             active_tabs: BTreeMap::new(),
             tabs: BTreeMap::new(),
+            sidebar_open,
         };
         for space in &workspace.spaces {
             view.active_tabs.insert(space.id, space.active);
@@ -136,6 +146,7 @@ impl LocalView {
             "active_space": self.active_space.map(|space| space.0.to_string()),
             "active_tabs": Value::Object(active_tabs),
             "tabs": Value::Object(tabs),
+            "sidebar_open": self.sidebar_open,
         })
     }
 
@@ -206,6 +217,12 @@ impl LocalView {
             active_space,
             active_tabs,
             tabs,
+            // Absent in older version-1 files; a wrong type is ignored rather
+            // than discarding the rest of the view.
+            sidebar_open: object
+                .get("sidebar_open")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -295,6 +312,7 @@ mod tests {
                     history: vec![PaneId(97), pane],
                 },
             )]),
+            sidebar_open: false,
         };
         view.apply(&mut workspace);
         assert_eq!(workspace.spaces().len(), 1);
@@ -314,5 +332,24 @@ mod tests {
         assert!(LocalView::parse(&json!({"version": 2})).is_err());
         assert!(LocalView::parse(&json!({"version": 1, "tabs": {"x": {}}})).is_err());
         assert!(LocalView::parse(&json!({"version": 1, "tabs": {"7": {"history": [7]}}})).is_err());
+    }
+
+    #[test]
+    fn the_sidebar_flag_is_optional_and_never_loses_the_rest_of_the_view() {
+        let source = populated();
+        let view = LocalView::capture_with_sidebar(&source, true);
+        let value = view.to_value();
+        assert_eq!(value["sidebar_open"], json!(true));
+        assert_eq!(LocalView::parse(&value), Ok(view));
+
+        let mut old = value.clone();
+        old.as_object_mut().unwrap().remove("sidebar_open");
+        assert!(!LocalView::parse(&old).expect("old view").sidebar_open);
+
+        let mut broken = value;
+        broken["sidebar_open"] = json!("yes");
+        let parsed = LocalView::parse(&broken).expect("lenient flag");
+        assert!(!parsed.sidebar_open);
+        assert_eq!(parsed.active_space, Some(source.active_space_id()));
     }
 }

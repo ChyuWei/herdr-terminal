@@ -13,6 +13,7 @@ pub const REQUIRED_METHODS: &[&str] = &[
     "events.subscribe",
     "terminal.run",
     "terminal.attach",
+    "terminal.label",
     "doc.get",
     "doc.set",
 ];
@@ -354,7 +355,10 @@ mod tests {
         let Err(Mismatch::MissingMethods(methods)) = missing.check() else {
             panic!("missing method not detected")
         };
-        assert_eq!(methods, ["terminal.attach", "doc.get", "doc.set"]);
+        assert_eq!(
+            methods,
+            ["terminal.attach", "terminal.label", "doc.get", "doc.set"]
+        );
         assert!(
             missing
                 .check()

@@ -2,7 +2,9 @@
 //! overlay, the rename prompt, the last message, the prefix and the
 //! connection state. Pure and unit-testable.
 
+use super::agents::Overlay;
 use super::commands::RenameTarget;
+use super::model::PaneId;
 
 /// The screen's local view state.
 #[derive(Clone, Debug)]
@@ -14,6 +16,10 @@ pub struct UiState {
     /// The prefix key was pressed and the next key is a command.
     pub prefix: bool,
     pub connection: Connection,
+    /// The modal agent sidebar and its selection.
+    pub sidebar: Sidebar,
+    /// The agent being peeked, when the peek overlay is open.
+    pub peek: Option<PaneId>,
 }
 
 impl Default for UiState {
@@ -24,8 +30,36 @@ impl Default for UiState {
             message: None,
             prefix: false,
             connection: Connection::Live,
+            sidebar: Sidebar::default(),
+            peek: None,
         }
     }
+}
+
+impl UiState {
+    /// What covers the panes right now, for the visible-agent rules. A peek
+    /// is checked before the sidebar because it counts only its target.
+    pub fn agent_overlay(&self) -> Overlay {
+        if self.help {
+            Overlay::Help
+        } else if self.prompt.is_some() {
+            Overlay::Prompt
+        } else if let Some(pane) = self.peek {
+            Overlay::Peek(pane)
+        } else if self.sidebar.open {
+            Overlay::Sidebar
+        } else {
+            Overlay::None
+        }
+    }
+}
+
+/// The agent sidebar: open flag, selection by pane id, and scroll offset.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sidebar {
+    pub open: bool,
+    pub selected: Option<PaneId>,
+    pub offset: usize,
 }
 
 /// Whether the client currently has a usable core connection.
@@ -216,5 +250,23 @@ mod tests {
         assert_eq!(prompt().label(), "rename tab: ");
         let space = Prompt::new(RenameTarget::Space(super::super::model::SpaceId(1)), "s");
         assert_eq!(space.label(), "rename space: ");
+    }
+
+    #[test]
+    fn the_agent_overlay_names_what_covers_the_panes() {
+        let mut ui = UiState::default();
+        assert_eq!(ui.agent_overlay(), Overlay::None);
+        ui.sidebar.open = true;
+        assert_eq!(ui.agent_overlay(), Overlay::Sidebar);
+        ui.peek = Some(PaneId(7));
+        assert_eq!(
+            ui.agent_overlay(),
+            Overlay::Peek(PaneId(7)),
+            "a peek over the sidebar counts only its target"
+        );
+        ui.prompt = Some(prompt());
+        assert_eq!(ui.agent_overlay(), Overlay::Prompt);
+        ui.help = true;
+        assert_eq!(ui.agent_overlay(), Overlay::Help);
     }
 }

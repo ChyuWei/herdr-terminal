@@ -82,7 +82,7 @@ pub(super) fn open(options: &Options) -> Result<Opened> {
     // and disconnected changes are not replayed.
     let client = Arc::new(CoreClient::connect(options.hc.as_deref())?);
     let events = client.subscribe()?;
-    let model = Model::from_snapshot(events.snapshot());
+    let mut model = Model::from_snapshot(events.snapshot());
 
     let first = client.doc_get(DOC_NAME, DOC_TIMEOUT).map_err(read_error)?;
     let mut value = first.value;
@@ -97,7 +97,7 @@ pub(super) fn open(options: &Options) -> Result<Opened> {
         if !value.is_null() {
             let shared = parse_doc(&value)?;
             // The snapshot may predate a terminal the document already names.
-            let infos = startup_infos(&client, &model, &[&shared])?;
+            let infos = startup_infos(&client, &mut model, &[&shared])?;
             resolved = Some(restore_existing(
                 &client, &screen, &view, shared, version, &infos, &mut notes,
             ));
@@ -373,7 +373,7 @@ fn start_program(
 /// startup before any prune can be written.
 fn startup_infos(
     client: &CoreClient,
-    model: &Model,
+    model: &mut Model,
     docs: &[&SharedDoc],
 ) -> Result<Vec<TerminalInfo>> {
     let mut infos: Vec<TerminalInfo> = model.terminals().map(info).collect();
@@ -384,7 +384,12 @@ fn startup_infos(
                 continue;
             }
             match client.get(&address) {
-                Ok(record) => infos.push(info(&record)),
+                Ok(record) => {
+                    // Keep the fetched record in the model so agent rows have
+                    // its status/turn/labels before its next event arrives.
+                    model.upsert(record.clone());
+                    infos.push(info(&record));
+                }
                 // Only a confirmed `not_found` may be pruned. Any other
                 // refusal fails startup before a prune can be written, so an
                 // unknown error never loses a live terminal.

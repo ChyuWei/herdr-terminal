@@ -5,6 +5,7 @@
 //! detach of the whole client. Key bindings live in [`super::keys`], so M6 can
 //! add a palette and configurable bindings without touching these semantics.
 
+use super::agents::Jump;
 use super::model::{
     Axis, CloseKind, ClosedPane, Direction, SpaceId, StartKind, StartRequest, TabId, Workspace,
     close_action,
@@ -29,6 +30,12 @@ pub enum Command {
     Close(CloseKind),
     RenameTab,
     RenameSpace,
+    /// Toggle the modal agent sidebar.
+    Agents,
+    /// Peek the focused (or sidebar-selected) agent.
+    Peek,
+    /// Jump to the next or previous agent in sidebar order.
+    JumpAgent(Jump),
     Detach,
 }
 
@@ -54,6 +61,12 @@ pub enum Effect {
     Rename(RenameTarget),
     /// Open the help overlay.
     Help,
+    /// Toggle the agent sidebar; the runtime selects a row.
+    Agents,
+    /// Open the peek overlay for the focused or selected agent.
+    Peek,
+    /// Jump to the next or previous agent.
+    JumpAgent(Jump),
     /// Close every attach stream and leave the client.
     Detach,
 }
@@ -83,6 +96,9 @@ impl Workspace {
                 }
             }
             Command::RenameSpace => Effect::Rename(RenameTarget::Space(self.active_space_id())),
+            Command::Agents => Effect::Agents,
+            Command::Peek => Effect::Peek,
+            Command::JumpAgent(jump) => Effect::JumpAgent(jump),
             Command::Detach => Effect::Detach,
         }
     }

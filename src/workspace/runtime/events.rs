@@ -9,6 +9,7 @@ use crate::tui::vt_error;
 use crate::vt::Vt;
 use crate::workspace::model::{DOC_NAME, PaneId};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ struct Displayed {
     pane: PaneId,
     title: String,
     status: Option<String>,
+    labels: BTreeMap<String, String>,
 }
 
 impl Screen<'_> {
@@ -101,6 +103,7 @@ impl Screen<'_> {
                     // A document change may have been missed too; refetch it
                     // before trusting the local layout.
                     self.doc.stale = true;
+                    self.agents.reset();
                     self.reconcile_snapshot();
                 }
                 Notification::Event {
@@ -123,6 +126,9 @@ impl Screen<'_> {
                     if let Some(address) = terminal {
                         let kind = kind.clone();
                         let address = address.clone();
+                        if kind == EventKind::Labels {
+                            self.note_labels(&address);
+                        }
                         self.apply_event(kind, &address);
                     }
                 }
@@ -309,6 +315,9 @@ impl Screen<'_> {
                     status: record
                         .and_then(|record| record.status.as_ref())
                         .map(|status| status.state.clone()),
+                    labels: record
+                        .map(|record| record.labels.clone())
+                        .unwrap_or_else(|| pane.labels.clone()),
                 }
             })
             .collect();
@@ -316,6 +325,9 @@ impl Screen<'_> {
         for update in updates {
             changed |= self.workspace.set_title(update.pane, update.title);
             changed |= self.workspace.set_status(update.pane, update.status);
+            changed |= self
+                .workspace
+                .set_attention_labels(update.pane, &update.labels);
         }
         if changed {
             self.dirty = true;

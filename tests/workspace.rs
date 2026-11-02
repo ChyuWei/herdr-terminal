@@ -34,6 +34,20 @@ fn session() -> Option<Session> {
     session
 }
 
+/// A program that reports its own state through OSC 7501 and reads commands
+/// from its terminal: the way a real agent talks to core.
+const AGENT: &str = r#"printf 'AGENT-READY\n'
+printf '\033]2;Agent Build\007'
+printf '\033]7501;state=idle:app=demo:title=QnVpbGQ=\033\\'
+while IFS= read -r line; do
+  case "$line" in
+    working) printf '\033]7501;state=working:app=demo:title=QnVpbGQ=:progress=10\033\\' ;;
+    done) printf '\033]7501;state=done:app=demo:title=QnVpbGQ=\033\\' ;;
+    blocked) printf '\033]7501;state=blocked:kind=permission:app=demo:title=QnVpbGQ=\033\\' ;;
+    clear) printf '\033]7501;state=clear\033\\' ;;
+  esac
+done"#;
+
 /// One `ht` workspace under a PTY, with both output streams captured.
 struct Run {
     pty: Pty,
@@ -186,6 +200,30 @@ fn title_of(session: &Session, address: &str) -> String {
 
 fn wait_title(session: &Session, address: &str, title: &str, timeout: Duration) -> bool {
     wait_until(timeout, || title_of(session, address) == title)
+}
+
+fn status_state(session: &Session, address: &str) -> Option<String> {
+    record(session, address)["status"]["state"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn wait_status(session: &Session, address: &str, state: &str, timeout: Duration) -> bool {
+    wait_until(timeout, || {
+        status_state(session, address).as_deref() == Some(state)
+    })
+}
+
+fn turn_of(session: &Session, address: &str) -> u64 {
+    record(session, address)["turn"].as_u64().unwrap_or(0)
+}
+
+fn wait_turn(session: &Session, address: &str, turn: u64, timeout: Duration) -> bool {
+    wait_until(timeout, || turn_of(session, address) == turn)
+}
+
+fn wait_label(session: &Session, address: &str, key: &str, value: &str, timeout: Duration) -> bool {
+    wait_until(timeout, || label(session, address, key) == value)
 }
 
 fn foreground_of(session: &Session, address: &str) -> String {
@@ -1106,5 +1144,256 @@ fn a_deleted_document_is_rebuilt_from_live_labeled_terminals() {
         known,
         "detaching leaves the recreated document intact"
     );
+    cleanup_all(&session);
+}
+
+/// A real program's OSC 7501 reports drive the agent row: status, turn, app,
+/// progress, title, foreground, seen/unread and pin through `terminal.label`.
+#[test]
+fn agents_report_status_turns_seen_and_pin_end_to_end() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn_with(&session, 100, 30, &["sh", "-c", AGENT]);
+    let address = wait_addresses(&session, 1, secs(10))
+        .into_iter()
+        .next()
+        .expect("agent terminal");
+    assert!(
+        wait_until(secs(10), || {
+            let record = record(&session, &address);
+            record["reported"].as_bool() == Some(true)
+                && record["status"]["state"] == "idle"
+                && record["turn"].as_u64() == Some(0)
+        }),
+        "the agent did not report idle: {}",
+        record(&session, &address)
+    );
+    assert!(
+        wait_title(&session, &address, "Agent Build", secs(5)),
+        "core did not keep the program's title"
+    );
+    assert_eq!(turn_of(&session, &address), 0);
+    assert!(
+        wait_until(secs(5), || !foreground_of(&session, &address).is_empty()),
+        "the foreground process was not reported: {}",
+        record(&session, &address)
+    );
+    assert!(run.wait_text("[idle]", secs(5)), "{}", run.rendered());
+
+    session.hc_json(&["send", &address, "working"]);
+    assert!(wait_status(&session, &address, "working", secs(10)));
+    assert!(run.wait_text("[working]", secs(5)), "{}", run.rendered());
+    run.command(b'a');
+    assert!(run.wait_text("agents", secs(5)), "{}", run.rendered());
+    let sidebar = run.rendered();
+    assert!(sidebar.contains("Build"), "{sidebar}");
+    assert!(sidebar.contains("demo"), "{sidebar}");
+    assert!(sidebar.contains("10%"), "{sidebar}");
+    assert!(sidebar.contains("turn 0"), "{sidebar}");
+    run.send(b"\x1b");
+    assert!(
+        run.wait_screen(secs(5), |screen| !screen.contains("agents")),
+        "{}",
+        run.rendered()
+    );
+
+    session.hc_json(&["send", &address, "done"]);
+    assert!(wait_status(&session, &address, "done", secs(10)));
+    assert!(wait_turn(&session, &address, 1, secs(10)));
+    assert!(
+        wait_label(&session, &address, "herdr.seen", "1", secs(10)),
+        "a visible completed turn was not marked seen: {}",
+        record(&session, &address)
+    );
+    assert!(run.wait_text("[idle]", secs(5)), "{}", run.rendered());
+
+    // Unread is the one lower write, and the row shows done/unseen until the
+    // pane is looked at again.
+    run.command(b'a');
+    assert!(run.wait_text("agents", secs(5)));
+    run.send(b"u");
+    assert!(
+        wait_label(&session, &address, "herdr.seen", "0", secs(10)),
+        "unread did not write turn-1: {}",
+        record(&session, &address)
+    );
+    assert!(
+        run.wait_screen(secs(5), |screen| {
+            screen.contains("done") && screen.contains("unseen")
+        }),
+        "the unread row was not shown: {}",
+        run.rendered()
+    );
+
+    // Pin and unpin write the two exact shared values.
+    run.send(b"p");
+    assert!(
+        wait_label(&session, &address, "herdr.pinned", "1", secs(10)),
+        "pin did not reach core: {}",
+        record(&session, &address)
+    );
+    assert!(
+        run.wait_screen(secs(5), |screen| screen.contains("* done")),
+        "the pin marker is missing: {}",
+        run.rendered()
+    );
+
+    // A second screen sees the same shared labels: pinned and still unseen.
+    assert!(
+        wait_until(secs(10), || {
+            !doc_addresses(&session.doc("herdr-terminal")).is_empty()
+        }),
+        "the layout document was not written: {}",
+        session.doc("herdr-terminal")
+    );
+    let mut observer = Run::spawn_as(&session, 100, 30, "observer");
+    assert!(
+        observer.wait_text("Agent Build", secs(10)),
+        "the second screen did not restore the agent: {}",
+        observer.rendered()
+    );
+    // The second screen is looking at the agent, so its own seen write raises
+    // the shared label; the first screen's open sidebar applies that labels
+    // event and stops showing the turn unseen.
+    assert!(
+        wait_label(&session, &address, "herdr.seen", "1", secs(10)),
+        "the second screen did not mark its visible turn seen: {}",
+        record(&session, &address)
+    );
+    assert!(
+        run.wait_screen(secs(5), |screen| {
+            screen.contains("idle") && !screen.contains("unseen")
+        }),
+        "another client's seen write did not reach the first screen: {}",
+        run.rendered()
+    );
+
+    observer.command(b'a');
+    assert!(
+        observer.wait_screen(secs(5), |screen| {
+            screen.contains("* idle") && screen.contains("pinned")
+        }),
+        "the second screen did not show the shared pin state: {}",
+        observer.rendered()
+    );
+
+    run.send(b"p");
+    assert!(
+        wait_label(&session, &address, "herdr.pinned", "", secs(10)),
+        "unpin did not remove the label: {}",
+        record(&session, &address)
+    );
+    assert!(
+        observer.wait_screen(secs(5), |screen| {
+            screen.contains("idle") && !screen.contains("pinned")
+        }),
+        "the second screen did not apply another client's unpin: {}",
+        observer.rendered()
+    );
+    observer.send(&[DETACH]);
+    let status = observer.wait_exit(secs(5)).expect("observer detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", observer.errors());
+
+    // Clearing the status leaves the agent reported and falls back to core's
+    // terminal title; the unseen cleared state reads as done.
+    session.hc_json(&["send", &address, "clear"]);
+    assert!(
+        wait_until(secs(10), || status_state(&session, &address).is_none()),
+        "the status was not cleared: {}",
+        record(&session, &address)
+    );
+    assert!(
+        run.wait_text("Agent Build", secs(5)),
+        "the row did not fall back to the terminal title: {}",
+        run.rendered()
+    );
+
+    run.send(b"\x1b");
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+/// Across tabs, a hidden agent finishing is one notice and a BEL; jumping
+/// focuses it, marks the turn seen, and peek draws its local VT plus facts.
+#[test]
+fn agents_jump_and_peek_across_tabs_end_to_end() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn_with(&session, 100, 30, &["sh", "-c", AGENT]);
+    let address = wait_addresses(&session, 1, secs(10))
+        .into_iter()
+        .next()
+        .expect("agent terminal");
+    assert!(wait_status(&session, &address, "idle", secs(10)));
+    assert!(run.wait_text("AGENT-READY", secs(5)), "{}", run.rendered());
+
+    // A new tab holds a plain shell; the agent is now off-screen.
+    run.command(b'c');
+    let all = wait_addresses(&session, 2, secs(10));
+    assert!(all.contains(&address));
+    assert!(
+        run.wait_screen(secs(5), |screen| !screen.contains("AGENT-READY")),
+        "the agent's tab stayed visible: {}",
+        run.rendered()
+    );
+
+    session.hc_json(&["send", &address, "working"]);
+    assert!(wait_status(&session, &address, "working", secs(10)));
+    session.hc_json(&["send", &address, "done"]);
+    assert!(wait_status(&session, &address, "done", secs(10)));
+    assert!(wait_turn(&session, &address, 1, secs(10)));
+    assert!(
+        run.output.wait_count(7, 1, secs(10)),
+        "the hidden finish did not beep: {}",
+        run.rendered()
+    );
+    assert!(
+        run.wait_text("finished", secs(5)),
+        "the hidden finish had no notice: {}",
+        run.rendered()
+    );
+    assert_eq!(
+        label(&session, &address, "herdr.seen"),
+        "0",
+        "a hidden turn must stay unseen"
+    );
+
+    // `g` cycles to the only agent (from a non-agent) and marks it seen.
+    run.command(b'g');
+    assert!(
+        run.wait_text("AGENT-READY", secs(5)),
+        "jump did not focus the agent: {}",
+        run.rendered()
+    );
+    assert!(
+        wait_label(&session, &address, "herdr.seen", "1", secs(10)),
+        "the jumped-to turn was not marked seen: {}",
+        record(&session, &address)
+    );
+
+    // Peek shows the same local VT and core facts, and any key closes it.
+    run.command(b'i');
+    assert!(
+        run.wait_text("peek · any key closes", secs(5)),
+        "peek did not open: {}",
+        run.rendered()
+    );
+    let peek = run.rendered();
+    assert!(peek.contains("demo") && peek.contains("Build"), "{peek}");
+    assert!(peek.contains("AGENT-READY"), "{peek}");
+    run.send(b"x");
+    assert!(
+        run.wait_screen(secs(5), |screen| {
+            !screen.contains("peek · any key closes")
+        }),
+        "peek did not close: {}",
+        run.rendered()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
     cleanup_all(&session);
 }

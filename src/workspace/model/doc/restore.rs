@@ -8,6 +8,7 @@ use super::super::{
 };
 use super::schema::{
     CLIENT_LABEL, CLIENT_NAME, DocLayout, DocPane, PANE_LABEL, SPACE_LABEL, SharedDoc, TAB_LABEL,
+    identity_labels,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -126,7 +127,7 @@ pub fn restore(
                 }
                 if record.address != pane.address
                     || record.name != pane.name
-                    || record.labels != pane.labels
+                    || identity_labels(&record.labels) != identity_labels(&pane.labels)
                 {
                     repaired = true;
                 }
@@ -381,7 +382,7 @@ pub fn pane_addresses(doc: &SharedDoc) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::schema::{DocSpace, DocTab};
+    use super::super::schema::{DocSpace, DocTab, PINNED_LABEL, SEEN_LABEL};
     use super::*;
 
     fn labels(pane: u64) -> BTreeMap<String, String> {
@@ -435,6 +436,29 @@ mod tests {
         );
         assert_eq!(pane.labels.get(PANE_LABEL), Some(&"3".to_owned()));
         assert_eq!(restored.workspace.focused_pane(), Some(PaneId(3)));
+    }
+
+    #[test]
+    fn live_attention_labels_never_repair_or_pollute_the_document() {
+        let mut live = labels(3);
+        live.insert(SEEN_LABEL.into(), "9".into());
+        live.insert(PINNED_LABEL.into(), "1".into());
+        let restored = restore(
+            &doc("t1"),
+            IdAllocator::new("default"),
+            (1, 1),
+            &[TerminalInfo::new("t1", live)],
+        );
+        assert!(
+            !restored.repaired,
+            "a seen or pin change is live state, not a document repair"
+        );
+        assert_eq!(restored.missing, 0);
+        let pane = restored.workspace.pane(PaneId(3)).expect("pane");
+        assert_eq!(pane.labels.get(SEEN_LABEL), Some(&"9".to_owned()));
+        assert_eq!(pane.labels.get(PINNED_LABEL), Some(&"1".to_owned()));
+        let captured = restored.workspace.capture_doc().to_value().to_string();
+        assert!(!captured.contains(SEEN_LABEL) && !captured.contains(PINNED_LABEL));
     }
 
     #[test]

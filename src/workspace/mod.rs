@@ -15,6 +15,7 @@
 //! HerdR Terminal labels. Ctrl-] and `prefix q` detach every pane, leaving the
 //! programs and the document intact.
 
+pub mod agents;
 pub mod commands;
 pub mod geometry;
 pub mod keys;

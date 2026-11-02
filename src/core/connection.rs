@@ -28,6 +28,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the `hello` handshake may take before the connection is abandoned.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Shared label writes must not block the UI for the 10 s call default.
+pub const LABEL_TIMEOUT: Duration = Duration::from_secs(2);
+
 const READ_CHUNK: usize = 64 * 1024;
 const MAX_HELLO_LINE: usize = 1 << 20;
 
@@ -337,6 +340,24 @@ impl CoreClient {
         Ok(terminal)
     }
 
+    /// Sets or removes (with an empty value) labels on a terminal, merging
+    /// them with the labels it already carries. Returns the updated record
+    /// with a bounded timeout: shared attention labels never stall the UI.
+    pub fn label(&self, terminal: &str, labels: &BTreeMap<String, String>) -> Result<Terminal> {
+        let value = self.call_timeout(
+            "terminal.label",
+            json!({"terminal": terminal, "labels": labels}),
+            LABEL_TIMEOUT,
+        )?;
+        let record: Terminal = serde_json::from_value(value.clone())?;
+        if record.address.is_empty() {
+            return Err(Error::Protocol(format!(
+                "terminal.label returned no address: {value}"
+            )));
+        }
+        Ok(record)
+    }
+
     /// Opens a raw stream to a live terminal at the given size.
     pub fn attach(&self, terminal: &str, cols: u16, rows: u16) -> Result<Attached> {
         let value = self.call(
@@ -411,8 +432,7 @@ impl CoreClient {
         Ok(terminal)
     }
 
-    /// Reads a terminal's screen text (with `lines` of history above it).
-    /// Works for a finished terminal too: core keeps its final screen.
+    /// Reads a terminal's screen text (with `lines` of history above it).    /// Works for a finished terminal too: core keeps its final screen.
     pub fn read(&self, terminal: &str, lines: usize) -> Result<ReadResult> {
         let value = self.call(
             "terminal.read",

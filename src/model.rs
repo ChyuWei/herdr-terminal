@@ -51,6 +51,23 @@ impl Model {
         self.terminals.get(address)
     }
 
+    /// Inserts or replaces one record, used for records fetched directly
+    /// (`terminal.get`) that the snapshot did not carry. Later events still
+    /// win; this only fills a gap.
+    pub fn upsert(&mut self, terminal: Terminal) {
+        if !terminal.address.is_empty() {
+            self.terminals.insert(terminal.address.clone(), terminal);
+        }
+    }
+
+    /// Replaces one terminal's labels for an optimistic shared-label update.
+    /// The next `labels` event from core is authoritative.
+    pub fn set_labels(&mut self, address: &str, labels: BTreeMap<String, String>) {
+        if let Some(record) = self.terminals.get_mut(address) {
+            record.labels = labels;
+        }
+    }
+
     /// Document versions seen so far, keyed by `name` or `machine/name`.
     pub fn docs(&self) -> &BTreeMap<String, u64> {
         &self.docs

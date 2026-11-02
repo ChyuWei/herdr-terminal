@@ -34,7 +34,9 @@ impl Screen<'_> {
     }
 
     pub(super) fn save_view(&mut self) {
-        if let Some(error) = self.view.save_if_changed(&self.workspace)
+        if let Some(error) = self
+            .view
+            .save_if_changed(&self.workspace, self.ui.sidebar.open)
             && self.ui.message.as_deref() != Some(error.as_str())
         {
             self.ui.message = Some(error);
@@ -340,7 +342,13 @@ impl Screen<'_> {
                     continue;
                 }
                 match self.client.get(&address) {
-                    Ok(record) => infos.push(info(&record)),
+                    Ok(record) => {
+                        // The snapshot may predate a terminal the document
+                        // names; keep its facts for the agent rows and for
+                        // later events.
+                        self.model.upsert(record.clone());
+                        infos.push(info(&record));
+                    }
                     Err(error) if session::is_lost(&error) => {
                         self.begin_reconnect();
                         return Ok(None);

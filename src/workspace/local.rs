@@ -119,10 +119,15 @@ impl ViewStore {
         self.saved.apply(workspace);
     }
 
-    /// Saves only when focus/zoom/selection changed; returns a new error to
-    /// report, or nothing.
-    pub fn save_if_changed(&mut self, workspace: &Workspace) -> Option<String> {
-        let current = LocalView::capture(workspace);
+    /// Whether the sidebar was open when this view was last saved.
+    pub fn sidebar_open(&self) -> bool {
+        self.saved.sidebar_open
+    }
+
+    /// Saves only when focus/zoom/selection or the sidebar flag changed;
+    /// returns a new error to report, or nothing.
+    pub fn save_if_changed(&mut self, workspace: &Workspace, sidebar_open: bool) -> Option<String> {
+        let current = LocalView::capture_with_sidebar(workspace, sidebar_open);
         if current == self.saved {
             return None;
         }
@@ -130,8 +135,8 @@ impl ViewStore {
     }
 
     /// Saves unconditionally (detach), even when nothing changed.
-    pub fn save_now(&mut self, workspace: &Workspace) -> Option<String> {
-        let current = LocalView::capture(workspace);
+    pub fn save_now(&mut self, workspace: &Workspace, sidebar_open: bool) -> Option<String> {
+        let current = LocalView::capture_with_sidebar(workspace, sidebar_open);
         self.store(&current)
     }
 

@@ -54,6 +54,13 @@ impl Screen<'_> {
             self.detach = true;
             return Ok(());
         }
+        if self.ui.peek.is_some() {
+            // Peek is modal: any key other than detach closes it, and none of
+            // them reaches the program underneath.
+            self.close_peek();
+            self.swallow = Some(key.code);
+            return Ok(());
+        }
         if self.ui.help {
             self.ui.help = false;
             self.ui.prefix = false;
@@ -64,6 +71,10 @@ impl Screen<'_> {
         if self.ui.prompt.is_some() {
             self.swallow = Some(key.code);
             return self.edit_prompt(&key);
+        }
+        if self.ui.sidebar.open {
+            self.swallow = Some(key.code);
+            return self.sidebar_key(&key);
         }
         if self.ui.prefix {
             self.ui.prefix = false;
@@ -97,7 +108,28 @@ impl Screen<'_> {
     }
 
     pub(super) fn overlay_open(&self) -> bool {
-        self.ui.help || self.ui.prompt.is_some()
+        self.ui.help || self.ui.prompt.is_some() || self.ui.peek.is_some() || self.ui.sidebar.open
+    }
+
+    /// One key while the sidebar is modal. Only its documented keys act;
+    /// everything else is consumed without reaching the program.
+    fn sidebar_key(&mut self, key: &KeyEvent) -> Result<()> {
+        let plain = !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.close_sidebar(),
+            KeyCode::Char('a') if plain => self.close_sidebar(),
+            KeyCode::Down | KeyCode::Char('j') if plain => self.sidebar_move(1),
+            KeyCode::Up | KeyCode::Char('k') if plain => self.sidebar_move(-1),
+            KeyCode::Home | KeyCode::Char('g') if plain => self.sidebar_edge(false),
+            KeyCode::End | KeyCode::Char('G') if plain => self.sidebar_edge(true),
+            KeyCode::Enter => self.sidebar_enter()?,
+            KeyCode::Char('i') if plain => self.sidebar_peek()?,
+            KeyCode::Char('p') if plain => self.toggle_pin()?,
+            KeyCode::Char('u') if plain => self.mark_unread()?,
+            _ => {}
+        }
+        Ok(())
     }
 
     pub(super) fn edit_prompt(&mut self, key: &KeyEvent) -> Result<()> {
@@ -256,8 +288,12 @@ impl Screen<'_> {
                 self.ui.help = true;
                 self.ui.prompt = None;
                 self.ui.prefix = false;
+                self.ui.peek = None;
                 self.dirty = true;
             }
+            Effect::Agents => self.toggle_sidebar(),
+            Effect::Peek => self.peek_focused(),
+            Effect::JumpAgent(jump) => self.jump_agent(jump),
             Effect::Detach => self.detach = true,
         }
         Ok(())

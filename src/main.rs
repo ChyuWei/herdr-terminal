@@ -29,6 +29,14 @@ Prefix Ctrl-b, then:
   v split left/right   s split top/bottom   h/j/k/l focus   H/J/K/L move
   z zoom   x close   e keep and close   X kill and close
   , rename tab   . rename space   ? help
+  a agents sidebar   i peek agent   g/G next/prev agent
+The agents sidebar lists every agent in the workspace (a terminal counts only
+when core says it reported through OSC 7501). Pinned agents sort first, then
+blocked, done, working and idle. In the sidebar, j/k move, g/G jump to the
+first/last row, Enter jumps to the agent, i peeks it, p pins or unpins it, u
+marks it unread; Esc or a closes. Prefix i peeks the focused agent and any key
+closes the peek. Seen and pinned state are core labels, not part of the saved
+document.
 Ctrl-] (or prefix q) detaches: every program keeps running and the document
 stays. Focus, zoom and the active tab are local per screen, named by
 HERDR_TERMINAL_SCREEN (default `default`). It needs a terminal on stdin and

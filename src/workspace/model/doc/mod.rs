@@ -9,7 +9,7 @@ pub use merge::{Conflict, MergeResult, merge};
 pub use restore::{TerminalInfo, pane_addresses, recover_orphans, restore};
 pub use schema::{
     CLIENT_LABEL, CLIENT_NAME, DOC_NAME, DocChild, DocError, DocLayout, DocPane, DocSpace, DocTab,
-    SharedDoc, pane_ids,
+    PINNED_LABEL, SEEN_LABEL, SharedDoc, identity_labels, is_attention_label, pane_ids,
 };
 
 use super::Workspace;

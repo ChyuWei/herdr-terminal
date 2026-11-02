@@ -18,6 +18,24 @@ pub const CLIENT_NAME: &str = "herdr-terminal";
 pub const SPACE_LABEL: &str = "herdr.terminal.space";
 pub const TAB_LABEL: &str = "herdr.terminal.tab";
 pub const PANE_LABEL: &str = "herdr.terminal.pane";
+/// Shared attention labels: live terminal state, never document state.
+pub const SEEN_LABEL: &str = "herdr.seen";
+pub const PINNED_LABEL: &str = "herdr.pinned";
+
+/// The labels the shared document owns: terminal identity only. Attention
+/// labels are shared through core's terminal records and must never dirty the
+/// layout document.
+pub fn identity_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    labels
+        .iter()
+        .filter(|(key, _)| !is_attention_label(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+pub fn is_attention_label(key: &str) -> bool {
+    key == SEEN_LABEL || key == PINNED_LABEL
+}
 
 /// A parsed version-1 workspace document.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -234,7 +252,9 @@ fn capture_layout(workspace: &Workspace, layout: &Layout) -> DocLayout {
                     .map(|pane| pane.address.clone())
                     .unwrap_or_default(),
                 name: computed.map(|pane| pane.name.clone()).unwrap_or_default(),
-                labels: computed.map(|pane| pane.labels.clone()).unwrap_or_default(),
+                labels: computed
+                    .map(|pane| identity_labels(&pane.labels))
+                    .unwrap_or_default(),
             })
         }
         Layout::Split { axis, children } => DocLayout::Split {
@@ -464,6 +484,33 @@ mod tests {
         assert_eq!(
             value["spaces"][0]["tabs"][0]["layout"]["axis"],
             json!("rows")
+        );
+    }
+
+    #[test]
+    fn the_shared_document_holds_identity_labels_only() {
+        let mut workspace = workspace();
+        let pane = workspace.panes().next().expect("pane").id;
+        workspace.set_labels(
+            pane,
+            BTreeMap::from([
+                (CLIENT_LABEL.to_owned(), CLIENT_NAME.to_owned()),
+                (SPACE_LABEL.to_owned(), "1".into()),
+                (SEEN_LABEL.to_owned(), "7".into()),
+                (PINNED_LABEL.to_owned(), "1".into()),
+            ]),
+        );
+        let value = workspace.capture_doc().to_value();
+        let text = value.to_string();
+        assert!(text.contains(CLIENT_LABEL), "{text}");
+        assert!(text.contains(SPACE_LABEL), "{text}");
+        assert!(
+            !text.contains(SEEN_LABEL) && !text.contains(PINNED_LABEL),
+            "attention labels must never dirty the layout document: {text}"
+        );
+        assert_eq!(
+            workspace.capture_doc(),
+            SharedDoc::parse(&value).expect("round trip")
         );
     }
 

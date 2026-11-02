@@ -9,17 +9,21 @@
 //!
 //! The loop is split by seam: [`panes`] owns sizing, attach and per-pane
 //! protocol; [`events`] owns streams, events and lifecycle outcomes;
-//! [`input`] owns keys, mouse, commands and terminal start/close; and
-//! [`reconnect`] owns a dropped connection. Lifecycle rules are shared with
-//! the single-pane screen: a kept terminal whose program was lost waits for
-//! `restarted`, and a dropped connection is retried with bounded backoff
-//! without starting duplicate terminals.
+//! [`input`] owns keys, mouse, commands and terminal start/close;
+//! [`agents`] owns agent rows, shared seen/pin labels, the sidebar, peek,
+//! jumps and alerts; and [`reconnect`] owns a dropped connection. Lifecycle
+//! rules are shared with the single-pane screen: a kept terminal whose
+//! program was lost waits for `restarted`, and a dropped connection is retried
+//! with bounded backoff without starting duplicate terminals.
 
+mod agents;
 mod events;
 mod input;
 mod panes;
 mod reconnect;
 mod sync;
+
+use agents::AgentRuntime;
 
 use super::geometry;
 use super::local::ViewStore;
@@ -134,6 +138,8 @@ pub(super) struct Screen<'a> {
     /// A start interrupted by the connection loss; resolved after reconnect.
     pending: Option<PendingStart>,
     ui: UiState,
+    /// Agent rows, seen/pin bookkeeping, sidebar selection and alerts.
+    agents: AgentRuntime,
     terminal: ScreenTerminal,
     guard: &'a mut ScreenGuard,
     reconn: Option<Reconnect>,
@@ -167,10 +173,11 @@ impl<'a> Screen<'a> {
             seen,
             notice,
         } = boot;
-        let ui = UiState {
+        let mut ui = UiState {
             message: notice,
             ..UiState::default()
         };
+        ui.sidebar.open = view.sidebar_open();
         let mut screen = Screen {
             size,
             hc: options.hc.clone(),
@@ -185,6 +192,7 @@ impl<'a> Screen<'a> {
             seen,
             pending: None,
             ui,
+            agents: AgentRuntime::default(),
             terminal,
             guard,
             reconn: None,
@@ -210,7 +218,7 @@ impl<'a> Screen<'a> {
     pub(super) fn run(mut self) -> Finish {
         let result = self.play();
         if self.reconn.is_none() {
-            if let Some(error) = self.view.save_now(&self.workspace) {
+            if let Some(error) = self.view.save_now(&self.workspace, self.ui.sidebar.open) {
                 eprintln!("ht: warning: {error}");
             }
             if let Some(error) = self.flush_document() {
@@ -271,6 +279,10 @@ impl<'a> Screen<'a> {
         }
         self.poll_input(had_data)?;
         self.sync_mouse()?;
+        self.refresh_agents()?;
+        if self.reconn.is_some() {
+            return Ok(());
+        }
         self.sync_workspace()?;
         Ok(())
     }
@@ -311,6 +323,14 @@ impl<'a> Screen<'a> {
             if let Some(link) = self.links.get_mut(pane) {
                 screens.insert(*pane, link.vt.snapshot().map_err(vt_error)?);
             }
+        }
+        // Peek renders the existing local VT of its target, even when the
+        // target lives in another tab; it never reads the screen from core.
+        if let Some(pane) = self.ui.peek
+            && !screens.contains_key(&pane)
+            && let Some(link) = self.links.get_mut(&pane)
+        {
+            screens.insert(pane, link.vt.snapshot().map_err(vt_error)?);
         }
 
         // Facts go to every attached pane, including panes in background
@@ -359,6 +379,7 @@ impl<'a> Screen<'a> {
         let ui_state = self.ui.clone();
         let workspace = &self.workspace;
         let visible = &screens;
+        let rows = &self.agents.rows;
         // A finished pane has no prompt to type into; its final cursor would
         // suggest otherwise.
         let finished: Vec<PaneId> = self
@@ -371,7 +392,14 @@ impl<'a> Screen<'a> {
         self.terminal
             .draw(|frame| {
                 let area = frame.area();
-                let rendered = ui::render(frame.buffer_mut(), area, workspace, &ui_state, visible);
+                let rendered = ui::render_view(
+                    frame.buffer_mut(),
+                    area,
+                    workspace,
+                    &ui_state,
+                    visible,
+                    rows,
+                );
                 if let Some((x, y)) = rendered.prompt_cursor {
                     frame.set_cursor_position((x, y));
                     shape = Some(SetCursorStyle::DefaultUserShape);

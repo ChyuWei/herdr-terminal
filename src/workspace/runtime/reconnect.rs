@@ -35,6 +35,10 @@ impl Screen<'_> {
         self.ui.prefix = false;
         self.ui.help = false;
         self.ui.prompt = None;
+        self.ui.peek = None;
+        // The fresh snapshot is a new baseline; a reconnect must not replay
+        // alerts for transitions that happened while disconnected.
+        self.agents.reset();
         self.ui.message =
             Some("lost the connection to core; the programs may still be running".into());
         self.dirty = true;
@@ -110,6 +114,7 @@ impl Screen<'_> {
         self.client = client.clone();
         self.events = events;
         self.model = model;
+        self.agents.reset();
         self.reconn = None;
         self.ui.connection = Connection::Live;
         for link in self.links.values_mut() {

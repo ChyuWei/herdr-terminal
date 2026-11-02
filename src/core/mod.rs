@@ -7,7 +7,7 @@ pub mod events;
 pub mod frames;
 pub mod rpc;
 
-pub use connection::{Attached, CoreClient, RunOptions, StreamItem};
+pub use connection::{Attached, CoreClient, LABEL_TIMEOUT, RunOptions, StreamItem};
 pub use events::{EventKind, EventStream, LineBuffer, Notification, parse_notification};
 pub use frames::{Frame, FrameDecoder, FrameError, Kind};
 pub use rpc::{
