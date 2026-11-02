@@ -10,9 +10,20 @@ use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Color as RatColor, Modifier, Style};
 
-pub fn draw(frame: &mut Frame, screen: &Screen) {
+pub fn draw(frame: &mut Frame, screen: &Screen, message: Option<&str>) {
     let area = frame.area();
     draw_buffer(frame.buffer_mut(), area, screen);
+    if let Some(message) = message.filter(|_| area.height > 0) {
+        // A minimal status line: the last row of the pane. It never changes
+        // the terminal's grid, so the program's size is untouched.
+        let row = area.y + area.height - 1;
+        let width = area.width as usize;
+        let style = Style::default().add_modifier(Modifier::REVERSED);
+        let buffer = frame.buffer_mut();
+        buffer.set_string(area.x, row, " ".repeat(width), style);
+        let text: String = message.chars().take(width).collect();
+        buffer.set_string(area.x, row, text, style);
+    }
     if screen.cursor.visible && screen.cursor.x < area.width && screen.cursor.y < area.height {
         frame.set_cursor_position((screen.cursor.x, screen.cursor.y));
     }
@@ -167,11 +178,31 @@ mod tests {
         let backend = TestBackend::new(3, 1);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw(frame, &screen))
+            .draw(|frame| draw(frame, &screen, None))
             .expect("draw frame");
         terminal
             .backend_mut()
             .assert_cursor_position(ratatui::layout::Position::new(2, 0));
+    }
+
+    #[test]
+    fn a_message_is_drawn_on_the_last_row() {
+        let screen = Screen {
+            cols: 12,
+            rows: 2,
+            cells: vec![cell("x", 1); 24],
+            ..Screen::default()
+        };
+        let backend = TestBackend::new(12, 2);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &screen, Some("reconnecting")))
+            .expect("draw frame");
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..12).map(|x| buffer[(x, 1)].symbol()).collect();
+        assert_eq!(row, "reconnecting");
+        let first: String = (0..12).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(first, "xxxxxxxxxxxx");
     }
 
     #[test]

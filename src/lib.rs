@@ -6,6 +6,7 @@
 //! ratatui.
 
 pub mod core;
+pub mod model;
 pub mod probe;
 pub mod screen;
 pub mod session;

@@ -1,12 +1,13 @@
-//! The lifecycle of a terminal this client started.
+//! The lifecycle of a terminal this client manages.
 //!
-//! One [`Session`] owns the terminal address from `terminal.run` until the
-//! program ends or the viewer leaves. Its normal paths are explicit:
-//! [`Session::remove_finished`] after the program exited by itself,
-//! [`Session::end`] when the viewer quits (detach, kill, remove), and
-//! [`Session::lost`] when core is unreachable and the program must be left
-//! alone. Any other early return runs `Drop`, which ends and removes the
-//! terminal so a local error cannot leave a program behind.
+//! One [`Session`] owns the terminal address from `terminal.run` (or adopts an
+//! address found again after a client restart) until the program ends or the
+//! viewer leaves. Its normal paths are explicit: [`Session::remove_finished`]
+//! after the program exited by itself, [`Session::detach`] when the viewer
+//! leaves (the program keeps running), [`Session::waiting`] when a kept
+//! terminal lost its program, and [`Session::lost`] when core is unreachable.
+//! Any other early return runs `Drop`, which cleans up an owned terminal and
+//! only detaches an adopted one.
 //!
 //! [`recover_finished`] handles the race where a program exits before
 //! `terminal.attach` lands: the run keeps its record (`rm: false`), so the
@@ -17,12 +18,18 @@ use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
 
-/// A terminal started by this client, with cleanup on every path.
+/// A terminal managed by this client, with cleanup on every path.
+///
+/// A session is either **owned** (this process ran `terminal.run`) or adopted
+/// (this process reattached to a terminal a previous client left running). A
+/// local error ends an owned terminal; an adopted one is only detached, so a
+/// client restart can never kill the program it came back for.
 pub struct Session {
     client: Arc<CoreClient>,
     address: String,
     channel: Option<u32>,
     done: bool,
+    owned: bool,
 }
 
 impl Session {
@@ -34,7 +41,21 @@ impl Session {
             address,
             channel: None,
             done: false,
+            owned: true,
         })
+    }
+
+    /// Reattaches to a terminal this process did not start (discovered from
+    /// the pointer or its labels). Its program is not ours to kill on a local
+    /// error.
+    pub fn adopt(client: Arc<CoreClient>, address: String) -> Session {
+        Session {
+            client,
+            address,
+            channel: None,
+            done: false,
+            owned: false,
+        }
     }
 
     pub fn client(&self) -> &Arc<CoreClient> {
@@ -45,16 +66,47 @@ impl Session {
         &self.address
     }
 
+    /// Whether this process ran the terminal (as opposed to adopting it).
+    pub fn owned(&self) -> bool {
+        self.owned
+    }
+
     /// The attach channel, once attached.
     pub fn channel(&self) -> Option<u32> {
         self.channel
     }
 
     /// Attaches at the given size and remembers the channel for cleanup.
+    /// A successful attach clears the "leave it alone" state a reconnect or a
+    /// loss set.
     pub fn attach(&mut self, cols: u16, rows: u16) -> Result<Attached> {
         let attached = self.client.attach(&self.address, cols, rows)?;
         self.channel = Some(attached.channel);
+        self.done = false;
         Ok(attached)
+    }
+
+    /// Points the session at a fresh connection after a reconnect. The old
+    /// channel belonged to the dead connection and is not reusable.
+    pub fn set_client(&mut self, client: Arc<CoreClient>) {
+        self.client = client;
+        self.channel = None;
+        self.done = false;
+    }
+
+    /// Closes the current attach stream, if any, without ending the program.
+    pub fn detach_current(&mut self) -> Result<()> {
+        match self.channel.take() {
+            Some(channel) => self.client.detach(channel),
+            None => Ok(()),
+        }
+    }
+
+    /// The viewer left the screen: detach and leave the program running. No
+    /// `terminal.kill` or `terminal.rm` is sent, so a later `ht` reattaches.
+    pub fn detach(&mut self) -> Result<()> {
+        self.done = true;
+        self.detach_current()
     }
 
     /// The program ended by itself: forget its finished record.
@@ -64,9 +116,19 @@ impl Session {
         missing_ok(self.client.rm(&self.address))
     }
 
-    /// The viewer quit: detach, end the program, and remove the record. Each
-    /// step is tried even if an earlier one fails, so a refused detach cannot
-    /// leave the program running.
+    /// A local error after `terminal.run`: end the terminal this process
+    /// started; an adopted terminal is only detached, never killed.
+    pub fn cleanup(&mut self) -> Result<()> {
+        if self.owned {
+            self.end()
+        } else {
+            self.detach()
+        }
+    }
+
+    /// The program ended by itself: detach, end the program, and remove the
+    /// record. Each step is tried even if an earlier one fails, so a refused
+    /// detach cannot leave the program running.
     pub fn end(&mut self) -> Result<()> {
         self.done = true;
         let mut first = None;
@@ -96,15 +158,23 @@ impl Session {
     /// Core is unreachable. The program may still be running.
     pub fn lost(&mut self) {
         self.done = true;
+        self.channel = None;
+    }
+
+    /// A kept terminal lost its program and waits for a fresh shell. Nothing
+    /// is detached or killed; a later `restarted` reattaches.
+    pub fn waiting(&mut self) {
+        self.done = true;
+        self.channel = None;
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.done {
-            // A local error after `terminal.run` (a write, a thread spawn, an
-            // attach failure): end the program this client started.
-            let _ = self.end();
+            // A local error after the terminal appeared (a write, a thread
+            // spawn, an attach failure): clean up what this process owns.
+            let _ = self.cleanup();
         }
     }
 }

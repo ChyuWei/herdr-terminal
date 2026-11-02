@@ -1,28 +1,32 @@
-//! `ht`: the HerdR Terminal command line. M0 has `probe`; M1 adds `screen`.
+//! `ht`: the HerdR Terminal command line. With no subcommand it opens the
+//! single-pane screen; `screen` and `probe` remain explicit forms.
 
 use herdr_terminal::core::{Error, Result};
 use herdr_terminal::{probe, screen};
 use std::ffi::OsString;
+use std::iter::once;
 use std::path::PathBuf;
 
 const HELP: &str = "\
 ht — the terminal client for Herdr Core
 
 usage:
+  ht [options] [--] [PROGRAM [ARGS...]]
   ht screen [options] [--] [PROGRAM [ARGS...]]
   ht probe [options] [--] [PROGRAM [ARGS...]]
   ht --version
   ht --help
 
-`ht screen` is one full-screen terminal rendered with ratatui. It runs a shell
-(or PROGRAM), attaches to it, and draws its cells, colors, cursor and wide
-characters. Keys and the mouse go to the program, including Ctrl-C. Ctrl-]
-leaves the screen: it detaches, ends the program, and removes its record.
-It needs a terminal on stdin and stdout.
+`ht` (and `ht screen`) is one full-screen terminal rendered with ratatui. It
+draws a shell's cells, colors, cursor and wide characters; keys and the mouse
+go to it, including Ctrl-C. Without PROGRAM it reattaches to the terminal a
+previous client left running, or starts a shell. Ctrl-] detaches: the program
+keeps running, and the next `ht` reattaches to it. It needs a terminal on
+stdin and stdout.
 
 `ht probe` copies the program's raw bytes to stdout; Ctrl-C quits.
 
-options (both commands):
+options (all commands):
   --hc PATH    herdr-core binary to use (default: HERDR_TERMINAL_HC, PATH, ...)
   --cols N     attach width in cells (default: the terminal's, else 80)
   --rows N     attach height in cells (default: the terminal's, else 24)
@@ -47,8 +51,7 @@ fn main() {
 fn run(args: Vec<OsString>) -> Result<i32> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
-        print!("{HELP}");
-        return Ok(0);
+        return screen::run(screen::Options::default());
     };
     let command = text(command)?;
     match command.as_str() {
@@ -60,19 +63,7 @@ fn run(args: Vec<OsString>) -> Result<i32> {
             print!("{HELP}");
             Ok(0)
         }
-        "screen" => match command_options("screen", args)? {
-            None => {
-                print!("{HELP}");
-                Ok(0)
-            }
-            Some(options) => screen::run(screen::Options {
-                cols: options.cols,
-                rows: options.rows,
-                hc: options.hc,
-                argv: options.argv,
-                verbose: options.verbose,
-            }),
-        },
+        "screen" => screen_command(command_options("screen", args)?),
         "probe" => match command_options("probe", args)? {
             None => {
                 print!("{HELP}");
@@ -86,7 +77,28 @@ fn run(args: Vec<OsString>) -> Result<i32> {
                 verbose: options.verbose,
             }),
         },
+        // Options without a subcommand open the screen: `ht --cols 100`.
+        _ if command.starts_with('-') => {
+            let options = command_options("ht", once(OsString::from(command)).chain(args))?;
+            screen_command(options)
+        }
         other => Err(Error::Usage(format!("unknown command {other:?}\n\n{HELP}"))),
+    }
+}
+
+fn screen_command(options: Option<CommandOptions>) -> Result<i32> {
+    match options {
+        None => {
+            print!("{HELP}");
+            Ok(0)
+        }
+        Some(options) => screen::run(screen::Options {
+            cols: options.cols,
+            rows: options.rows,
+            hc: options.hc,
+            argv: options.argv,
+            verbose: options.verbose,
+        }),
     }
 }
 

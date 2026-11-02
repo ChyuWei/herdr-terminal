@@ -167,6 +167,9 @@ pub struct Terminal {
     pub argv: Vec<String>,
     #[serde(default)]
     pub cwd: String,
+    /// Replace a lost program with a fresh shell in place.
+    #[serde(default)]
+    pub keep: bool,
     #[serde(default)]
     pub state: String,
     #[serde(default)]
@@ -185,6 +188,58 @@ pub struct Terminal {
     pub exit_code: Option<i64>,
     #[serde(default)]
     pub signal: Option<i64>,
+    #[serde(default)]
+    pub finished_ms: Option<u64>,
+    /// The program's own OSC 7501 word, stored as reported.
+    #[serde(default)]
+    pub status: Option<Status>,
+    #[serde(default)]
+    pub status_ms: Option<u64>,
+    #[serde(default)]
+    pub records: BTreeMap<String, Status>,
+    #[serde(default)]
+    pub turn: u64,
+    #[serde(default)]
+    pub reported: bool,
+    /// What runs in it now; null once it has finished.
+    #[serde(default)]
+    pub foreground: Option<Foreground>,
+}
+
+impl Terminal {
+    pub fn is_live(&self) -> bool {
+        self.state == "live"
+    }
+}
+
+/// The root or a named OSC 7501 record, as core stores it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct Status {
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub progress: Option<u8>,
+    #[serde(default)]
+    pub app: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub msg: String,
+}
+
+/// The foreground process group's leader and its folder.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct Foreground {
+    #[serde(default)]
+    pub pid: i32,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub cwd: String,
 }
 
 /// `events.subscribe`'s reply: the snapshot and, when framed, its channel.

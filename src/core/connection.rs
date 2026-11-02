@@ -23,6 +23,9 @@ use std::time::Duration;
 /// How long a call waits for its reply before giving up.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the `hello` handshake may take before the connection is abandoned.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 const READ_CHUNK: usize = 64 * 1024;
 const MAX_HELLO_LINE: usize = 1 << 20;
 
@@ -56,6 +59,8 @@ pub struct RunOptions {
     pub labels: BTreeMap<String, String>,
     /// Remove the terminal once it exits.
     pub rm: bool,
+    /// Replace a lost program with a fresh shell in place.
+    pub keep: bool,
     /// Do not let an ambient terminal become its parent.
     pub no_parent: bool,
 }
@@ -67,6 +72,7 @@ impl Default for RunOptions {
             env: client_env(),
             labels: client_labels(),
             rm: false,
+            keep: false,
             no_parent: true,
         }
     }
@@ -99,6 +105,13 @@ impl CoreClient {
     /// Discovers `hc` (unless one is given), connects, and performs the framed
     /// `hello` handshake. Fails clearly when core cannot serve this client.
     pub fn connect(hc: Option<&Path>) -> Result<CoreClient> {
+        Self::connect_timeout(hc, HANDSHAKE_TIMEOUT)
+    }
+
+    /// [`CoreClient::connect`] with a deadline for the `hello` exchange, so a
+    /// core that accepts a connection and never answers cannot stall a
+    /// reconnect loop forever.
+    pub fn connect_timeout(hc: Option<&Path>, timeout: Duration) -> Result<CoreClient> {
         let bin = match hc {
             Some(path) => {
                 if discovery::version(path).is_none() {
@@ -121,7 +134,7 @@ impl CoreClient {
                 path: bin.clone(),
                 source,
             })?;
-        let (mut stdin, mut stdout) = match (child.stdin.take(), child.stdout.take()) {
+        let (stdin, stdout) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => (stdin, stdout),
             _ => {
                 let _ = child.kill();
@@ -131,12 +144,41 @@ impl CoreClient {
                 ));
             }
         };
-        let hello = match handshake(&mut stdin, &mut stdout) {
-            Ok(hello) => hello,
-            Err(error) => {
+        // The handshake owns both pipes, then hands them back. A separate
+        // thread lets the deadline interrupt a core that answers nothing.
+        let (tx, rx) = mpsc::channel();
+        if let Err(source) = std::thread::Builder::new()
+            .name("ht-core-hello".into())
+            .spawn(move || {
+                let mut stdin = stdin;
+                let mut stdout = stdout;
+                let result = handshake(&mut stdin, &mut stdout).map(|hello| (hello, stdin, stdout));
+                let _ = tx.send(result);
+            })
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Io(source));
+        }
+        let (hello, stdin, stdout) = match rx.recv_timeout(timeout) {
+            Ok(Ok(parts)) => parts,
+            Ok(Err(error)) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Timeout {
+                    method: "hello".into(),
+                    timeout,
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Closed);
             }
         };
 
@@ -273,6 +315,7 @@ impl CoreClient {
             "env": &options.env,
             "labels": &options.labels,
             "rm": options.rm,
+            "keep": options.keep,
             "no_parent": options.no_parent,
         });
         let value = self.call("terminal.run", params)?;
@@ -442,8 +485,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Plain line mode before `hello`, then framed for the life of the connection.
-/// The reply read has no deadline yet (an M2 gap): a core that accepts the
-/// connection and never answers stalls the client here.
+/// The caller runs this with a deadline, so a silent core is abandoned rather
+/// than stalling the client.
 fn handshake(stdin: &mut ChildStdin, stdout: &mut ChildStdout) -> Result<Hello> {
     let request = json!({"jsonrpc": "2.0", "id": 0, "method": "hello", "params": {"framed": true}});
     let mut line = request.to_string().into_bytes();

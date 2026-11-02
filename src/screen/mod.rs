@@ -1,36 +1,40 @@
-//! `ht screen`: one full-screen terminal, rendered with ratatui.
+//! The default single-pane screen: one terminal, rendered with ratatui.
 //!
-//! This is the M1 client. It uses the M0 [`CoreClient`] and one attach
-//! stream: core's first paint and live bytes are fed into a local Ghostty VT
-//! ([`crate::vt`]), the visible grid is drawn with ratatui, and keys, mouse,
-//! resize and focus are sent back. The program itself never knows a TUI is in
-//! front of it.
+//! It is built from the M0 wire client, the M1 local Ghostty VT and one
+//! `events.subscribe` stream. The VT and the pure [`crate::model::Model`] are
+//! kept here; `play` owns the lifecycle state machine (attached, waiting for
+//! a restarted shell, reconnecting).
 //!
-//! Ctrl-] leaves the screen (detaches, ends the program and removes its
-//! record); every other key goes to the program, including Ctrl-C. The
-//! terminal is restored on every exit path by [`ScreenGuard`].
+//! With no program argument the screen reattaches to the terminal a previous
+//! client left running (a small pointer under `XDG_STATE_HOME`, or the single
+//! live terminal carrying `herdr.client=herdr-terminal`). With a program it
+//! starts a new kept terminal. Ctrl-] detaches: the program keeps running and
+//! the terminal record stays, so a later `ht` finds it again. The terminal is
+//! restored on every exit path by [`ScreenGuard`].
 
+mod lifecycle;
+mod play;
+mod pointer;
 mod view;
 
-use crate::core::{Attached, CoreClient, Display, Error, Result, RunOptions, StreamItem};
+use crate::core::{CoreClient, Display, Error, Result, RunOptions};
+use crate::model::Model;
 use crate::session::{self, Session};
 use crate::term::{self, RawMode};
-use crate::vt::{self, Color, Screen, Vt};
+use crate::vt::{Color, Screen};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use serde_json::Value;
 use std::io::{IsTerminal, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::TryRecvError;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Default attach size when there is no terminal and no explicit size.
 pub const DEFAULT_COLS: u16 = 80;
@@ -53,7 +57,8 @@ pub struct Options {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub hc: Option<PathBuf>,
-    /// Program and arguments; empty starts core's own shell.
+    /// Program and arguments; empty starts core's shell or reattaches to the
+    /// terminal a previous client left.
     pub argv: Vec<String>,
     pub verbose: bool,
 }
@@ -63,7 +68,7 @@ pub struct Options {
 pub fn run(options: Options) -> Result<i32> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(Error::Usage(
-            "ht screen needs a terminal on stdin and stdout (use ht probe for pipes)".into(),
+            "ht needs a terminal on stdin and stdout (use ht probe for pipes)".into(),
         ));
     }
     let size = term::window_size();
@@ -77,233 +82,140 @@ pub fn run(options: Options) -> Result<i32> {
         .unwrap_or(DEFAULT_ROWS);
 
     let client = Arc::new(CoreClient::connect(options.hc.as_deref())?);
-    let run = RunOptions {
-        argv: options.argv.clone(),
-        // Keep the finished record until this screen has read it: attach can
-        // lose the race with a program that exits at once.
-        rm: false,
-        ..RunOptions::default()
-    };
-    let mut session = Session::start(client, &run)?;
-    let attached = match session.attach(cols, rows) {
-        Ok(attached) => attached,
+    let events = client.subscribe()?;
+    let model = Model::from_snapshot(events.snapshot());
+    let core_id = client.hello().core.id.clone();
+    let mut session = prepare_target(&options, &client, &model, &core_id)?;
+    // The pointer lets the next client find this terminal even when it was
+    // discovered by its label; it is not the M4 workspace document.
+    pointer::pointer(&core_id, session.address()).save();
+    let first = match session.attach(cols, rows) {
+        Ok(attached) => play::First::Attached(Box::new(attached)),
         Err(Error::Rpc { error, .. }) if error.kind() == Some("finished") => {
             // The program ended before attach landed. There is no TUI to
             // restore yet, so print its final screen and return its status.
-            return session::recover_finished(&mut session, &mut stdout(), &error);
+            let result = session::recover_finished(&mut session, &mut stdout(), &error);
+            if result.is_ok() {
+                pointer::pointer(&core_id, session.address()).clear();
+            }
+            return result;
         }
-        Err(error) => return Err(error),
+        Err(Error::Rpc { error, .. }) if error.kind() == Some("unavailable") => {
+            // A kept terminal is parked until core starts its fresh shell.
+            play::First::Waiting
+        }
+        Err(error) => return Err(initial_error(&mut session, &core_id, error)),
     };
-    if options.verbose {
-        eprintln!(
-            "attached to {} on channel {} at {cols}x{rows}",
-            session.address(),
-            attached.channel
-        );
-    }
 
     let mut guard = ScreenGuard::enter()?;
-    let result = play(&mut session, attached, &mut guard, Watch { cols, rows });
+    let screen = play::Screen::new(
+        cols, rows, &options, &mut guard, client, events, model, session,
+    )?;
+    let (result, mut session, core_id) = screen.run(first);
     match result {
-        Ok(Exit::Program(reason)) => {
-            let code = session::exit_code_from(reason.as_ref());
+        Ok(play::Outcome::Program { reason, record }) => {
+            let code = reason
+                .as_ref()
+                .map(|reason| session::exit_code_from(Some(reason)))
+                .or_else(|| record.as_deref().map(session::record_exit_code))
+                .unwrap_or(0);
             if let Err(error) = session.remove_finished() {
                 eprintln!(
                     "ht: warning: could not remove terminal {}: {error}",
                     session.address()
                 );
             }
+            pointer::pointer(&core_id, session.address()).clear();
             Ok(code)
         }
-        Ok(Exit::Quit) => {
-            session.end()?;
+        Ok(play::Outcome::Quit) => {
+            // Detach only: the program keeps running for the next `ht`.
+            let _ = session.detach();
             Ok(0)
         }
-        Err(error) => {
-            if session::is_lost(&error) {
-                // Core is gone, not the program: leave it running.
-                session.lost();
-            }
-            Err(error)
+        Ok(play::Outcome::Removed) => {
+            let address = session.address().to_owned();
+            session.lost();
+            pointer::pointer(&core_id, &address).clear();
+            Err(Error::Protocol(format!("terminal {address} was removed")))
         }
+        Err(error) => Err(finish_error(&mut session, &core_id, error)),
     }
 }
 
-/// How the screen loop ended.
-enum Exit {
-    /// Core closed the stream; the JSON reason carries the program's status.
-    Program(Option<Value>),
-    /// The person pressed Ctrl-].
-    Quit,
-}
-
-struct Watch {
-    cols: u16,
-    rows: u16,
-}
-
-/// Feeds core bytes into the VT, draws, and forwards input until the program
-/// ends or the viewer detaches.
-fn play(
-    session: &mut Session,
-    attached: Attached,
-    guard: &mut ScreenGuard,
-    watch: Watch,
-) -> Result<Exit> {
-    let channel = attached.channel;
-    let stream = attached.stream;
-    let mut vt = Vt::new(watch.cols, watch.rows).map_err(vt_error)?;
-    let mut terminal: ScreenTerminal =
-        Terminal::new(CrosstermBackend::new(stdout())).map_err(Error::Io)?;
-
-    let mut dirty = true;
-    let mut last_draw = Instant::now() - FRAME;
-    let mut last_facts: Option<Display> = None;
-    let mut last_cursor_style: Option<SetCursorStyle> = None;
-    let mut mouse_on = false;
-    // Show the first paint before a fast program's live output can scroll it
-    // away; a flood must not hide the screen that attach handed us.
-    let mut drew_first_frame = false;
-
-    loop {
-        // Take what core has sent, but only up to a budget: a program that
-        // never stops writing must not keep input and drawing from running.
-        let mut had_data = false;
-        let mut closing = None;
-        let mut drained = 0usize;
-        let drain_start = Instant::now();
-        loop {
-            match stream.try_recv() {
-                Ok(StreamItem::Data(bytes)) => {
-                    had_data = true;
-                    drained = drained.saturating_add(bytes.len());
-                    vt.feed(&bytes);
-                    session.client().credit(channel, bytes.len())?;
-                    dirty = true;
-                    if !drew_first_frame
-                        || drained >= DRAIN_BYTES
-                        || drain_start.elapsed() >= DRAIN_TIME
-                    {
-                        break;
-                    }
-                }
-                Ok(StreamItem::Closed(reason)) => {
-                    closing = Some(reason);
-                    break;
-                }
-                Ok(StreamItem::Lost) | Err(TryRecvError::Disconnected) => {
-                    // Core is gone, not the program: leave it running.
-                    session.lost();
-                    return Err(session::lost_error());
-                }
-                Err(TryRecvError::Empty) => break,
-            }
+/// Chooses the terminal to show: the program argument starts a new one;
+/// otherwise the pointer or a single labelled live terminal is adopted.
+fn prepare_target(
+    options: &Options,
+    client: &Arc<CoreClient>,
+    model: &Model,
+    core_id: &str,
+) -> Result<Session> {
+    if !options.argv.is_empty() {
+        let run = RunOptions {
+            argv: options.argv.clone(),
+            keep: true,
+            rm: false,
+            ..RunOptions::default()
+        };
+        return Session::start(client.clone(), &run);
+    }
+    let saved = pointer::Pointer::load();
+    match pointer::choose(model, saved.as_ref(), core_id) {
+        pointer::Choice::Existing(address) => Ok(Session::adopt(client.clone(), address)),
+        pointer::Choice::New => {
+            let run = RunOptions {
+                argv: Vec::new(),
+                keep: true,
+                rm: false,
+                ..RunOptions::default()
+            };
+            Session::start(client.clone(), &run)
         }
-
-        if let Some(reason) = closing {
-            // Bytes fed in the same drain as CLOSE are still the program's
-            // last output. Force the final frame past the throttle so they
-            // reach the outer terminal before it is restored.
-            draw_frame(
-                &mut terminal,
-                &mut vt,
-                session.client(),
-                channel,
-                &mut last_cursor_style,
-                &mut last_facts,
-                false,
-            )?;
-            return Ok(Exit::Program(reason));
-        }
-
-        // The program's mouse mode decides whether the outer terminal should
-        // report the mouse at all; the encoder filters what it receives.
-        let tracking = vt.mouse_tracking();
-        if tracking != mouse_on {
-            guard.set_mouse(tracking)?;
-            mouse_on = tracking;
-        }
-
-        let timeout = if had_data { Duration::ZERO } else { TICK };
-        if event::poll(timeout).map_err(Error::Io)? {
-            match event::read().map_err(Error::Io)? {
-                Event::Key(key) => {
-                    if vt::is_detach(&key) {
-                        return Ok(Exit::Quit);
-                    }
-                    let bytes = vt.encode_key(&key);
-                    if !bytes.is_empty() {
-                        session.client().keys(channel, &bytes)?;
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    let bytes = vt.encode_mouse(&mouse);
-                    if !bytes.is_empty() {
-                        session.client().keys(channel, &bytes)?;
-                    }
-                }
-                Event::Resize(cols, rows) if cols > 0 && rows > 0 => {
-                    vt.resize(cols, rows).map_err(vt_error)?;
-                    session.client().resize(channel, cols, rows)?;
-                    dirty = true;
-                }
-                Event::FocusGained => session.client().focus(channel, true)?,
-                Event::FocusLost => session.client().focus(channel, false)?,
-                _ => {}
-            }
-        }
-
-        // The first frame that follows attach is drawn at once, before a
-        // flood can scroll it away; later frames keep the frame throttle.
-        let first_frame = !drew_first_frame && had_data;
-        if dirty && (first_frame || last_draw.elapsed() >= FRAME) {
-            draw_frame(
-                &mut terminal,
-                &mut vt,
-                session.client(),
-                channel,
-                &mut last_cursor_style,
-                &mut last_facts,
-                true,
-            )?;
-            last_draw = Instant::now();
-            dirty = false;
-            if first_frame {
-                drew_first_frame = true;
-            }
-        }
+        pointer::Choice::Ambiguous(addresses) => Err(Error::Protocol(format!(
+            "found several live terminals labelled {label}={name} ({}); cannot tell which one \
+             to reattach, and starting another would duplicate one of them. Kill or remove the \
+             extra terminals (hc kill ADDRESS, hc rm ADDRESS) and try again",
+            addresses.join(", "),
+            label = pointer::CLIENT_LABEL,
+            name = pointer::CLIENT_NAME,
+        ))),
     }
 }
 
-/// Draws one snapshot, updates the outer cursor shape, and reports display
-/// facts. `send_facts` is false for the final frame of a finished program:
-/// the stream is closing, and the frame matters more than its metadata.
-fn draw_frame(
-    terminal: &mut ScreenTerminal,
-    vt: &mut Vt,
-    client: &CoreClient,
-    channel: u32,
-    last_cursor_style: &mut Option<SetCursorStyle>,
-    last_facts: &mut Option<Display>,
-    send_facts: bool,
-) -> Result<()> {
-    let screen = vt.snapshot().map_err(vt_error)?;
-    terminal
-        .draw(|frame| view::draw(frame, &screen))
-        .map_err(Error::Io)?;
-    let shape = view::cursor_shape(&screen.cursor);
-    if *last_cursor_style != Some(shape) {
-        execute!(stdout(), shape).map_err(Error::Io)?;
-        *last_cursor_style = Some(shape);
-    }
-    if send_facts {
-        let facts = display(&screen);
-        if last_facts.as_ref() != Some(&facts) {
-            client.facts(channel, &facts)?;
-            *last_facts = Some(facts);
+/// A failure before the TUI started: clean up an owned terminal, leave an
+/// adopted one running, and point the error message at the cause.
+fn initial_error(session: &mut Session, core_id: &str, error: Error) -> Error {
+    if session::is_lost(&error) {
+        session.lost();
+    } else {
+        let owned = session.owned();
+        let _ = session.cleanup();
+        if owned {
+            pointer::pointer(core_id, session.address()).clear();
         }
     }
-    Ok(())
+    error
+}
+
+/// A failure after the TUI started: cleanup follows the same owned/adopted
+/// rule, and a lost connection leaves the program alone.
+fn finish_error(session: &mut Session, core_id: &str, error: Error) -> Error {
+    if session::is_lost(&error) {
+        session.lost();
+        return error;
+    }
+    let owned = session.owned();
+    if let Err(cleanup) = session.cleanup() {
+        eprintln!(
+            "ht: warning: could not clean up terminal {}: {cleanup}",
+            session.address()
+        );
+    }
+    if owned {
+        pointer::pointer(core_id, session.address()).clear();
+    }
+    error
 }
 
 /// The viewer's display facts: the terminal's current default colors. A TUI
@@ -324,7 +236,7 @@ fn hex(color: Color) -> Option<String> {
     }
 }
 
-fn vt_error(error: vt::VtError) -> Error {
+fn vt_error(error: crate::vt::VtError) -> Error {
     Error::Protocol(error.to_string())
 }
 
@@ -343,7 +255,7 @@ struct ScreenGuard {
 impl ScreenGuard {
     fn enter() -> Result<ScreenGuard> {
         let raw = RawMode::enter()?
-            .ok_or_else(|| Error::Usage("ht screen needs a terminal on stdin and stdout".into()))?;
+            .ok_or_else(|| Error::Usage("ht needs a terminal on stdin and stdout".into()))?;
         let mut guard = ScreenGuard {
             raw: Some(raw),
             alternate: false,

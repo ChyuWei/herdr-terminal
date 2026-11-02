@@ -106,6 +106,19 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// `hc` in this session, with failures returned instead of asserted. Used
+    /// by cleanup paths, which must not hide the test's own failure.
+    pub fn hc_try(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        self.command(&self.hc)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+    }
+
+    pub fn state_home(&self) -> PathBuf {
+        self.root.join("state")
+    }
+
     pub fn stop(&mut self) {
         if self.started {
             let _ = self
@@ -225,6 +238,11 @@ impl Probe {
 
     pub fn stdin(&mut self) -> &mut ChildStdin {
         self.child.stdin.as_mut().expect("piped stdin")
+    }
+
+    /// The child's pid, for tests that need to find or signal a child of it.
+    pub fn id(&self) -> u32 {
+        self.child.id()
     }
 
     /// Sends a signal to the child. A test PTY is not the child's controlling
