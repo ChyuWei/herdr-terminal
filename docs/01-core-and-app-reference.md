@@ -201,7 +201,10 @@ Reuse the **protocol and the patterns**, not the App's UI stack:
 
 ## 7. Capability checklist for any client
 
-A client that implements Herdr's core workflow needs:
+This checklist is a generic capability reference for any client, not the
+implementation status of this repository; current status is in
+[02-architecture.md §5.5](02-architecture.md#55-implemented). A client that
+implements Herdr's core workflow needs:
 
 - [ ] Discover and connect to core; check `hello`.
 - [ ] Subscribe to events; keep a snapshot; handle `missed`; resnapshot.

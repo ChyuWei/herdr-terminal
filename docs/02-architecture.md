@@ -1,6 +1,6 @@
 # HerdR Terminal — Architecture
 
-**Status:** draft, 2026-11-02
+**Status:** design draft; current implementation status in §5.5, 2026-11-02
 **Product:** HerdR Terminal
 **Code:** `herdr-terminal` (repo, package, core document); binary `ht`
 **Tagline:** The terminal client for Herdr Core.
@@ -303,9 +303,8 @@ Statuses:
 
 | Phase | Feature | Notes |
 |---|---|---|
-| 1 | Layout persistence and restore | Space/tab/pane tree in the document |
-| 1 | Resize, drag, tab reorder | Mouse and keyboard |
-| 2 | Command palette, keybindings, help, settings | Native widgets |
+| 1 | Mouse resize/drag, tab reorder | Mouse and keyboard |
+| 2 | Command palette, configurable keybindings, settings | Native widgets |
 | 3 | Machines: add/connect/list/rename/rm | Remote terminals and events |
 | 3 | Files: read/write/edit, diff, external editor | Core `file.*`; no embedded editor |
 | 3 | File picker | Simple list; use `machine.exec`/`file.*` |
@@ -346,6 +345,37 @@ Statuses:
 | Multi-window | One terminal window; use spaces/tabs/panes |
 | Telemetry/update UI | Not planned; package manager/core update handles it |
 | Win98 demo mod | Demo of GPUI customization; not a TUI feature |
+
+### 5.5 Implemented
+
+§5.1–§5.4 describe the target scope; this subsection records what the code
+currently implements.
+
+- **Connection:** core discovery, one long-lived framed connection, the
+  `hello` feature check, event subscription, and reconnect that keeps the
+  programs running.
+- **Terminals:** local VT rendering, keyboard and mouse input, resize, focus,
+  display facts, credit-based flow control, and the attach lifecycle (`lost`,
+  `restarted`, `finished`, reattach).
+- **Workspace:** spaces, tabs, panes, split/close/move, focus and zoom.
+- **Persistence:** the `herdr-terminal` document, restore, multi-screen
+  compare-and-set, and terminal rediscovery by labels.
+- **Agents:** status, turn, title and foreground from core; the agent
+  sidebar; peek; jump; seen and pinned labels; blocked and finished alerts.
+- **UI and CLI:** tab bar, pane frames, status bar, help overlay and rename
+  prompt, with the `Ctrl-b` prefix key map and `?` for help; `ht` opens the
+  workspace, `ht screen` runs or reattaches to one terminal and `ht probe`
+  copies the raw attach bytes. `Ctrl-]` detaches and the programs keep
+  running.
+
+This implements the Phase 0 and Phase 1 scope and the agent-facing part of
+Phase 2. Still planned: the command palette, configurable keybindings,
+settings and themes; mouse resize/drag, tab reorder, scrollback search and
+copy/paste; machines, files, packaging/install, `ht status`, and mods.
+
+The implementation is unreleased: there is no release, packaging or install
+procedure yet. See §3 for the boundary rules, §7 for conventions, and
+[AGENTS.md](../AGENTS.md) for the traps and the source layout.
 
 ## 6. Phases
 

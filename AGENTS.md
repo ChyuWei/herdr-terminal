@@ -6,14 +6,18 @@ workspace organization; Core owns the programs and the facts about them.
 
 If `AGENTS.local.md` exists, read it too: the maintainer's local rules.
 
-**Status: design phase.** The Cargo workspace and `ht` binary skeleton exist;
-the TUI and tests are not implemented yet. The design is in
+**Status: implemented, unreleased.** The client implements the core connection,
+local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
+`herdr-terminal` document with restore and multi-screen sync, and agent
+awareness (status, sidebar, peek, seen/pin, alerts). The tests exist and pass.
+Features such as the command palette, settings, machines, files and packaging
+remain planned. The design intent is in
 [docs/01-core-and-app-reference.md](docs/01-core-and-app-reference.md) and
 [docs/02-architecture.md](docs/02-architecture.md). Read both before proposing
-code. Do not invent a build or scaffolding that contradicts them.
+code; do not invent a build or scaffolding that contradicts them.
 
-Read the code once it exists. This file holds the rules, the traps, and the
-decisions that are easy to get wrong.
+Read the code. This file holds the rules, the traps, and the decisions that are
+easy to get wrong.
 
 ## The rule
 
@@ -56,8 +60,8 @@ records, raw output, attach, events, status, documents and machines.
 
 ## Commands
 
-The Cargo workspace exists. `cargo build`, `cargo test` and `cargo check`
-work; there are no tests yet.
+The Cargo workspace builds and tests. The suites cover the protocol, VT,
+single-pane lifecycle, workspace, persistence and agents.
 
 ```sh
 cargo build --locked
@@ -84,22 +88,29 @@ workspace.
 
 ## Layout
 
-See [docs/02-architecture.md §4.2](docs/02-architecture.md#42-modules). Planned:
+See [docs/02-architecture.md §4.2](docs/02-architecture.md#42-modules). Current:
 
 ```text
 src/
-  main.rs
-  core/       # framed client, attach, events, reconnect
-  model/      # pure workspace state
-  layout/     # split tree, geometry
-  vt/         # libghostty-vt binding
-  ui/         # ratatui composition
-  input/      # crossterm, key/mouse encoding
-  state/      # documents, local view
-  commands/   # command table, palette, CLI
-  theme/
-  config/
-  cli/
+  main.rs, lib.rs       # CLI; terminal setup and restore
+  core/                 # discovery, framed client, events, reconnect
+  screen/               # single-pane screen: lifecycle, play, pointer, view
+  vt/                   # VT binding: screen, keys, mouse
+  model.rs              # pure event/terminal model
+  workspace/
+    model.rs            # pure workspace state
+    model/              # document schema, merge, restore, ids, local view
+    geometry.rs         # split tree, geometry, hit testing
+    commands.rs, keys.rs # command table and bindings
+    agents.rs           # pure agent facts, ordering, alerts
+    runtime/            # event loop, attach, input, events, reconnect, agents
+    ui.rs               # ratatui composition
+    startup.rs          # document claim and restore
+    local.rs, state.rs  # local view and UI state
+    sync.rs             # document CAS state
+  tui.rs, term.rs, session.rs, probe.rs
+crates/                 # the VT binding crate
+tests/                  # probe, screen, workspace, fake-core
 ```
 
 ## Reading order
@@ -126,7 +137,7 @@ src/
 - Do not run a bare Core/App against a real home; tests are isolated.
 - Do not add mods, an embedded editor, Markdown or images in v1; see the
   architecture's non-goals.
-- Do not assume a build exists; this is the design phase.
+- Do not assume a `just` file exists; use the `cargo` commands above.
 
 ## Contributing
 
@@ -138,5 +149,7 @@ edit it.
 
 ## Next step
 
-Start Phase 0 (connection + one terminal) per `docs/02-architecture.md`. Do
-not start with UI chrome; prove attach, render, input and reconnect first.
+Pick up the remaining planned features in `docs/02-architecture.md` §5: the
+command palette and settings, machines, files, distribution and mods. Keep the
+same rule: prove protocol, VT, input and recovery behavior with tests before
+UI chrome.
