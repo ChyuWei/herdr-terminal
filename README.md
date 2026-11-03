@@ -8,6 +8,8 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 
 **Status:** implemented and unreleased. The client connects to Herdr Core, renders terminals through a local VT, runs a spaces/tabs/panes workspace with restore and agent awareness, and adds daily-driver input: mouse, bounded scrollback and search, selection with copy/paste, a command palette, and startup settings with default/dark/light themes. Later features remain planned.
 
+**Compatibility:** Herdr Core 0.1.16 or newer, protocol generation 1. Optional capabilities are gated on the `hello` features a core advertises, not a version string. Testing used Core 0.1.17; 0.1.16 support is checked by source and the no-feature path, not by running a 0.1.16 binary.
+
 ## Features
 
 **Implemented**
@@ -18,7 +20,7 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 - **Terminal sizing:** New terminals are spawned with the grid they will attach at — the initial shell, splits/tabs/spaces, explicit programs, `ht screen`, reconnect replacements and `ht probe` — so a program that reads its size once starts with the right layout. Cores that predate the field ignore it and still work.
 - **Workspace:** Create spaces, tabs and panes; split/close/move; focus, zoom; rename tabs and spaces.
 - **Terminal management:** Labels, keep, kill/rm, shell or command.
-- **Agents:** Status, turn, title, foreground, agent sidebar, peek, jump, seen/pinned, blocked/finished alerts.
+- **Agents:** Status, turn, title, foreground, agent sidebar, local-VT peek, jump, seen/pinned, blocked/finished alerts.
 - **State:** Own `herdr-terminal` document, restore, multi-screen sync; rediscover terminals by labels.
 - **Recovery:** Detach keeps programs running; reconnect, reattach, and resnapshot after a missed event.
 - **Mouse:** Click focuses a pane or selects a tab; dragging a split gap resizes; chrome never reaches a program. The wheel scrolls local history unless the program tracks the mouse; Shift-drag selects locally, even over a program that tracks the mouse.
@@ -57,7 +59,7 @@ See the [architecture](docs/02-architecture.md) for the feature scope, the imple
 ## Documentation
 
 - [Core and App Reference](docs/01-core-and-app-reference.md) — what Core and App own, how they talk, and what the TUI can reuse; includes a [glossary](docs/01-core-and-app-reference.md#9-glossary) of Core, attach, VT, credit, document, label and status terms.
-- [Architecture](docs/02-architecture.md) — HerdR Terminal's design, feature scope, implemented set, unsupported features, and phases.
+- [Architecture](docs/02-architecture.md) — HerdR Terminal's design, feature scope, implemented set, unsupported features, and planned work.
 - [AGENTS.md](AGENTS.md) — project rules, traps, the current source layout, and the intended workflow for agents.
 
 ## Names

@@ -1,6 +1,6 @@
 # Core and App Reference
 
-**Status:** draft, 2026-11-02
+**Status:** Reference
 **Audience:** contributors to HerdR Terminal.
 **Purpose:** describe what Herdr Core and Herdr App each own, how they talk, and what the new TUI can reuse. This is a reference, not the TUI design; see [02-architecture.md](02-architecture.md).
 
@@ -42,6 +42,8 @@ Core owns the programs and the facts about them. It deliberately has **no concep
 - A client keeps **one long-lived framed connection**. Do not spawn `hc` per user action.
 - Local clients can connect to the core socket directly; `hc connect` speaks the same protocol over stdin/stdout and crosses SSH.
 
+A user has one Core per `HC_SESSION`, shared by Herdr App, `ht`, multiple `ht` screens and CLI calls. The session socket resolves the same way for every client (`HC_SOCKET`, the runtime directory under `XDG_RUNTIME_DIR`, or the core config's `socket`), and when no Core is running, clients should resolve the same `hc` binary. `ht` uses `hc connect` and never starts a private Core per action. Herdr App's update path runs `hc update`, which swaps the binary and restarts the Core while terminals keep running; `ht` reconnects and reattaches. `ht` has no update command.
+
 Framed frame: `[channel u32 LE][kind u8][len u32 LE][payload]`.
 
 | Kind | Name | Meaning |
@@ -64,7 +66,7 @@ A normal viewer sends keys as DATA, plus RESIZE, FOCUS and FACTS as they change.
 
 `terminal.run` also accepts an optional `size: {cols, rows}`. A core that supports it starts the program at that grid before any viewer attaches; a core that predates the field ignores it and uses its configured default. A client should send the grid the terminal will attach at when it knows it, and omit the field otherwise. This lets a program that reads its terminal size once at startup draw its first frame at the right size; the size still changes when a viewer attaches and sends RESIZE.
 
-`terminal.attach` also accepts `observe: true` and `resize_notifications: true`. A client should request them only when `hello.features` advertises `resize_notifications`; no version string is needed. The attach reply must confirm `resize_notifications`; a client should refuse the stream rather than fall back to a normal viewer attach, which would take over the terminal size. An observer is read-only: it sends no keys, mouse reports, RESIZE, FOCUS or FACTS. Core sends it a RESIZE frame (kind 3, four little-endian bytes: `cols`, then `rows`) before each paint that uses a new grid, including the first paint and later replacements; apply it to the local VT before the following DATA. RESIZE is not terminal data and pays no stream credit. Normal attaches are unchanged. A core without the feature does not support observer attach; normal attaches on such a core still learn about size changes from the `size` event.
+`terminal.attach` also accepts `observe: true` and `resize_notifications: true`. A client should request them only when `hello.features` advertises `resize_notifications`; no version string is needed. The attach reply must confirm `resize_notifications`; a client should refuse the stream rather than fall back to a normal viewer attach, which would take over the terminal size. An observer is read-only: it sends no keys, mouse reports, RESIZE, FOCUS or FACTS. Core sends it a RESIZE frame (kind 3, four little-endian bytes: `cols`, then `rows`) before each paint that uses a new grid, including the first paint and later replacements; apply it to the local VT before the following DATA. RESIZE is not terminal data and pays no stream credit. Normal attaches are unchanged. A core without the feature does not support observer attach. For normal attaches, the `size` event updates the terminal record; the pane VT is sized by the client's layout and its own RESIZE, not by that record.
 
 ### 2.4 Events
 

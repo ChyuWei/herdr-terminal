@@ -8,6 +8,8 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 
 **状态：** 已实现，还未发布。客户端连接 Herdr Core，用本地 VT 渲染终端，提供带恢复和 agent 感知的 spaces/tabs/panes 工作区，并具备日常使用的输入能力：鼠标、有上限的 scrollback 和搜索、选择与复制/粘贴、命令面板，以及带 default/dark/light 主题的启动配置。后续功能见下方计划。
 
+**兼容性：** 支持 Herdr Core 0.1.16 及更新版本，协议 generation 1。可选能力根据 Core 在 `hello` 中声明的 features 启用，而不检查版本字符串。测试使用 Core 0.1.17；0.1.16 通过源码和缺少该 feature 时的路径核对，并未运行真实的 0.1.16 二进制。
+
 ## 功能
 
 **已实现**
@@ -18,7 +20,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 - **初始终端尺寸**：启动新终端时会带上 attach 时将使用的网格（初始 shell、split/tab/space、显式程序、`ht screen`、重连后的替换终端和 `ht probe`），因此只读取一次尺寸的程序也能以正确的布局启动。早于该字段的 Core 会忽略它并继续工作。
 - **工作区**：创建 spaces、tabs、panes；split/close/move；focus、zoom；重命名 tab 和 space。
 - **终端管理**：labels、keep、kill/rm、shell 或命令。
-- **Agent**：status、turn、title、foreground、agent 侧栏、peek、跳转、seen/pinned、blocked/finished 提醒。
+- **Agent**：status、turn、title、foreground、agent 侧栏、本地 VT peek、跳转、seen/pinned、blocked/finished 提醒。
 - **状态**：自己的 `herdr-terminal` 文档、恢复、多屏同步；按 labels 找回终端。
 - **恢复**：detach 不结束程序；重连、reattach，`missed` 后重新获取快照。
 - **鼠标**：点击聚焦 pane 或选择 tab；拖动 split 边界调整大小；chrome 不会发送给程序。程序不跟踪鼠标时滚轮滚动本地历史；Shift 拖动在程序跟踪鼠标时也做本地选择。
@@ -57,7 +59,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 ## 文档
 
 - [Core 与 App 参考](docs/01-core-and-app-reference.md) — Core 和 App 各自的权责、它们如何通信，以及 TUI 可以复用什么；包含 Core、attach、VT、credit、document、label、status 等术语的[术语表](docs/01-core-and-app-reference.md#9-glossary)。
-- [架构](docs/02-architecture.md) — HerdR Terminal 的设计、功能范围、已实现功能、不支持的功能和阶段拆分。
+- [架构](docs/02-architecture.md) — HerdR Terminal 的设计、功能范围、已实现功能、不支持的功能和计划工作。
 - [AGENTS.md](AGENTS.md) — 给 agent 的项目规则、陷阱、当前源码布局和工作方式。
 
 > 设计文档目前为英文，和 Herdr Core / Herdr App 的文档保持一致。

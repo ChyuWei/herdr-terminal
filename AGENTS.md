@@ -9,7 +9,7 @@ If `AGENTS.local.md` exists, read it too: the maintainer's local rules.
 **Status: implemented, unreleased.** The client implements the core connection,
 local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
 `herdr-terminal` document with restore and multi-screen sync, agent awareness
-(status, sidebar, peek, seen/pin, alerts), and the daily-driver input surface:
+(status, sidebar, local-VT peek, seen/pin, alerts), and the daily-driver input surface:
 mouse routing and split drags, bounded local scrollback with search, selection
 with OSC 52/native copy and bracketed paste, the command palette, and startup
 settings with default/dark/light themes. The local VT enables grapheme clustering
@@ -38,6 +38,10 @@ records, raw output, attach, events, status, documents and machines.
   Reconnect; the programs keep running.
 - **Feature-gate on `hello`.** Check generation, version, methods and features;
   protocol generation 1 only grows. Do not assume a version.
+- **Supported Core range.** Core 0.1.16 or newer at protocol generation 1;
+  optional capabilities are gated on `hello.features`, never a version string.
+  Testing uses 0.1.17; 0.1.16 is checked by source and the no-feature path, not
+  by running a 0.1.16 binary.
 - **Own state.** The workspace document is `herdr-terminal`; labels are
   `herdr.terminal.*`. Do not read or write Herdr App's `herdr-app` document,
   `herdr.space` or `herdr.tab`. Share only the cross-client `herdr.seen` and

@@ -1,6 +1,6 @@
 # HerdR Terminal — Architecture
 
-**Status:** design draft; current implementation status in §5.5, 2026-11-03
+**Status:** Architecture; current implementation status in §5.5
 **Product:** HerdR Terminal
 **Code:** `herdr-terminal` (repo, package, core document); binary `ht`
 **Tagline:** The terminal client for Herdr Core.
@@ -289,6 +289,23 @@ must never dirty the layout document.
 
 ### 4.7 Core client and lifecycle
 
+**Supported Core**
+
+Core 0.1.16 or newer at protocol generation 1. Optional capabilities are gated
+on `hello.features`, never a version string. Testing uses 0.1.17; 0.1.16 is
+checked by source and the no-feature path, not by running a 0.1.16 binary.
+
+**Shared Core**
+
+A user has one Core per `HC_SESSION`. Its socket resolves the same way for
+every client: `HC_SOCKET`, the runtime directory under `XDG_RUNTIME_DIR`, or the
+core config's `socket`; when no Core is running, clients should resolve the same
+`hc` binary. A running compatible Core is shared by Herdr App, `ht`, multiple
+`ht` screens and CLI calls. `ht` connects with `hc connect` and never starts a
+private Core per action. Herdr App's update path runs `hc update`, which swaps
+the binary and restarts the Core while terminals keep running; `ht` reconnects
+and reattaches. `ht` has no update command.
+
 **Startup**
 
 1. Discover the core binary (configured path, `PATH`, login shell `PATH`, usual install dirs; accept it only if `--version` prints `hc …`).
@@ -335,7 +352,8 @@ confirmed observer receives RESIZE (kind 3, four little-endian bytes) before
 each paint that uses a new grid, applies it to the local VT before the following
 DATA, and pays no stream credit for it. It sends no keys, mouse reports, RESIZE,
 FOCUS or FACTS. Normal attaches are unchanged; on a core without the feature,
-normal attaches still use the `size` event.
+the `size` event updates the terminal record, while the pane VT follows the
+client layout and its own RESIZE.
 
 **Reconnect**
 
@@ -404,7 +422,7 @@ search or redraw input.
 Statuses:
 
 - **v1** — required for the first usable release.
-- **Later** — planned, with a phase.
+- **Later** — planned; not yet scheduled.
 - **Postponed** — deliberately deferred; has a trigger.
 - **No** — not planned; reason given.
 
@@ -425,26 +443,26 @@ Statuses:
 
 ### 5.2 Expected later
 
-| Phase | Feature | Notes |
-|---|---|---|
-| 1 | Tab reorder | Mouse and keyboard |
-| 3 | Machines: add/connect/list/rename/rm | Remote terminals and events |
-| 3 | Files: read/write/edit, diff, external editor | Core `file.*`; no embedded editor |
-| 3 | File picker | Simple list; use `machine.exec`/`file.*` |
-| 4 | Custom layouts, accessibility | Settings and config |
-| 4 | Packaging, install, `--skill`, CLI docs | Distribution |
-| 5 | Mods/plugins (manifest + external commands) | See §6.3 |
-| 5 | Kitty graphics/images | See §6.3 |
+| Feature | Notes |
+|---|---|
+| Tab reorder | Mouse and keyboard |
+| Machines: add/connect/list/rename/rm | Remote terminals and events |
+| Files: read/write/edit, diff, external editor | Core `file.*`; no embedded editor |
+| File picker | Simple list; use `machine.exec`/`file.*` |
+| Custom layouts, accessibility | Settings and config |
+| Packaging, install, `--skill`, CLI docs | Distribution |
+| Mods/plugins (manifest + external commands) | See §6.3 |
+| Kitty graphics/images | See §6.3 |
 
 ### 5.3 Postponed
 
-| Feature | Why postponed | Trigger / phase |
+| Feature | Why postponed | Trigger |
 |---|---|---|
-| Mods/plugins | Needs a plugin model and a host API; not required for v1 | After Phase 4; use Herdr 1.x's manifest + external-command model, not JS/GPUI |
-| Kitty graphics / images | Terminal support varies; VT binding work | Phase 5, only if users need it |
+| Mods/plugins | Needs a plugin model and a host API; not required for v1 | Later; use Herdr 1.x's manifest + external-command model, not JS/GPUI |
+| Kitty graphics / images | Terminal support varies; VT binding work | Only if users need it |
 | Embedded code editor | Large scope; cell-grid editor is a product of its own | Use external `$EDITOR`; revisit only if demanded |
 | Markdown rendering | Rich text is out of scope for a TUI | Use an external pager/`glow`/`bat` |
-| Advanced settings UI | Basic config first | Phase 4; simple forms |
+| Advanced settings UI | Basic config first | Later; simple forms |
 | Drag-and-drop | Mouse support is terminal-dependent | Later; keyboard/mouse alternatives first |
 | Shared workspace with Herdr App | Couples two products' schemas | Separate design; not default |
 | Native OS notifications | Terminal-dependent | Later; bell/OSC fallback first |
@@ -519,10 +537,13 @@ currently implements.
   scrollback/search keep palette, search and redraw responsive under large
   output.
 
-This implements the Phase 0 and Phase 1 scope, the agent-facing part of
-Phase 2, and the daily-driver input, history, clipboard, palette and settings
-work of Phase 4. Still planned: tab reorder, machines, files,
-packaging/install, `ht status`, accessibility and mods. Scrollback, search,
+The implemented set covers the connection and terminal foundation, the
+workspace and its persistence, agent awareness, the daily-driver input layer
+(mouse, history, search, selection, clipboard, palette, settings and themes),
+the local VT's grapheme clustering, initial terminal sizes and the
+observer-attach foundation. Still planned: tab reorder, custom layouts,
+accessibility, general confirm/toast prompts, machines, files,
+packaging/install, `ht status` and mods. Scrollback, search,
 selection and theme stay in memory and are never written to the shared
 document or the per-screen view. Settings are read at startup; there is no
 settings UI and no live reload.
@@ -531,73 +552,33 @@ The implementation is unreleased: there is no release, packaging or install
 procedure yet. See §3 for the boundary rules, §7 for conventions, and
 [AGENTS.md](../AGENTS.md) for the traps and the source layout.
 
-## 6. Phases
+## 6. Planned work
 
-The lists below are the original roadmap. Current status is §5.5: several
-Phase 2 and Phase 4 items are implemented, and the rest remain planned.
+Current status is §5.5. The remaining work, grouped by capability:
 
-### Phase 0 — Foundation
+### Workspace and UI
 
-**Goal:** prove the hard path: connect, attach, render, input, reconnect.
+- Tab reorder.
+- Custom layouts.
+- Accessibility.
+- General confirm/toast prompts.
+- Performance tuning for many panes.
 
-- Core discovery and long-lived framed connection.
-- `hello` feature check.
-- `events.subscribe` snapshot.
-- Run/attach one terminal.
-- Local VT, cell rendering, cursor, wide characters.
-- Key encoding, RESIZE, FOCUS, FACTS, credit.
-- Reconnect and reattach; `lost`/`restarted`/`finished`; `missed`.
-
-**Done when:** a shell, vim and htop work in one pane; resize works; core restart reconnects; no leaked threads or streams.
-
-### Phase 1 — Workspace
-
-**Goal:** make it a daily terminal workspace.
-
-- Spaces, tabs, panes; split/close/move; focus; zoom.
-- Tab bar, pane frames, status bar.
-- New/close/rename; labels; keep; kill/rm.
-- `herdr-terminal` document; restore; multi-screen CAS.
-- Terminal rediscovery by labels.
-
-**Done when:** a multi-pane layout survives restart; two screens share the layout; no duplicate terminals.
-
-### Phase 2 — Agents and awareness
-
-**Goal:** make agents visible and steerable.
-
-- Status, turn, title, foreground.
-- Agent list/sidebar; peek; seen/pinned labels.
-- Notifications for blocked/error/finished.
-- Command palette, keybindings, help, confirm/prompt/toast.
-- Basic settings.
-
-**Done when:** an agent's state changes are visible without screen scraping; the user can jump to it, mark it seen and pin it.
-
-### Phase 3 — Machines and files
-
-**Goal:** one workspace across machines.
+### Machines and files
 
 - Machine add/connect/list/rename/rm.
 - Remote terminals, events and documents.
 - Reconnect after network loss.
 - File read/write/edit; diff; external editor; simple file picker.
 
-**Done when:** a remote terminal and a local terminal live in the same workspace; a remote file can be inspected/edited; reconnect restores the view.
+### Distribution and testing
 
-### Phase 4 — Polish and distribution
-
-**Goal:** make it a daily driver.
-
-- Mouse resize/drag; scrollback search; copy/paste and clipboard.
-- Themes, custom layouts, accessibility.
-- Performance: redraw coalescing, large output, many panes.
-- Packaging, install, `--version`, `--skill`, CLI/docs, CI.
+- Packaging and install.
+- `--skill`, CLI docs and CI.
+- `ht status` and core/log diagnostics.
 - End-to-end tests and golden buffers.
 
-**Done when:** a full day of work is comfortable; install and upgrade are documented; tests run in seconds.
-
-### Phase 5 — Later
+### Later
 
 - Mods/plugins using the manifest + external-command model.
 - Kitty graphics/images if there is demand.
@@ -625,7 +606,7 @@ Phase 2 and Phase 4 items are implemented, and the rest remain planned.
    core's minimal binding does not expose. Extracting a shared crate or a
    pure-Rust VT remains a future option.
 2. **Async runtime:** threads + channels vs tokio. Start simple; measure.
-3. **Document layout:** one `herdr-terminal` document per core with machine-qualified ids, or one document per machine like Herdr App? Start local, revisit for Phase 3.
+3. **Document layout:** one `herdr-terminal` document per core with machine-qualified ids, or one document per machine like Herdr App? Start local, revisit when remote machines are added.
 4. **Clipboard:** resolved for v1: OSC 52 by default, with a configured native
    helper, both, or off; a native failure falls back to OSC 52.
 5. **Notifications:** resolved for v1: one in-app status-bar notice and one
