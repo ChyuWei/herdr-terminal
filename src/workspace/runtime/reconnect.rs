@@ -36,6 +36,10 @@ impl Screen<'_> {
         self.ui.help = false;
         self.ui.prompt = None;
         self.ui.peek = None;
+        // An observer stream belongs to the dead connection; there is no safe
+        // detach to send. The manager underneath may stay open and refresh
+        // from the fresh snapshot.
+        self.drop_preview();
         // The fresh snapshot is a new baseline; a reconnect must not replay
         // alerts for transitions that happened while disconnected.
         self.agents.reset();

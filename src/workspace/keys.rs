@@ -125,6 +125,7 @@ pub fn defaults() -> Vec<(char, Command)> {
         (',', Command::RenameTab),
         ('.', Command::RenameSpace),
         ('a', Command::Agents),
+        ('t', Command::Terminals),
         ('i', Command::Peek),
         ('g', Command::JumpAgent(Jump::Next)),
         ('G', Command::JumpAgent(Jump::Previous)),
@@ -163,6 +164,7 @@ pub fn action_command(action: &str) -> Option<Command> {
         "rename_tab" => Command::RenameTab,
         "rename_space" => Command::RenameSpace,
         "agents" => Command::Agents,
+        "terminals" => Command::Terminals,
         "peek" => Command::Peek,
         "jump_next" => Command::JumpAgent(Jump::Next),
         "jump_prev" => Command::JumpAgent(Jump::Previous),
@@ -216,6 +218,7 @@ mod tests {
             "rename_tab",
             "rename_space",
             "agents",
+            "terminals",
             "peek",
             "jump_next",
             "jump_prev",
@@ -239,12 +242,12 @@ mod tests {
 
     #[test]
     fn an_override_moves_a_command_and_frees_its_old_key() {
-        let overrides = BTreeMap::from([("new_tab".to_owned(), "t".to_owned())]);
+        let overrides = BTreeMap::from([("new_tab".to_owned(), "b".to_owned())]);
         let (keys, warnings) = KeyMap::from_config(&overrides);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(keys.command('t'), Some(Command::NewTab));
+        assert_eq!(keys.command('b'), Some(Command::NewTab));
         assert_eq!(keys.command('c'), None);
-        assert_eq!(keys.hint(&Command::NewTab), Some('t'));
+        assert_eq!(keys.hint(&Command::NewTab), Some('b'));
     }
 
     #[test]

@@ -487,3 +487,147 @@ fn the_location_of_a_pane_is_its_space_and_tab() {
     );
     assert_eq!(workspace.pane_by_address("nope"), None);
 }
+
+#[test]
+fn showing_an_existing_terminal_adopts_it_without_taking_ownership() {
+    let mut workspace = Workspace::new();
+    let request = workspace.adopt_request();
+    let labels = BTreeMap::from([
+        ("herdr.client".to_owned(), "herdr-app".to_owned()),
+        ("herdr.space".to_owned(), "7".to_owned()),
+    ]);
+    let pane = workspace
+        .insert_adopted(
+            &request,
+            AdoptedTerminal {
+                address: "t9".to_owned(),
+                name: "worker".to_owned(),
+                labels: labels.clone(),
+                title: "Build".to_owned(),
+                status: Some("working".to_owned()),
+                keep: true,
+            },
+        )
+        .expect("adopted");
+    let record = workspace.pane(pane).expect("pane");
+    assert_eq!(record.address, "t9");
+    assert_eq!(record.name, "worker");
+    assert_eq!(record.title, "Build");
+    assert_eq!(record.status.as_deref(), Some("working"));
+    assert_eq!(record.labels, labels, "core labels are kept verbatim");
+    assert!(!record.owned, "a shown terminal is never owned");
+    assert!(record.keep);
+    assert_eq!(workspace.focused_pane(), Some(pane));
+    assert_eq!(
+        workspace.active_tab().and_then(|tab| tab.layout.clone()),
+        Some(Layout::Leaf(pane)),
+        "an empty tab takes the adopted pane alone"
+    );
+    assert_eq!(
+        close_action(record, CloseKind::Close),
+        CloseAction::Detach,
+        "closing a shown terminal never ends it"
+    );
+}
+
+#[test]
+fn an_adopted_terminal_splits_the_current_tab_and_is_never_duplicated() {
+    let mut workspace = Workspace::new();
+    let first = add(&mut workspace, StartKind::Initial, "t1");
+    let request = workspace.adopt_request();
+    let adopted = workspace
+        .insert_adopted(
+            &request,
+            AdoptedTerminal {
+                address: "t9".to_owned(),
+                name: String::new(),
+                labels: BTreeMap::new(),
+                title: String::new(),
+                status: None,
+                keep: false,
+            },
+        )
+        .expect("adopted");
+    assert_eq!(
+        workspace.pane(adopted).expect("pane").name,
+        "t9",
+        "an empty core name falls back to the address"
+    );
+    assert_eq!(panes(&workspace), vec![first, adopted]);
+    assert_eq!(workspace.focused_pane(), Some(adopted));
+    assert_eq!(
+        workspace.location(first),
+        workspace.location(adopted),
+        "the adopted pane stays in the current tab"
+    );
+
+    let tabs = workspace.active_space().tabs.len();
+    let second = workspace.adopt_request();
+    assert_eq!(
+        workspace.insert_adopted(
+            &second,
+            AdoptedTerminal {
+                address: "t9".to_owned(),
+                name: "again".to_owned(),
+                labels: BTreeMap::new(),
+                title: String::new(),
+                status: None,
+                keep: false,
+            },
+        ),
+        None,
+        "an address can back only one pane"
+    );
+    assert_eq!(workspace.pane_count(), 2);
+    assert_eq!(
+        workspace.active_space().tabs.len(),
+        tabs,
+        "a refused adoption leaves no empty tab"
+    );
+}
+
+#[test]
+fn an_adopted_pane_captures_and_restores_by_address() {
+    let mut workspace = Workspace::new();
+    add(&mut workspace, StartKind::Initial, "t1");
+    let request = workspace.adopt_request();
+    workspace
+        .insert_adopted(
+            &request,
+            AdoptedTerminal {
+                address: "t9".to_owned(),
+                name: "worker".to_owned(),
+                labels: BTreeMap::new(),
+                title: String::new(),
+                status: None,
+                keep: false,
+            },
+        )
+        .expect("adopted");
+    let document = workspace.capture_doc();
+    let text = document.to_value().to_string();
+    assert!(text.contains("\"t9\""), "{text}");
+    let t1_labels = workspace
+        .pane_by_address("t1")
+        .expect("own terminal")
+        .labels
+        .clone();
+
+    let infos = vec![
+        TerminalInfo::new("t1", t1_labels),
+        TerminalInfo::new("t9", BTreeMap::new()),
+    ];
+    let restored = restore(&document, IdAllocator::new("default"), (1, 1), &infos);
+    assert_eq!(restored.missing, 0);
+    let ours = restored
+        .workspace
+        .pane_by_address("t1")
+        .expect("own terminal");
+    let adopted = restored
+        .workspace
+        .pane_by_address("t9")
+        .expect("adopted terminal");
+    assert!(ours.owned);
+    assert!(!adopted.owned, "restore keeps an adopted terminal unowned");
+    assert_eq!(adopted.name, "worker");
+}

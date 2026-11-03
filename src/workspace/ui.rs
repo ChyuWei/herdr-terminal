@@ -7,9 +7,10 @@
 
 use super::agents::{self, AgentRow};
 use super::geometry::{self, Rects};
+use super::manager::{self, ManagerRow};
 use super::model::{PaneId, Workspace};
 use super::palette;
-use super::state::{Connection, UiState};
+use super::state::{Connection, PreviewState, UiState};
 use crate::theme::Theme;
 use crate::vt::Screen as VtScreen;
 use ratatui::buffer::Buffer;
@@ -21,7 +22,7 @@ use std::collections::BTreeMap;
 
 /// The help text. It is also the golden-tested documented key map.
 pub const HELP: &[&str] = &[
-    "prefix Ctrl-b      ? help          q detach",
+    "prefix Ctrl-b      ? help          q detach   any key closes help",
     "c new tab          C new space",
     "n / p tab          N / P space     1..9 select tab",
     "v split left/right s split top/bottom",
@@ -30,9 +31,11 @@ pub const HELP: &[&str] = &[
     "e keep + close     X kill + close",
     ", rename tab       . rename space",
     "a agents           i peek agent    g/G next/prev agent",
+    "t terminal manager (all live terminals in core)",
+    "manager: j/k move  g/G first/last  Enter show/hide",
+    "/ filter  p preview (read-only)  Esc close manager",
     "sidebar: j/k move  g/G first/last  Enter jump",
-    "p pin / unpin      u mark unread   i peek selected",
-    "Esc / a close sidebar               any key closes peek",
+    "p pin / unpin  u mark unread  i peek  Esc/a close  any key closes peek",
     "Ctrl-] detach      prefix twice sends Ctrl-b",
     ": palette          f search scrollback",
     "[ select mode      y copy selection",
@@ -41,7 +44,6 @@ pub const HELP: &[&str] = &[
     "Shift-PgUp/PgDn scroll history      Shift-Home/End top/bottom",
     "drag a split gap to resize          wheel scrolls local history",
     "mouse: click focuses pane/tab       drag selects; Shift-drag local",
-    "any key closes help",
 ];
 
 /// Where the cursor belongs after a frame.
@@ -67,6 +69,10 @@ pub struct View<'a> {
     pub theme: &'a Theme,
     pub selections: &'a SelectionSpans,
     pub scroll_hint: Option<&'a str>,
+    /// Every live terminal in core, while the manager is open.
+    pub manager: &'a [ManagerRow],
+    /// The read-only observer preview's local VT snapshot.
+    pub preview: Option<&'a VtScreen>,
 }
 
 impl Default for View<'_> {
@@ -74,6 +80,7 @@ impl Default for View<'_> {
         static SCREENS: std::sync::OnceLock<BTreeMap<PaneId, VtScreen>> =
             std::sync::OnceLock::new();
         static ROWS: [AgentRow; 0] = [];
+        static MANAGER_ROWS: [ManagerRow; 0] = [];
         static SELECTIONS: std::sync::OnceLock<SelectionSpans> = std::sync::OnceLock::new();
         static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
         View {
@@ -82,6 +89,8 @@ impl Default for View<'_> {
             theme: THEME.get_or_init(Theme::default),
             selections: SELECTIONS.get_or_init(BTreeMap::new),
             scroll_hint: None,
+            manager: &MANAGER_ROWS,
+            preview: None,
         }
     }
 }
@@ -157,6 +166,15 @@ pub fn render_with(
         rendered.focused = None;
         rendered.prompt_cursor = None;
     }
+    if ui.manager.open {
+        rendered.prompt_cursor = draw_manager(buffer, area, ui, view.manager, theme);
+        rendered.focused = None;
+    }
+    if let Some(preview) = &ui.preview {
+        draw_preview(buffer, area, preview, view.preview, theme);
+        rendered.focused = None;
+        rendered.prompt_cursor = None;
+    }
     if ui.palette.is_some() {
         rendered.prompt_cursor = draw_palette(buffer, area, ui, theme);
         rendered.focused = None;
@@ -188,6 +206,68 @@ pub fn sidebar_rect(area: Rect) -> Rect {
 /// How many agent rows fit inside the sidebar.
 pub fn sidebar_inner_height(area: Rect) -> usize {
     sidebar_rect(area).height.saturating_sub(2) as usize
+}
+
+/// The terminal manager's overlay rectangle: a wide, tall panel. Each row is
+/// fitted to the list width (`manager::row_line`), so a narrow terminal keeps
+/// the marker, status word and address while secondary facts are dropped.
+pub fn manager_rect(area: Rect) -> Rect {
+    if area.width < 8 || area.height < 5 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let width = area.width.saturating_sub(4).min(100);
+    let height = area.height.saturating_sub(2);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + 1,
+        width,
+        height,
+    )
+}
+
+/// How many inventory rows fit under the manager's filter/count line.
+pub fn manager_list_height(area: Rect) -> usize {
+    manager_rect(area)
+        .height
+        .saturating_sub(2)
+        .saturating_sub(1) as usize
+}
+
+/// The preview overlay's rectangle, shared by drawing and the observer's
+/// initial attach size.
+pub fn preview_rect(area: Rect) -> Rect {
+    if area.width < 8 || area.height < 5 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let width = area.width.saturating_sub(4).min(96);
+    let height = area.height.saturating_sub(2);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + 1,
+        width,
+        height,
+    )
+}
+
+/// The preview's terminal grid: inside the border, below the facts line.
+pub fn preview_grid(area: Rect) -> Rect {
+    let rect = preview_rect(area);
+    let inner = Block::new().borders(Borders::ALL).inner(rect);
+    if inner.width == 0 || inner.height <= 1 {
+        return Rect::new(inner.x, inner.y, 0, 0);
+    }
+    Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    )
+}
+
+/// The observer attach size for the preview.
+pub fn preview_grid_size(area: Rect) -> (u16, u16) {
+    let grid = preview_grid(area);
+    (grid.width, grid.height)
 }
 
 fn draw_tab_bar(buffer: &mut Buffer, workspace: &Workspace, area: Rect, theme: &Theme) {
@@ -381,6 +461,12 @@ fn draw_status(
         Connection::Reconnecting { attempt: 0 } => "reconnecting…".to_owned(),
         Connection::Reconnecting { attempt } => format!("reconnecting (attempt {attempt})"),
         Connection::Live if ui.prefix => "prefix ^b…".to_owned(),
+        Connection::Live if ui.preview.is_some() => {
+            "preview · read-only · any key closes".to_owned()
+        }
+        Connection::Live if ui.manager.open => {
+            "terminals · Enter show/hide · p preview · Esc close".to_owned()
+        }
         Connection::Live if ui.peek.is_some() => "peek · any key closes".to_owned(),
         Connection::Live if ui.sidebar.open => "agents · Esc closes".to_owned(),
         Connection::Live => "^b ? help".to_owned(),
@@ -762,6 +848,180 @@ fn draw_peek(
         Some(screen) => crate::screen::view::draw_buffer(buffer, grid, screen),
         None => Paragraph::new(Span::styled(
             "terminal not attached yet",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .render(grid, buffer),
+    }
+}
+
+/// The Core-wide terminal manager: a modal list of every live terminal with
+/// its marker, word, age and address, a filter/count line and the local
+/// selection. It draws only the rows the runtime derived from core; it never
+/// reads a screen or infers a status.
+fn draw_manager(
+    buffer: &mut Buffer,
+    area: Rect,
+    ui: &UiState,
+    rows: &[ManagerRow],
+    theme: &Theme,
+) -> Option<(u16, u16)> {
+    if !ui.manager.open {
+        return None;
+    }
+    let rect = manager_rect(area);
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let query = ui.manager.filter.text();
+    let filtered = manager::filter(rows, &query);
+    let total = rows.len();
+    let shown = rows.iter().filter(|row| row.shown).count();
+    Clear.render(rect, buffer);
+    let title = format!(
+        " terminal manager · {shown} shown · {total} live · \
+         Enter show/hide · p preview · / filter · Esc close "
+    );
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.overlay))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.overlay)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(rect);
+    block.render(rect, buffer);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    let (head, label) = if ui.manager.filtering {
+        (
+            format!(" filter: {query} · {}/{} match", filtered.len(), total),
+            " filter: ",
+        )
+    } else if query.is_empty() {
+        (format!(" {total} live · * = shown here · / filter"), "")
+    } else {
+        (
+            format!(
+                " filter: {query} · {}/{} match · / edit",
+                filtered.len(),
+                total
+            ),
+            "",
+        )
+    };
+    Paragraph::new(Line::from(Span::styled(
+        head,
+        Style::default().fg(theme.highlight),
+    )))
+    .render(Rect::new(inner.x, inner.y, inner.width, 1), buffer);
+
+    if inner.height > 1 {
+        let list = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+        if total == 0 {
+            Paragraph::new(Line::from(Span::styled(
+                " no live terminals in core",
+                Style::default().add_modifier(Modifier::DIM),
+            )))
+            .render(list, buffer);
+        } else if filtered.is_empty() {
+            Paragraph::new(Line::from(Span::styled(
+                " no terminals match the filter",
+                Style::default().add_modifier(Modifier::DIM),
+            )))
+            .render(list, buffer);
+        } else {
+            let selected = ui
+                .manager
+                .selected
+                .as_deref()
+                .and_then(|address| filtered.iter().position(|row| row.address == address))
+                .unwrap_or(0);
+            let visible = (list.height as usize).min(filtered.len());
+            let mut offset = ui
+                .manager
+                .offset
+                .min(filtered.len().saturating_sub(visible));
+            if selected < offset {
+                offset = selected;
+            } else if selected >= offset + visible {
+                offset = selected + 1 - visible;
+            }
+            let lines: Vec<Line> = filtered
+                .iter()
+                .skip(offset)
+                .take(visible)
+                .enumerate()
+                .map(|(index, row)| {
+                    let style = if offset + index == selected {
+                        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(
+                        manager::row_line(row, list.width as usize),
+                        style,
+                    ))
+                })
+                .collect();
+            Paragraph::new(lines).render(list, buffer);
+        }
+    }
+    if !ui.manager.filtering {
+        return None;
+    }
+    let before = ui.manager.filter.before();
+    let x = inner
+        .x
+        .saturating_add(Span::raw(label).width() as u16)
+        .saturating_add(Span::raw(before.as_str()).width() as u16)
+        .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
+    Some((x, inner.y))
+}
+
+/// The read-only observer preview: a border and title, a facts line, and the
+/// local VT fed by the observer stream. It never shows a caret and never
+/// offers input.
+fn draw_preview(
+    buffer: &mut Buffer,
+    area: Rect,
+    preview: &PreviewState,
+    screen: Option<&VtScreen>,
+    theme: &Theme,
+) {
+    let rect = preview_rect(area);
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    Clear.render(rect, buffer);
+    let title = format!(" preview · {} · {} ", preview.title, preview.address);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.peek))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default().fg(theme.peek).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(rect);
+    block.render(rect, buffer);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    Paragraph::new(Line::from(Span::styled(
+        " read-only observer · no keys, mouse or resize are sent · any key closes",
+        Style::default().add_modifier(Modifier::DIM),
+    )))
+    .render(Rect::new(inner.x, inner.y, inner.width, 1), buffer);
+    let grid = preview_grid(area);
+    if grid.width == 0 || grid.height == 0 {
+        return;
+    }
+    match screen {
+        Some(screen) => crate::screen::view::draw_buffer(buffer, grid, screen),
+        None => Paragraph::new(Span::styled(
+            "waiting for the first frame…",
             Style::default().add_modifier(Modifier::DIM),
         ))
         .render(grid, buffer),

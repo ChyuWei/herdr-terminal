@@ -99,6 +99,18 @@ impl Session {
         Ok(attached)
     }
 
+    /// Attaches as a read-only observer. Core confirms resize notifications
+    /// before the stream is used; there is no normal-attach fallback, so a
+    /// refusal leaves the session without a channel.
+    pub fn attach_observer(&mut self, cols: u16, rows: u16, history: usize) -> Result<Attached> {
+        let attached = self
+            .client
+            .attach_observer(&self.address, cols, rows, history)?;
+        self.channel = Some(attached.channel);
+        self.done = false;
+        Ok(attached)
+    }
+
     /// Points the session at a fresh connection after a reconnect. The old
     /// channel belonged to the dead connection and is not reusable.
     pub fn set_client(&mut self, client: Arc<CoreClient>) {

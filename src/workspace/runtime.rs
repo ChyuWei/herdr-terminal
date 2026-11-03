@@ -19,6 +19,7 @@
 mod agents;
 mod events;
 mod input;
+mod manager;
 mod mouse;
 mod overlays;
 mod panes;
@@ -26,9 +27,11 @@ mod reconnect;
 mod sync;
 
 use agents::AgentRuntime;
+use manager::ManagerPreview;
 
 use super::geometry;
 use super::local::ViewStore;
+use super::manager::ManagerRow;
 use super::model::{PaneId, StartRequest, Workspace};
 use super::state::UiState;
 use super::sync::DocState;
@@ -178,6 +181,10 @@ pub(super) struct Screen<'a> {
     ui: UiState,
     /// Agent rows, seen/pin bookkeeping, sidebar selection and alerts.
     agents: AgentRuntime,
+    /// The Core-wide manager's inventory, refreshed once per frame while open.
+    manager_rows: Vec<ManagerRow>,
+    /// The read-only observer preview, when one is open.
+    preview: Option<ManagerPreview>,
     terminal: ScreenTerminal,
     guard: &'a mut ScreenGuard,
     reconn: Option<Reconnect>,
@@ -242,6 +249,8 @@ impl<'a> Screen<'a> {
             pending: None,
             ui,
             agents: AgentRuntime::default(),
+            manager_rows: Vec::new(),
+            preview: None,
             terminal,
             guard,
             reconn: None,
@@ -271,6 +280,13 @@ impl<'a> Screen<'a> {
     /// the caller can detach, leave them alone, or clean up.
     pub(super) fn run(mut self) -> Finish {
         let result = self.play();
+        // The preview is not a workspace session: close its observer stream
+        // before the sessions are handed back.
+        if self.reconn.is_none() {
+            self.close_preview();
+        } else {
+            self.drop_preview();
+        }
         if self.reconn.is_none() {
             if let Some(error) = self.view.save_now(&self.workspace, self.ui.sidebar.open) {
                 eprintln!("ht: warning: {error}");
@@ -327,11 +343,15 @@ impl<'a> Screen<'a> {
         if self.reconn.is_some() {
             return Ok(());
         }
+        let preview_data = self.drain_preview()?;
+        if self.reconn.is_some() {
+            return Ok(());
+        }
         self.apply_events()?;
         if self.reconn.is_some() {
             return Ok(());
         }
-        self.poll_input(had_data)?;
+        self.poll_input(had_data || preview_data)?;
         self.drive_search();
         self.sync_mouse()?;
         self.refresh_agents()?;
@@ -372,6 +392,11 @@ impl<'a> Screen<'a> {
             return Ok(());
         }
 
+        self.refresh_manager();
+        let preview_screen = match self.preview.as_mut() {
+            Some(preview) => Some(preview.vt.snapshot().map_err(vt_error)?),
+            None => None,
+        };
         let rects = self.rects();
         let mut screens: BTreeMap<PaneId, VtScreen> = BTreeMap::new();
         for (pane, _) in &rects.panes {
@@ -453,6 +478,7 @@ impl<'a> Screen<'a> {
         let workspace = &self.workspace;
         let visible = &screens;
         let rows = &self.agents.rows;
+        let manager_rows = &self.manager_rows;
         let theme = &self.theme;
         let scroll_hint = self.scroll_hint();
         // A finished pane has no prompt to type into; its final cursor would
@@ -478,6 +504,8 @@ impl<'a> Screen<'a> {
                     theme,
                     selections: &selections,
                     scroll_hint: scroll_hint.as_deref(),
+                    manager: manager_rows,
+                    preview: preview_screen.as_ref(),
                 };
                 let rendered =
                     ui::render_with(frame.buffer_mut(), area, workspace, &ui_state, &view);

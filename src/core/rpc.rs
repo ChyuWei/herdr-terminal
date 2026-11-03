@@ -286,6 +286,10 @@ pub struct Terminal {
     pub signal: Option<i64>,
     #[serde(default)]
     pub finished_ms: Option<u64>,
+    /// When core created the terminal, in milliseconds since the epoch. A
+    /// `terminal.run` reply may omit it; a snapshot record carries it.
+    #[serde(default)]
+    pub created_ms: Option<u64>,
     /// The program's own OSC 7501 word, stored as reported.
     #[serde(default)]
     pub status: Option<Status>,

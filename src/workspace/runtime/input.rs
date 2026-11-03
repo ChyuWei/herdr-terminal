@@ -55,6 +55,13 @@ impl Screen<'_> {
             self.detach = true;
             return Ok(());
         }
+        if self.ui.preview.is_some() {
+            // A preview is read-only and modal: any key closes it and none
+            // reaches the program or the manager underneath.
+            self.close_preview();
+            self.swallow = Some(key.code);
+            return Ok(());
+        }
         // A key ends a click that never became a drag.
         self.selection_press = None;
         if self.ui.peek.is_some() {
@@ -82,6 +89,10 @@ impl Screen<'_> {
         if self.ui.search.is_some() {
             self.swallow = Some(key.code);
             return self.search_key(&key);
+        }
+        if self.ui.manager.open {
+            self.swallow = Some(key.code);
+            return self.manager_key(&key);
         }
         if self.ui.selecting.is_some() {
             if self.selection_key(&key)? {
@@ -302,6 +313,7 @@ impl Screen<'_> {
                 self.dirty = true;
             }
             Effect::Agents => self.toggle_sidebar(),
+            Effect::Terminals => self.toggle_manager(),
             Effect::Peek => self.peek_focused(),
             Effect::JumpAgent(jump) => self.jump_agent(jump),
             Effect::Palette => self.open_palette(),

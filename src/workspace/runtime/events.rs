@@ -120,6 +120,7 @@ impl Screen<'_> {
                     self.doc.stale = true;
                     self.agents.reset();
                     self.reconcile_snapshot();
+                    self.check_preview();
                 }
                 Notification::Event {
                     kind: EventKind::Doc,
@@ -157,6 +158,11 @@ impl Screen<'_> {
     /// Applies a core event to the pane that owns the terminal. The pure model
     /// has already applied it; this reacts to it (attach, wait, remove).
     pub(super) fn apply_event(&mut self, kind: EventKind, address: &str) {
+        if matches!(&kind, EventKind::Finished | EventKind::Removed) {
+            // A preview has no pane and no lifecycle of its own; an end or
+            // removal closes its observer stream and returns to the manager.
+            self.preview_gone(address);
+        }
         let Some(pane) = self.workspace.pane_id_by_address(address) else {
             return;
         };

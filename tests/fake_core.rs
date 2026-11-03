@@ -72,7 +72,13 @@ fn run_tests() {
     #[cfg(unix)]
     workspace_keeps_a_pane_missing_from_the_snapshot();
     #[cfg(unix)]
-    workspace_never_adopts_a_terminal_it_did_not_label();
+    workspace_adopts_a_documented_address_without_claiming_its_labels();
+    #[cfg(unix)]
+    workspace_terminal_manager_shows_and_hides_without_running_or_killing();
+    #[cfg(unix)]
+    workspace_terminal_manager_previews_read_only_and_follows_events();
+    #[cfg(unix)]
+    workspace_terminal_manager_never_clears_another_screens_labels();
     #[cfg(unix)]
     workspace_claims_a_new_document_and_labels_its_terminal();
     #[cfg(unix)]
@@ -1376,32 +1382,63 @@ fn workspace_keeps_a_pane_missing_from_the_snapshot() {
     );
 }
 
-/// A terminal at the same address but without this client's pane label is not
-/// adopted; the pane is pruned rather than claiming a stranger's program.
+/// A terminal named by this client's document but carrying another client's
+/// labels is restored by address and adopted: close only detaches it and its
+/// labels are never overwritten.
 #[cfg(unix)]
-fn workspace_never_adopts_a_terminal_it_did_not_label() {
+fn workspace_adopts_a_documented_address_without_claiming_its_labels() {
     let scratch = Scratch::new("doc-foreign");
     scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
     let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-foreign");
 
     assert!(
-        workspace.wait_text("no terminals in this tab", secs(10)),
-        "the foreign terminal was not adopted; screen={:?} stderr={:?}",
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the documented address was not adopted; screen={:?} stderr={:?}",
         workspace.rendered(),
         workspace.stderr.text()
     );
     assert!(
         common::wait_until(secs(5), || {
-            scratch.doc_value()["spaces"][0]["tabs"][0]["layout"] == json!(null)
+            scratch.doc_value()["spaces"][0]["tabs"][0]["layout"]
+                .get("leaf")
+                .is_some()
         }),
-        "the pruned pane must leave the document; doc={:?}",
+        "the adopted pane stays in the document; doc={:?}",
         scratch.doc_value()
     );
+    assert_eq!(doc_addresses(&scratch.doc_value()), vec!["t1".to_owned()]);
     let log = scratch.entries();
-    assert!(!log.iter().any(|entry| entry["call"] == "terminal.run"));
     assert!(
-        !log.iter().any(|entry| entry.get("attached").is_some()),
-        "a foreign terminal must not be attached; log={log:?}"
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "adopting a documented address never starts a program; log={log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|entry| entry.get("attached").is_some() && entry["terminal"] == "t1"),
+        "the adopted terminal is attached; log={log:?}"
+    );
+    let captured = scratch.doc_value().to_string();
+    assert!(
+        captured.contains("someone-else"),
+        "another client's labels are kept verbatim: {captured}"
+    );
+
+    // Closing an adopted pane only detaches: no kill, no rm.
+    workspace.command(b'x');
+    assert!(
+        common::wait_until(secs(5), || {
+            scratch.doc_value()["spaces"][0]["tabs"][0]["layout"] == json!(null)
+        }),
+        "closing the adopted pane removes it from the document; doc={:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm"),
+        "an adopted pane is never killed or removed; log={:?}",
+        scratch.entries()
     );
 
     workspace.send(&[0x1d]);
@@ -1412,6 +1449,467 @@ fn workspace_never_adopts_a_terminal_it_did_not_label() {
         "stderr={:?}",
         workspace.stderr.text()
     );
+}
+
+/// The manager lists a background Core terminal, shows it as an adopted pane
+/// without `terminal.run`, hides it by detaching only, and shows it again
+/// without a duplicate.
+#[cfg(unix)]
+fn workspace_terminal_manager_shows_and_hides_without_running_or_killing() {
+    let scratch = Scratch::new("m8-manager");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "manager");
+    assert!(
+        screen.wait_text("PANE-ONE", secs(10)),
+        "the documented pane was not restored; screen={:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+
+    // The manager lists a background terminal from the event snapshot.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 2 live", secs(5)),
+        "the manager did not list core's terminals: {:?}",
+        screen.rendered()
+    );
+    let listed = screen.rendered();
+    assert!(
+        listed.contains("working") && listed.contains("t9") && listed.contains("worker"),
+        "the background terminal's own facts are shown: {listed:?}"
+    );
+
+    // Filter to t9, leave filter editing, and show it.
+    screen.send(b"/t9");
+    assert!(
+        screen.wait_text("filter: t9 · 1/2 match", secs(5)),
+        "the filter did not narrow the rows: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("WORKER-PANE", secs(10)),
+        "Enter did not show the terminal: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("terminal manager"),
+        "the manager closes after a show: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "t9".to_owned()]),
+        "the shown terminal is in the document; doc={:?}",
+        scratch.doc_value()
+    );
+    let doc = scratch.doc_value();
+    let leaf = doc_leaf(&doc, "t9").expect("t9's leaf in the document");
+    assert_eq!(
+        leaf["labels"],
+        json!({"herdr.client": "someone-else"}),
+        "the adopted terminal keeps its own labels verbatim: {doc}"
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "showing an existing terminal never starts a program; log={log:?}"
+    );
+    assert_eq!(
+        wire_attach_count(&log, "t9"),
+        1,
+        "the shown terminal is attached once; log={log:?}"
+    );
+
+    // Hide it: detach and drop the pane, never kill or remove the program.
+    // The manager keeps its local filter across openings.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 2 shown · 2 live", secs(5)),
+        "the shown terminal is marked: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "hiding removes only the pane reference; doc={:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("WORKER-PANE")),
+        "the hidden terminal is no longer drawn: {:?}",
+        screen.rendered()
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter()
+            .any(|entry| entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm"),
+        "hiding never kills or removes the program; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| {
+            entry["call"] == "terminal.label"
+                && entry["params"]["labels"]
+                    .as_object()
+                    .is_some_and(|labels| labels.values().any(|value| value == ""))
+        }),
+        "hiding never clears another client's labels; log={log:?}"
+    );
+    for entry in log
+        .iter()
+        .filter(|entry| entry["call"] == "terminal.label" && entry["params"]["terminal"] == "t9")
+    {
+        let labels = entry["params"]["labels"].as_object().expect("a label map");
+        assert!(
+            labels.keys().all(|key| key == "herdr.seen"),
+            "this client writes only its shared seen label on an adopted terminal: {entry:?}"
+        );
+    }
+    let channel = log
+        .iter()
+        .find(|entry| entry.get("attached").is_some() && entry["terminal"] == "t9")
+        .and_then(|entry| entry["attached"].as_u64())
+        .expect("t9's attach channel");
+    assert!(
+        log.iter()
+            .any(|entry| entry["frame"]["channel"] == channel && entry["frame"]["kind"] == 2),
+        "hiding closes the attach stream; log={log:?}"
+    );
+
+    // Show it again: the same address, still no run and no duplicate pane.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 2 live", secs(5)),
+        "the hidden terminal is listed again: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("WORKER-PANE", secs(10)),
+        "Enter did not show the terminal again: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            let addresses = doc_addresses(&scratch.doc_value());
+            addresses.iter().filter(|address| *address == "t9").count() == 1 && addresses.len() == 2
+        }),
+        "showing again never duplicates the pane; doc={:?}",
+        scratch.doc_value()
+    );
+    let log = scratch.entries();
+    assert_eq!(
+        wire_attach_count(&log, "t9"),
+        2,
+        "the second show attaches the same terminal again; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "showing again never starts a program; log={log:?}"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// Preview is a read-only observer: the wire carries only credit and the
+/// closing detach, never input, RESIZE, FOCUS or FACTS; events refresh the
+/// manager's rows underneath it.
+#[cfg(unix)]
+fn workspace_terminal_manager_previews_read_only_and_follows_events() {
+    let scratch = Scratch::new("m8-manager-events");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "manager-events");
+    assert!(
+        screen.wait_text("PANE-ONE", secs(10)),
+        "the documented pane was not restored; screen={:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+    let writes = doc_set_calls(&scratch);
+
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 4 live", secs(5)),
+        "the manager did not list core's terminals: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"/t9");
+    assert!(
+        screen.wait_text("filter: t9 · 1/4 match", secs(5)),
+        "the filter did not narrow the rows: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    screen.send(b"p");
+    assert!(
+        screen.wait_text("preview · Worker · t9", secs(5)),
+        "p did not open the preview: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.wait_text("PREVIEW-WORKER", secs(10)),
+        "the observer stream was not rendered: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("read-only observer"),
+        "the preview says it is read-only: {:?}",
+        screen.rendered()
+    );
+    let log = scratch.entries();
+    let attach = log
+        .iter()
+        .find(|entry| entry["call"] == "terminal.attach" && entry["params"]["terminal"] == "t9")
+        .expect("the preview attached t9");
+    assert_eq!(
+        attach["params"]["observe"],
+        json!(true),
+        "the preview attaches as an observer: {attach:?}"
+    );
+    assert_eq!(
+        attach["params"]["resize_notifications"],
+        json!(true),
+        "the preview asks for grid-before-paint: {attach:?}"
+    );
+    let channel = log
+        .iter()
+        .find(|entry| entry.get("attached").is_some() && entry["terminal"] == "t9")
+        .and_then(|entry| entry["attached"].as_u64())
+        .expect("the preview's attach channel");
+    let sent_before_close: Vec<u64> = log
+        .iter()
+        .filter(|entry| entry["frame"]["channel"] == channel)
+        .filter_map(|entry| entry["frame"]["kind"].as_u64())
+        .collect();
+    assert!(
+        !sent_before_close.is_empty() && sent_before_close.iter().all(|kind| *kind == 1),
+        "an open preview sends only credit; frames={sent_before_close:?}"
+    );
+
+    // Any key closes the preview; the manager stays open underneath and then
+    // receives the scripted status/created/finished/removed events.
+    screen.send(&[0x1b]);
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 3 live", secs(10)),
+        "the manager did not follow the events: {:?}",
+        screen.rendered()
+    );
+    let listed = screen.rendered();
+    assert!(
+        listed.contains("done") && listed.contains("t9"),
+        "the status event rewrote the row: {listed:?}"
+    );
+
+    // Clear the manager's persisted filter to see every updated row.
+    screen.send(b"/");
+    screen.send(&[0x7f, 0x7f]);
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("t10", secs(5)),
+        "the labels event added the new terminal: {:?}",
+        screen.rendered()
+    );
+    let listed = screen.rendered();
+    assert!(
+        listed.contains("done") && listed.contains("builder"),
+        "status and labels events update the rows: {listed:?}"
+    );
+    assert!(
+        !listed.contains("t7") && !listed.contains("t8"),
+        "finished and removed terminals leave the rows: {listed:?}"
+    );
+
+    let log = scratch.entries();
+    let sent: Vec<u64> = log
+        .iter()
+        .filter(|entry| entry["frame"]["channel"] == channel)
+        .filter_map(|entry| entry["frame"]["kind"].as_u64())
+        .collect();
+    assert!(
+        sent.iter().all(|kind| *kind == 1 || *kind == 2),
+        "the preview sends only credit and a closing detach; frames={sent:?}"
+    );
+    assert!(
+        sent.contains(&2),
+        "closing the preview detaches its stream; frames={sent:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| matches!(
+            entry["call"].as_str(),
+            Some("terminal.run" | "terminal.kill" | "terminal.rm" | "terminal.read")
+        )),
+        "a preview never runs, kills, removes or reads a terminal; log={log:?}"
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned()],
+        "a preview adds no pane to the document"
+    );
+    assert_eq!(
+        doc_set_calls(&scratch),
+        writes,
+        "a preview writes no document"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// Hide only clears labels this screen wrote: a terminal whose pane label
+/// lives in another screen's id namespace keeps its labels (and is never
+/// killed or removed), while a same-screen stale label is still cleared.
+#[cfg(unix)]
+fn workspace_terminal_manager_never_clears_another_screens_labels() {
+    let scratch = Scratch::new("m8-manager-labels");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    // The workspace screen runs in the default namespace (1). The cross
+    // screen wrote namespace 2; t10's label is stale but from this screen.
+    let cross = cross_screen_labels();
+    scratch.seed_labels(json!({
+        "t9": cross_screen_labels(),
+        "t10": same_screen_stale_labels(),
+    }));
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "manager-cross-screen");
+    assert!(
+        screen.wait_text("PANE-ONE", secs(10)),
+        "the documented pane was not restored; screen={:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+
+    // A stale label from this screen's own namespace is cleared on Hide.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 3 live", secs(5)),
+        "the manager did not list core's terminals: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"/t10");
+    assert!(
+        screen.wait_text("filter: t10 · 1/3 match", secs(5)),
+        "the filter did not narrow the rows: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("STALE-PANE", secs(10)),
+        "Enter did not show the same-screen terminal: {:?}",
+        screen.rendered()
+    );
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 2 shown · 3 live", secs(5)),
+        "the shown terminal is marked: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "hiding removes the pane reference; doc={:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        common::wait_until(secs(5), || scratch.labels_value()["t10"] == json!({})),
+        "a same-screen hide clears the four identity labels: {:?}",
+        scratch.labels_value()
+    );
+    let log = scratch.entries();
+    let clears: Vec<&Value> = log
+        .iter()
+        .filter(|entry| entry["call"] == "terminal.label" && entry["params"]["terminal"] == "t10")
+        .collect();
+    assert_eq!(clears.len(), 1, "the four labels are cleared once: {log:?}");
+    let labels = clears[0]["params"]["labels"]
+        .as_object()
+        .expect("a label map");
+    assert_eq!(labels.len(), 4, "{:?}", clears[0]);
+    for label in [
+        "herdr.client",
+        "herdr.terminal.space",
+        "herdr.terminal.tab",
+        "herdr.terminal.pane",
+    ] {
+        assert_eq!(
+            labels.get(label).and_then(Value::as_str),
+            Some(""),
+            "{label}: {:?}",
+            clears[0]
+        );
+    }
+
+    // Another screen's terminal: Show then Hide must leave its labels alone.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 3 live", secs(5)),
+        "the hidden terminal is listed again: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"/");
+    screen.send(&[0x7f, 0x7f, 0x7f]);
+    screen.send(b"t9");
+    assert!(
+        screen.wait_text("filter: t9 · 1/3 match", secs(5)),
+        "the filter did not move to the other screen's terminal: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("FOREIGN-PANE", secs(10)),
+        "Enter did not show the other screen's terminal: {:?}",
+        screen.rendered()
+    );
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 2 shown · 3 live", secs(5)),
+        "the shown terminal is marked: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "hiding removes the pane reference; doc={:?}",
+        scratch.doc_value()
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter()
+            .any(|entry| entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm"),
+        "hiding never kills or removes the program; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| {
+            entry["call"] == "terminal.label" && entry["params"]["terminal"] == "t9"
+        }),
+        "another screen's labels are never written; log={log:?}"
+    );
+    assert_eq!(
+        scratch.labels_value()["t9"],
+        cross,
+        "the other screen's labels are unchanged: {:?}",
+        scratch.labels_value()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+#[cfg(unix)]
+fn wire_attach_count(entries: &[Value], address: &str) -> usize {
+    entries
+        .iter()
+        .filter(|entry| entry.get("attached").is_some() && entry["terminal"] == address)
+        .count()
 }
 
 /// With no document, the first screen claims an empty one at version 0, starts
@@ -2329,6 +2827,22 @@ fn workspace_flushes_a_merged_change_on_detach_after_conflicts() {
         10,
         "the flush conflict is re-read, merged and retried at version 10"
     );
+}
+
+/// The document leaf for an address, wherever the layout holds it.
+#[cfg(unix)]
+fn doc_leaf<'a>(value: &'a serde_json::Value, address: &str) -> Option<&'a serde_json::Value> {
+    if let Some(leaf) = value.get("leaf") {
+        return (leaf.get("address").and_then(serde_json::Value::as_str) == Some(address))
+            .then_some(leaf);
+    }
+    if let Some(items) = value.as_array() {
+        return items.iter().find_map(|item| doc_leaf(item, address));
+    }
+    if let Some(object) = value.as_object() {
+        return object.values().find_map(|item| doc_leaf(item, address));
+    }
+    None
 }
 
 /// Every document pane address, in document order.
@@ -4400,7 +4914,7 @@ fn workspace_paste_frames_only_when_the_program_enabled_it() {
 #[cfg(unix)]
 fn workspace_config_sets_theme_and_keys_and_malformed_config_warns() {
     let scratch = Scratch::new("m6-config");
-    scratch.seed_config(r#"{"theme":"light","keys":{"new_tab":"t"}}"#);
+    scratch.seed_config(r#"{"theme":"light","keys":{"new_tab":"b"}}"#);
     let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
     assert!(
         wait_for_text(&screen, "PANE-ONE"),
@@ -4422,7 +4936,7 @@ fn workspace_config_sets_theme_and_keys_and_malformed_config_warns() {
         screen.errors()
     );
 
-    screen.command(b't');
+    screen.command(b'b');
     assert!(
         wait_for_text(&screen, "PANE-TWO"),
         "the rebound new-tab key did not run: {:?}",
@@ -4435,7 +4949,7 @@ fn workspace_config_sets_theme_and_keys_and_malformed_config_warns() {
         screen.rendered()
     );
     assert!(
-        wait_for_text(&screen, "^b t"),
+        wait_for_text(&screen, "^b b"),
         "the palette did not show the configured key hint: {:?}",
         screen.rendered()
     );
@@ -5110,6 +5624,10 @@ fn fake_connect() -> io::Result<()> {
     // `observe-early-frames`: the later pair is sent only after the client
     // credits the early paint, which proves the live route was registered.
     let mut late_frames_sent = false;
+    // The terminal-manager preview's channel, so its close can drive the
+    // scripted manager events while the manager underneath stays open.
+    let mut preview_channel: Option<u32> = None;
+    let mut manager_events_sent = false;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         let mut frame = json!({"channel": channel, "kind": kind, "len": payload.len()});
@@ -5132,6 +5650,55 @@ fn fake_connect() -> io::Result<()> {
         // attach is treated as a fresh paint.
         if kind == CLOSE {
             attached_channels.remove(&channel);
+            if scenario == "manager-events"
+                && preview_channel == Some(channel)
+                && !manager_events_sent
+            {
+                manager_events_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "status",
+                        "t9",
+                        json!({
+                            "status": agent_status("done", "claude", "Worker", None, None, ""),
+                            "records": {},
+                            "reported": true,
+                        }),
+                    ),
+                )?;
+                let mut builder = manager_worker_record("t10", "idle");
+                builder["name"] = json!("builder");
+                builder["title"] = json!("New worker");
+                let labels = builder["labels"].clone();
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "labels",
+                        "t10",
+                        json!({"labels": labels, "record": builder}),
+                    ),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "finished",
+                        "t8",
+                        json!({"reason": "exited", "exit_code": 0}),
+                    ),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "t7", json!({})),
+                )?;
+            }
             continue;
         }
 
@@ -5433,6 +6000,18 @@ fn fake_connect() -> io::Result<()> {
                         let mut record = live_record(4242);
                         record["address"] = json!(target);
                         record
+                    } else if scenario == "manager-cross-screen" {
+                        match target.as_str() {
+                            "t9" => cross_screen_worker_record("t9"),
+                            "t10" => same_screen_stale_worker_record("t10"),
+                            _ => doc_record_for(&scenario, &target),
+                        }
+                    } else if scenario.starts_with("manager") {
+                        if target == "t9" {
+                            manager_worker_record("t9", "working")
+                        } else {
+                            doc_record_for(&scenario, &target)
+                        }
                     } else if doc_scenario(&scenario)
                         && target == last_run_address
                         && target != "t1"
@@ -5610,6 +6189,27 @@ fn fake_connect() -> io::Result<()> {
                         "doc-mismatch" | "doc-missing" | "doc-foreign" | "doc-fresh"
                         | "doc-deleted" | "doc-orphan-invalid" => {
                             write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
+                        }
+                        "manager" | "manager-events" => {
+                            if target == "t9" {
+                                if confirmed && observe {
+                                    preview_channel = Some(channel);
+                                    write_frame(&mut output, channel, 3, &resize_payload(24, 6))?;
+                                    write_frame(&mut output, channel, DATA, b"PREVIEW-WORKER\n")?;
+                                } else {
+                                    write_frame(&mut output, channel, DATA, b"WORKER-PANE\n")?;
+                                }
+                            } else {
+                                write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
+                            }
+                        }
+                        "manager-cross-screen" => {
+                            let text: &[u8] = match target.as_str() {
+                                "t9" => b"FOREIGN-PANE\n",
+                                "t10" => b"STALE-PANE\n",
+                                _ => b"PANE-ONE\n",
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
                         }
                         // Agent scenarios paint their whole pane, and some
                         // emit the events the scenario is about once both
@@ -6057,6 +6657,21 @@ fn snapshot_for(
         });
     }
     let terminals: Vec<Value> = match scenario {
+        "manager" => vec![
+            doc_record_for(scenario, "t1"),
+            manager_worker_record("t9", "working"),
+        ],
+        "manager-events" => vec![
+            doc_record_for(scenario, "t1"),
+            manager_worker_record("t9", "working"),
+            manager_worker_record("t8", "idle"),
+            manager_worker_record("t7", "idle"),
+        ],
+        "manager-cross-screen" => vec![
+            doc_record_for(scenario, "t1"),
+            cross_screen_worker_record("t9"),
+            same_screen_stale_worker_record("t10"),
+        ],
         "doc-restore"
         | "doc-remove"
         | "doc-deleted-recover"
@@ -6086,7 +6701,7 @@ fn snapshot_for(
         "doc-deleted-claim-lost" => Vec::new(),
         "doc-orphan" => vec![doc_record_for(scenario, "t1"), orphan_record("t7", 5, 6, 9)],
         "doc-orphan-invalid" => vec![doc_record_for(scenario, "t1"), unlabeled_record("t9")],
-        "doc-foreign" => vec![foreign_record("t1")],
+        "doc-foreign" => vec![unlabeled_record("t1")],
         "agents-lost" if generation > 1 => vec![agent_snapshot_record("t1")],
         "agents-reconnect-blocked" if generation > 1 => {
             vec![agent_blocked_snapshot_record("t1")]
@@ -6105,6 +6720,59 @@ fn client_labels(space: u64, tab: u64, pane: u64) -> Value {
         "herdr.terminal.tab": tab.to_string(),
         "herdr.terminal.pane": pane.to_string(),
     })
+}
+
+/// A live terminal in core that this client's document does not name: the
+/// terminal manager's inventory sees it from the event snapshot alone.
+fn manager_worker_record(address: &str, state: &str) -> Value {
+    let mut record = live_record(7700);
+    record["address"] = json!(address);
+    record["name"] = json!("worker");
+    record["title"] = json!("Worker");
+    record["labels"] = json!({"herdr.client": "someone-else"});
+    record["status"] = agent_status(state, "claude", "Worker", None, None, "");
+    record["cwd"] = json!("/srv/work");
+    record
+}
+
+/// Labels another ht screen wrote: the same client name, but the pane id is
+/// in that screen's namespace (2), not the default screen's (1).
+fn cross_screen_labels() -> Value {
+    json!({
+        "herdr.client": "herdr-terminal",
+        "herdr.terminal.pane": ((2u64 << 32) | 7).to_string(),
+    })
+}
+
+/// A live terminal carrying another ht screen's labels.
+fn cross_screen_worker_record(address: &str) -> Value {
+    let mut record = live_record(7373);
+    record["address"] = json!(address);
+    record["name"] = json!("worker");
+    record["title"] = json!("Worker");
+    record["labels"] = cross_screen_labels();
+    record["cwd"] = json!("/srv/work");
+    record
+}
+
+/// This screen's identity labels with a stale pane id (same namespace).
+fn same_screen_stale_labels() -> Value {
+    json!({
+        "herdr.client": "herdr-terminal",
+        "herdr.terminal.pane": ((1u64 << 32) | 11).to_string(),
+    })
+}
+
+/// A live terminal this screen labeled in an older pane, now shown from a
+/// different pane by the manager.
+fn same_screen_stale_worker_record(address: &str) -> Value {
+    let mut record = live_record(7474);
+    record["address"] = json!(address);
+    record["name"] = json!("worker");
+    record["title"] = json!("Worker");
+    record["labels"] = same_screen_stale_labels();
+    record["cwd"] = json!("/srv/work");
+    record
 }
 
 /// A live terminal carrying the labels a document pane expects.
@@ -6179,14 +6847,6 @@ fn agent_blocked_snapshot_record(address: &str) -> Value {
         "argv": ["claude", "run"],
         "cwd": "/work",
     });
-    record
-}
-
-/// A terminal without the pane label: the same address is not enough.
-fn foreign_record(address: &str) -> Value {
-    let mut record = live_record(9191);
-    record["address"] = json!(address);
-    record["labels"] = json!({"herdr.client": "herdr-terminal"});
     record
 }
 
@@ -6573,10 +7233,18 @@ fn write_labels(path: Option<&Path>, store: &serde_json::Map<String, Value>) {
 
 /// The labels a terminal already carries when its first label call arrives.
 fn base_labels(
-    _scenario: &str,
+    scenario: &str,
     target: &str,
     run_labels: &BTreeMap<String, serde_json::Map<String, Value>>,
 ) -> serde_json::Map<String, Value> {
+    if scenario.starts_with("manager") {
+        // A background terminal brought in by the manager carries another
+        // client's labels; core's label reply keeps them and adds ours.
+        return json!({"herdr.client": "someone-else"})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+    }
     if let Some(labels) = run_labels.get(target) {
         return labels.clone();
     }
@@ -6792,6 +7460,19 @@ impl Scratch {
 
     fn doc_version(&self) -> u64 {
         self.doc().1
+    }
+
+    /// Writes the core label store as if the terminals already carried these
+    /// labels before the client connected.
+    fn seed_labels(&self, value: serde_json::Value) {
+        std::fs::write(self.dir.join("labels.json"), value.to_string()).expect("seed labels");
+    }
+
+    fn labels_value(&self) -> serde_json::Value {
+        std::fs::read_to_string(self.dir.join("labels.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
     }
 
     /// Writes the per-screen local view where the client looks for it.

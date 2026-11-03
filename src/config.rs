@@ -240,7 +240,7 @@ mod tests {
             "scrollback": 500,
             "mouse": false,
             "clipboard": "both",
-            "keys": {"new_tab": "t", "palette": ":"},
+            "keys": {"new_tab": "b", "palette": ":"},
         }));
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         let config = loaded.config;
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(config.scrollback, 500);
         assert!(!config.mouse);
         assert_eq!(config.clipboard, ClipboardMode::Both);
-        assert_eq!(config.keys["new_tab"], "t");
+        assert_eq!(config.keys["new_tab"], "b");
         assert_eq!(config.keys["palette"], ":");
     }
 

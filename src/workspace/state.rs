@@ -88,6 +88,10 @@ pub struct UiState {
     pub connection: Connection,
     /// The modal agent sidebar and its selection.
     pub sidebar: Sidebar,
+    /// The Core-wide terminal manager and its local selection/filter.
+    pub manager: ManagerState,
+    /// The read-only observer preview, when open.
+    pub preview: Option<PreviewState>,
     /// The agent being peeked, when the peek overlay is open.
     pub peek: Option<PaneId>,
     /// The effective prefix key map, so the palette can show current hints.
@@ -106,6 +110,8 @@ impl Default for UiState {
             prefix: false,
             connection: Connection::Live,
             sidebar: Sidebar::default(),
+            manager: ManagerState::default(),
+            preview: None,
             peek: None,
             keymap: KeyMap::default(),
         }
@@ -124,8 +130,12 @@ impl UiState {
             Overlay::Palette
         } else if self.search.is_some() {
             Overlay::Search
+        } else if self.preview.is_some() {
+            Overlay::Preview
         } else if let Some(pane) = self.peek {
             Overlay::Peek(pane)
+        } else if self.manager.open {
+            Overlay::Manager
         } else if self.sidebar.open {
             Overlay::Sidebar
         } else {
@@ -142,6 +152,8 @@ impl UiState {
             || self.palette.is_some()
             || self.search.is_some()
             || self.peek.is_some()
+            || self.manager.open
+            || self.preview.is_some()
             || self.sidebar.open
     }
 
@@ -213,6 +225,26 @@ pub struct Sidebar {
     pub open: bool,
     pub selected: Option<PaneId>,
     pub offset: usize,
+}
+
+/// The terminal manager's local state. The selection is an address, not a
+/// pane id: a hidden terminal has no pane. The filter and selection are never
+/// part of the shared document.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagerState {
+    pub open: bool,
+    pub selected: Option<String>,
+    pub filter: Line,
+    pub filtering: bool,
+    pub offset: usize,
+}
+
+/// The address and title of the terminal being previewed. The stream and VT
+/// live in the runtime; this is what the overlays and input rules read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewState {
+    pub address: String,
+    pub title: String,
 }
 
 /// Whether the client currently has a usable core connection.

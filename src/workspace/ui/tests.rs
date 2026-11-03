@@ -130,6 +130,8 @@ fn render_agents(
         theme: &theme,
         selections: &empty,
         scroll_hint: None,
+        manager: &[],
+        preview: None,
     };
     let rendered = render_with(&mut buffer, area, workspace, ui, &view);
     (buffer, rendered)
@@ -527,6 +529,8 @@ fn a_local_selection_paints_its_cells_with_the_theme_selection_color() {
         theme: &theme,
         selections: &selections,
         scroll_hint: None,
+        manager: &[],
+        preview: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -555,6 +559,8 @@ fn the_scroll_hint_replaces_the_idle_status_hint() {
         theme: &theme,
         selections: &BTreeMap::new(),
         scroll_hint: Some("scroll 2/18 · Shift-PgDn live"),
+        manager: &[],
+        preview: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -582,6 +588,8 @@ fn explicit_themes_style_the_chrome_consistently() {
             theme: &theme,
             selections: &BTreeMap::new(),
             scroll_hint: None,
+            manager: &[],
+            preview: None,
         };
         let mut buffer = Buffer::empty(area);
         render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -617,6 +625,8 @@ fn the_terminal_grid_is_not_painted_by_the_theme() {
         theme: &theme,
         selections: &BTreeMap::new(),
         scroll_hint: None,
+        manager: &[],
+        preview: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -647,6 +657,8 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
         theme: &theme,
         selections: &BTreeMap::new(),
         scroll_hint: Some("scroll 20/60 · Shift-PgDn live"),
+        manager: &[],
+        preview: None,
     };
     let mut buffer = Buffer::empty(area);
     let started = std::time::Instant::now();
@@ -675,10 +687,168 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
         theme: &theme,
         selections: &BTreeMap::new(),
         scroll_hint: None,
+        manager: &[],
+        preview: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &stopped);
     let text = lines(&buffer).join("\n");
     assert!(text.contains("LINE-099"), "the live bottom is back: {text}");
     assert!(!text.contains("scroll 20/60"));
+}
+
+fn manager_row(address: &str, name: &str, word: &str, shown: bool) -> ManagerRow {
+    ManagerRow {
+        address: address.to_owned(),
+        machine: manager::machine(address),
+        name: name.to_owned(),
+        title: String::new(),
+        parent: None,
+        word: word.to_owned(),
+        cwd: "/work".into(),
+        age: "2m".into(),
+        created_ms: Some(2_000),
+        shown,
+    }
+}
+
+fn render_manager(ui: &UiState, rows: &[ManagerRow], width: u16, height: u16) -> (Buffer, Render) {
+    let (workspace, _) = one_pane();
+    let area = Rect::new(0, 0, width, height);
+    let theme = Theme::default();
+    let selections = BTreeMap::new();
+    let screens = BTreeMap::new();
+    let view = View {
+        screens: &screens,
+        rows: &[],
+        theme: &theme,
+        selections: &selections,
+        scroll_hint: None,
+        manager: rows,
+        preview: None,
+    };
+    let mut buffer = Buffer::empty(area);
+    let rendered = render_with(&mut buffer, area, &workspace, ui, &view);
+    (buffer, rendered)
+}
+
+#[test]
+fn the_terminal_manager_lists_every_row_with_a_shown_marker() {
+    let mut ui = UiState::default();
+    ui.manager.open = true;
+    ui.manager.selected = Some("m3/t9".into());
+    let rows = vec![
+        manager_row("t7", "worker", "blocked", true),
+        manager_row("m3/t9", "builder", "working", false),
+    ];
+    let (buffer, rendered) = render_manager(&ui, &rows, 90, 18);
+    let text = lines(&buffer).join("\n");
+    for expected in [
+        "terminal manager",
+        "1 shown · 2 live",
+        "* blocked",
+        "t7",
+        "worker",
+        "  working",
+        "m3/t9",
+        "builder",
+        "machine m3",
+        "/work",
+        "Enter show/hide",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}: {text}");
+    }
+    assert!(rendered.focused.is_none(), "the manager covers the panes");
+    assert!(rendered.prompt_cursor.is_none());
+}
+
+#[test]
+fn the_manager_empty_and_no_match_states_say_so() {
+    let mut ui = UiState::default();
+    ui.manager.open = true;
+    let (buffer, _) = render_manager(&ui, &[], 70, 14);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("no live terminals in core"), "{text}");
+    assert!(text.contains("0 live"), "{text}");
+
+    ui.manager.filter = Line::new("zzz");
+    let rows = vec![manager_row("t7", "worker", "blocked", true)];
+    let (buffer, _) = render_manager(&ui, &rows, 70, 14);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("no terminals match the filter"), "{text}");
+    assert!(text.contains("0/1 match"), "{text}");
+    assert!(
+        !text.contains("worker"),
+        "the hidden row is filtered: {text}"
+    );
+}
+
+#[test]
+fn the_manager_filter_owns_the_cursor_and_selection_moves_over_matches() {
+    let mut ui = UiState::default();
+    ui.manager.open = true;
+    ui.manager.filtering = true;
+    ui.manager.filter = Line::new("work");
+    ui.manager.selected = Some("t9".into());
+    let rows = vec![
+        manager_row("t7", "worker", "blocked", true),
+        {
+            let mut other = manager_row("t8", "other", "idle", false);
+            other.cwd = "/elsewhere".into();
+            other
+        },
+        manager_row("t9", "workbench", "working", false),
+    ];
+    let (buffer, rendered) = render_manager(&ui, &rows, 80, 16);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("filter: work"), "{text}");
+    assert!(
+        text.contains("worker") && text.contains("workbench"),
+        "{text}"
+    );
+    assert!(!text.contains("other"), "the filter is live: {text}");
+    assert!(text.contains("2/3 match"), "{text}");
+    assert!(rendered.prompt_cursor.is_some(), "the filter has a cursor");
+    let (x, y) = rendered.prompt_cursor.expect("cursor");
+    assert_eq!(y, manager_rect(Rect::new(0, 0, 80, 16)).y + 1);
+    assert!(x > 0);
+}
+
+#[test]
+fn the_preview_draws_a_read_only_border_title_and_terminal() {
+    let ui = UiState {
+        preview: Some(PreviewState {
+            address: "m1/t9".into(),
+            title: "worker".into(),
+        }),
+        ..UiState::default()
+    };
+    let (workspace, _) = one_pane();
+    let area = Rect::new(0, 0, 80, 20);
+    let grid = preview_grid(area);
+    assert!(grid.width > 0 && grid.height > 0);
+    let mut vt = Vt::new(grid.width, grid.height).expect("vt");
+    vt.feed(b"PREVIEW");
+    let screen = vt.snapshot().expect("snapshot");
+    let theme = Theme::default();
+    let selections = BTreeMap::new();
+    let screens = BTreeMap::new();
+    let view = View {
+        screens: &screens,
+        rows: &[],
+        theme: &theme,
+        selections: &selections,
+        scroll_hint: None,
+        manager: &[],
+        preview: Some(&screen),
+    };
+    let mut buffer = Buffer::empty(area);
+    let rendered = render_with(&mut buffer, area, &workspace, &ui, &view);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("preview · worker · m1/t9"), "{text}");
+    assert!(text.contains("read-only observer"), "{text}");
+    assert!(text.contains("any key closes"), "{text}");
+    assert!(text.contains("PREVIEW"), "the observer VT is drawn: {text}");
+    assert!(rendered.focused.is_none());
+    assert!(rendered.prompt_cursor.is_none());
 }
