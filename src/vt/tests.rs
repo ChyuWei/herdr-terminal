@@ -309,3 +309,36 @@ fn a_golden_frame_has_text_styles_widths_and_a_cursor() {
         Color::Rgb(0x81, 0xA2, 0xBE)
     );
 }
+
+#[test]
+fn a_large_output_burst_is_processed_and_bounded() {
+    use std::time::{Duration, Instant};
+    // Four MiB through the VT, in the same 64 KiB chunks the drain uses.
+    let line = "0123456789abcdefghijklmnopqrstuvwxyz\r\n";
+    let mut burst = Vec::with_capacity(4 * 1024 * 1024 + line.len());
+    while burst.len() < 4 * 1024 * 1024 {
+        burst.extend_from_slice(line.as_bytes());
+    }
+    let mut vt = Vt::new_with_scrollback(120, 40, 10_000).expect("VT");
+    let started = Instant::now();
+    for chunk in burst.chunks(64 * 1024) {
+        vt.feed(chunk);
+    }
+    let screen = vt.snapshot().expect("snapshot");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "4 MiB took {elapsed:?}; the local VT must stay interactive"
+    );
+    assert_eq!(screen.lines().len(), 40);
+    assert!(screen.lines().join("\n").contains("0123456789abcdef"));
+    assert!(
+        vt.scrollback_rows() <= 10_000 + 1_024,
+        "history is bounded: {} rows",
+        vt.scrollback_rows()
+    );
+    assert!(
+        vt.snapshot().expect("second snapshot").lines().len() == 40,
+        "a redraw after the burst still produces a full frame"
+    );
+}

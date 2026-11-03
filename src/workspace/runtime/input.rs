@@ -9,7 +9,7 @@ use crate::workspace::commands::{Command, Effect, RenameTarget};
 use crate::workspace::keys;
 use crate::workspace::model::{CloseAction, ClosedPane, StartRequest};
 use crate::workspace::state::{Edit, Prompt, PromptEdit};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::Duration;
 
 impl Screen<'_> {
@@ -21,7 +21,8 @@ impl Screen<'_> {
         let event = event::read().map_err(Error::Io)?;
         match event {
             Event::Key(key) => self.handle_key(key)?,
-            Event::Mouse(mouse) => self.forward_mouse(mouse)?,
+            Event::Mouse(mouse) => self.handle_mouse(mouse)?,
+            Event::Paste(text) => self.handle_paste(text)?,
             Event::Resize(cols, rows) if cols > 0 && rows > 0 => {
                 self.size = (cols, rows);
                 self.dirty = true;
@@ -54,6 +55,8 @@ impl Screen<'_> {
             self.detach = true;
             return Ok(());
         }
+        // A key ends a click that never became a drag.
+        self.selection_press = None;
         if self.ui.peek.is_some() {
             // Peek is modal: any key other than detach closes it, and none of
             // them reaches the program underneath.
@@ -71,6 +74,29 @@ impl Screen<'_> {
         if self.ui.prompt.is_some() {
             self.swallow = Some(key.code);
             return self.edit_prompt(&key);
+        }
+        if self.ui.palette.is_some() {
+            self.swallow = Some(key.code);
+            return self.palette_key(&key);
+        }
+        if self.ui.search.is_some() {
+            self.swallow = Some(key.code);
+            return self.search_key(&key);
+        }
+        if self.ui.selecting.is_some() {
+            if self.selection_key(&key)? {
+                // A selection key is handled locally; its release must not
+                // reach the program.
+                self.swallow = Some(key.code);
+                return Ok(());
+            }
+            // A selection is not a keyboard trap. Any key that is not a
+            // selection key leaves the selection and reaches the program. Its
+            // release is forwarded too; the encoder emits one only when the
+            // program asked for key events.
+            self.exit_selection(true);
+            self.snap_to_bottom();
+            return self.forward_key(&key);
         }
         if self.ui.sidebar.open {
             self.swallow = Some(key.code);
@@ -91,10 +117,14 @@ impl Screen<'_> {
                 return Ok(());
             }
             if let KeyCode::Char(c) = key.code
-                && let Some(command) = keys::command(c)
+                && let Some(command) = self.ui.keymap.command(c)
             {
                 self.dispatch(command)?;
             }
+            return Ok(());
+        }
+        if self.scroll_key(&key)? {
+            self.swallow = Some(key.code);
             return Ok(());
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(keys::PREFIX)
@@ -104,11 +134,14 @@ impl Screen<'_> {
             self.dirty = true;
             return Ok(());
         }
+        // Ordinary input resumes live output: a program must not receive keys
+        // while the person is reading history.
+        self.snap_to_bottom();
         self.forward_key(&key)
     }
 
     pub(super) fn overlay_open(&self) -> bool {
-        self.ui.help || self.ui.prompt.is_some() || self.ui.peek.is_some() || self.ui.sidebar.open
+        self.ui.modal()
     }
 
     /// One key while the sidebar is modal. Only its documented keys act;
@@ -208,36 +241,6 @@ impl Screen<'_> {
         Ok(())
     }
 
-    pub(super) fn forward_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
-        if self.overlay_open() || self.ui.prefix {
-            return Ok(());
-        }
-        let prepared = {
-            let Some(pane) = self.workspace.focused_pane() else {
-                return Ok(());
-            };
-            self.links.get_mut(&pane).and_then(|link| {
-                let bytes = link.vt.encode_mouse(&mouse);
-                link.session.channel().map(|channel| (channel, bytes))
-            })
-        };
-        let Some((channel, bytes)) = prepared else {
-            return Ok(());
-        };
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let client = self.client.clone();
-        if let Err(error) = client.keys(channel, &bytes) {
-            if session::is_lost(&error) {
-                self.begin_reconnect();
-                return Ok(());
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
-
     pub(super) fn forward_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         let Some(pane) = self.workspace.focused_pane() else {
             return Ok(());
@@ -289,11 +292,18 @@ impl Screen<'_> {
                 self.ui.prompt = None;
                 self.ui.prefix = false;
                 self.ui.peek = None;
+                self.ui.palette = None;
+                self.ui.search = None;
+                self.ui.selecting = None;
                 self.dirty = true;
             }
             Effect::Agents => self.toggle_sidebar(),
             Effect::Peek => self.peek_focused(),
             Effect::JumpAgent(jump) => self.jump_agent(jump),
+            Effect::Palette => self.open_palette(),
+            Effect::Search => self.open_search(),
+            Effect::Select => self.toggle_select()?,
+            Effect::Copy => self.copy_selection()?,
             Effect::Detach => self.detach = true,
         }
         Ok(())

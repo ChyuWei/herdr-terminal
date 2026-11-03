@@ -28,6 +28,96 @@ fn a_new_workspace_has_one_empty_space_and_tab() {
 }
 
 #[test]
+fn a_mouse_click_focuses_a_pane_in_the_active_tab_only() {
+    let mut workspace = Workspace::new();
+    let first = add(&mut workspace, StartKind::Initial, "t1");
+    let second = add(&mut workspace, StartKind::Split(Axis::Columns), "t2");
+    assert_eq!(workspace.focused_pane(), Some(second));
+    assert!(workspace.focus_pane(first));
+    assert_eq!(workspace.focused_pane(), Some(first));
+    assert!(!workspace.focus_pane(first), "already focused");
+    assert!(!workspace.focus_pane(PaneId(999)), "unknown pane");
+
+    add(&mut workspace, StartKind::Tab, "tab 2 terminal");
+    assert_eq!(
+        workspace.focused_pane(),
+        workspace.active_tab().and_then(|tab| tab.focused)
+    );
+    assert!(
+        !workspace.focus_pane(first),
+        "the click cannot focus a pane in a background tab"
+    );
+}
+
+#[test]
+fn a_tab_bar_click_selects_a_tab_of_the_active_space() {
+    let mut workspace = Workspace::new();
+    add(&mut workspace, StartKind::Initial, "t1");
+    let first_tab = workspace.active_tab_id().expect("tab");
+    add(&mut workspace, StartKind::Tab, "t2");
+    let second_tab = workspace.active_tab_id().expect("tab");
+    assert_ne!(first_tab, second_tab);
+    assert!(workspace.select_tab_id(first_tab));
+    assert_eq!(workspace.active_tab_id(), Some(first_tab));
+    assert!(!workspace.select_tab_id(first_tab), "already active");
+    assert!(!workspace.select_tab_id(TabId(999)), "unknown tab");
+}
+
+#[test]
+fn dragging_a_split_boundary_moves_it_by_exact_cells() {
+    let mut workspace = Workspace::new();
+    add(&mut workspace, StartKind::Initial, "t1");
+    add(&mut workspace, StartKind::Split(Axis::Columns), "t2");
+    let viewport = viewport();
+    let before = geometry::compute(workspace.active_tab(), viewport);
+    assert_eq!(before.panes[0].1.width, 40);
+    assert_eq!(before.panes[1].1.width, 39);
+
+    assert!(workspace.resize_gap(viewport, &[], 0, 4));
+    let after = geometry::compute(workspace.active_tab(), viewport);
+    assert_eq!(after.panes[0].1.width, 44, "{after:?}");
+    assert_eq!(after.panes[1].1.width, 35, "{after:?}");
+    assert_eq!(after.panes[1].1.x, 45, "the one-cell gap moved with it");
+    assert_eq!(after.panes[0].1.width + 1 + after.panes[1].1.width, 80);
+
+    // The new spans become the ratio, so the next drag is equally exact.
+    assert!(workspace.resize_gap(viewport, &[], 0, -2));
+    let after = geometry::compute(workspace.active_tab(), viewport);
+    assert_eq!(after.panes[0].1.width, 42);
+    assert_eq!(after.panes[1].1.width, 37);
+}
+
+#[test]
+fn a_split_drag_clamps_both_sides_and_refuses_impossible_ones() {
+    let mut workspace = Workspace::new();
+    add(&mut workspace, StartKind::Initial, "t1");
+    add(&mut workspace, StartKind::Split(Axis::Rows), "t2");
+    let viewport = viewport();
+    assert!(workspace.resize_gap(viewport, &[], 0, -100));
+    let heights = geometry::compute(workspace.active_tab(), viewport)
+        .panes
+        .iter()
+        .map(|(_, rect)| rect.height)
+        .collect::<Vec<_>>();
+    assert_eq!(heights[0], geometry::MIN_PANE, "{heights:?}");
+    assert!(
+        !workspace.resize_gap(viewport, &[], 0, -1),
+        "already at the floor"
+    );
+    assert!(
+        !workspace.resize_gap(viewport, &[], 1, 1),
+        "no boundary after the last child"
+    );
+    assert!(!workspace.resize_gap(viewport, &[9], 0, 1), "bad path");
+
+    assert!(workspace.toggle_zoom());
+    assert!(
+        !workspace.resize_gap(viewport, &[], 0, 2),
+        "zoom hides boundaries"
+    );
+}
+
+#[test]
 fn the_initial_terminal_becomes_the_focused_leaf() {
     let mut workspace = Workspace::new();
     let pane = add(&mut workspace, StartKind::Initial, "t1");

@@ -8,11 +8,13 @@
 use super::agents::{self, AgentRow};
 use super::geometry::{self, Rects};
 use super::model::{PaneId, Workspace};
+use super::palette;
 use super::state::{Connection, UiState};
+use crate::theme::Theme;
 use crate::vt::Screen as VtScreen;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use std::collections::BTreeMap;
@@ -32,6 +34,13 @@ pub const HELP: &[&str] = &[
     "p pin / unpin      u mark unread   i peek selected",
     "Esc / a close sidebar               any key closes peek",
     "Ctrl-] detach      prefix twice sends Ctrl-b",
+    ": palette          f search scrollback",
+    "[ select mode      y copy selection",
+    "selection: drag or h/j/k/l, y copy, Esc cancel",
+    "other keys leave selection; paste is ignored while selecting",
+    "Shift-PgUp/PgDn scroll history      Shift-Home/End top/bottom",
+    "drag a split gap to resize          wheel scrolls local history",
+    "mouse: click focuses pane/tab       drag selects; Shift-drag local",
     "any key closes help",
 ];
 
@@ -40,11 +49,45 @@ pub const HELP: &[&str] = &[
 pub struct Render {
     /// The focused pane and its terminal grid, when it is visible.
     pub focused: Option<(PaneId, Rect)>,
-    /// The rename prompt's cursor, when the prompt is open.
+    /// The rename prompt, palette or search query cursor, when one is open.
     pub prompt_cursor: Option<(u16, u16)>,
 }
 
-/// Paints a frame and describes the cursor to place.
+/// Viewport-relative selection highlight spans `(x, y, width)` per pane.
+pub type SelectionSpans = BTreeMap<PaneId, Vec<(u16, u16, u16)>>;
+
+/// Everything a frame needs beyond the workspace and UI state: local VT
+/// snapshots, agent rows, the theme, local selection highlights and the
+/// scroll-position hint. Grouping them keeps the drawing signatures stable as
+/// the daily-driver surface grows.
+#[derive(Clone, Copy)]
+pub struct View<'a> {
+    pub screens: &'a BTreeMap<PaneId, VtScreen>,
+    pub rows: &'a [AgentRow],
+    pub theme: &'a Theme,
+    pub selections: &'a SelectionSpans,
+    pub scroll_hint: Option<&'a str>,
+}
+
+impl Default for View<'_> {
+    fn default() -> View<'static> {
+        static SCREENS: std::sync::OnceLock<BTreeMap<PaneId, VtScreen>> =
+            std::sync::OnceLock::new();
+        static ROWS: [AgentRow; 0] = [];
+        static SELECTIONS: std::sync::OnceLock<SelectionSpans> = std::sync::OnceLock::new();
+        static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+        View {
+            screens: SCREENS.get_or_init(BTreeMap::new),
+            rows: &ROWS,
+            theme: THEME.get_or_init(Theme::default),
+            selections: SELECTIONS.get_or_init(BTreeMap::new),
+            scroll_hint: None,
+        }
+    }
+}
+
+/// Paints a frame with default settings, for callers that only need the
+/// workspace and the terminal snapshots.
 pub fn render(
     buffer: &mut Buffer,
     area: Rect,
@@ -52,22 +95,32 @@ pub fn render(
     ui: &UiState,
     screens: &BTreeMap<PaneId, VtScreen>,
 ) -> Render {
-    render_view(buffer, area, workspace, ui, screens, &[])
+    let view = View {
+        screens,
+        ..View::default()
+    };
+    render_with(buffer, area, workspace, ui, &view)
 }
 
-/// Paints a frame with the current agent rows: the status-bar attention count,
-/// the sidebar overlay and the peek overlay.
-pub fn render_view(
+/// Paints a frame.
+pub fn render_with(
     buffer: &mut Buffer,
     area: Rect,
     workspace: &Workspace,
     ui: &UiState,
-    screens: &BTreeMap<PaneId, VtScreen>,
-    rows: &[AgentRow],
+    view: &View,
 ) -> Render {
+    let theme = view.theme;
     let rects = geometry::compute(workspace.active_tab(), area);
-    draw_panes(buffer, workspace, &rects, screens);
-    draw_tab_bar(buffer, workspace, rects.tab_bar);
+    draw_panes(
+        buffer,
+        workspace,
+        &rects,
+        view.screens,
+        view.selections,
+        theme,
+    );
+    draw_tab_bar(buffer, workspace, rects.tab_bar, theme);
     let mut rendered = Render {
         focused: workspace.focused_pane().and_then(|id| {
             rects
@@ -80,19 +133,36 @@ pub fn render_view(
     if rects.panes.is_empty() && area.height > 0 {
         draw_empty(buffer, rects.workspace);
     }
-    rendered.prompt_cursor = draw_status(buffer, workspace, ui, rects.status, rows);
+    rendered.prompt_cursor = draw_status(
+        buffer,
+        workspace,
+        ui,
+        rects.status,
+        view.rows,
+        theme,
+        view.scroll_hint,
+    );
+    if ui.search.is_some() {
+        // The search bar owns the status row; the program's cursor would
+        // suggest the keys are still typing into it.
+        rendered.focused = None;
+    }
     if ui.sidebar.open {
-        draw_sidebar(buffer, area, ui, rows);
+        draw_sidebar(buffer, area, ui, view.rows, theme);
         rendered.focused = None;
         rendered.prompt_cursor = None;
     }
     if ui.peek.is_some() {
-        draw_peek(buffer, area, ui, screens, rows);
+        draw_peek(buffer, area, ui, view.screens, view.rows, theme);
         rendered.focused = None;
         rendered.prompt_cursor = None;
     }
+    if ui.palette.is_some() {
+        rendered.prompt_cursor = draw_palette(buffer, area, ui, theme);
+        rendered.focused = None;
+    }
     if ui.help {
-        draw_help(buffer, area);
+        draw_help(buffer, area, theme);
         rendered.focused = None;
         rendered.prompt_cursor = None;
     }
@@ -120,20 +190,22 @@ pub fn sidebar_inner_height(area: Rect) -> usize {
     sidebar_rect(area).height.saturating_sub(2) as usize
 }
 
-fn draw_tab_bar(buffer: &mut Buffer, workspace: &Workspace, area: Rect) {
+fn draw_tab_bar(buffer: &mut Buffer, workspace: &Workspace, area: Rect, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let space = workspace.active_space();
     let mut spans = vec![Span::styled(
         format!(" {} ", space.name),
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
     )];
     for (index, tab) in space.tabs.iter().enumerate() {
         let style = if tab.id == space.active {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            theme.tab_active
         } else {
-            Style::default().add_modifier(Modifier::DIM)
+            theme.tab_inactive
         };
         spans.push(Span::styled(format!(" {} {} ", index + 1, tab.name), style));
     }
@@ -145,6 +217,8 @@ fn draw_panes(
     workspace: &Workspace,
     rects: &Rects,
     screens: &BTreeMap<PaneId, VtScreen>,
+    selections: &BTreeMap<PaneId, Vec<(u16, u16, u16)>>,
+    theme: &Theme,
 ) {
     let focused = workspace.focused_pane();
     for (pane_id, rect) in &rects.panes {
@@ -154,10 +228,10 @@ fn draw_panes(
         let is_focused = focused == Some(*pane_id);
         let border = if is_focused {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.border)
         };
         let mut label = if pane.title.is_empty() || pane.title == pane.name {
             pane.name.clone()
@@ -172,10 +246,32 @@ fn draw_panes(
             .border_style(border)
             .title(Line::from(Span::styled(format!(" {label} "), border)))
             .render(*rect, buffer);
-        if let Some(inner) = geometry::inner(*rect)
-            && let Some(screen) = screens.get(pane_id)
-        {
+        let Some(inner) = geometry::inner(*rect) else {
+            continue;
+        };
+        if let Some(screen) = screens.get(pane_id) {
             crate::screen::view::draw_buffer(buffer, inner, screen);
+        }
+        if let Some(spans) = selections.get(pane_id) {
+            draw_selection(buffer, inner, spans, theme);
+        }
+    }
+}
+
+/// Patches the selection color over the terminal cells the local selection
+/// covers.
+fn draw_selection(buffer: &mut Buffer, inner: Rect, spans: &[(u16, u16, u16)], theme: &Theme) {
+    let style = Style::default().bg(theme.selection);
+    for &(x, y, width) in spans {
+        if y >= inner.height {
+            continue;
+        }
+        let end = x.saturating_add(width).min(inner.width);
+        for column in x..end {
+            let at = (inner.x.saturating_add(column), inner.y.saturating_add(y));
+            if let Some(cell) = buffer.cell_mut(at) {
+                cell.set_style(style);
+            }
         }
     }
 }
@@ -204,24 +300,29 @@ fn draw_empty(buffer: &mut Buffer, area: Rect) {
         .render(at, buffer);
 }
 
-/// Draws the status bar (or the rename prompt in its place) and returns the
-/// prompt cursor.
+/// Draws the status bar (or the rename prompt or search bar in its place) and
+/// returns the field cursor.
 fn draw_status(
     buffer: &mut Buffer,
     workspace: &Workspace,
     ui: &UiState,
     area: Rect,
     rows: &[AgentRow],
+    theme: &Theme,
+    scroll_hint: Option<&str>,
 ) -> Option<(u16, u16)> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
-    buffer.set_style(area, Style::default().add_modifier(Modifier::REVERSED));
+    if let Some(search) = &ui.search {
+        return draw_search(buffer, area, search, theme);
+    }
+    buffer.set_style(area, theme.status);
     if let Some(prompt) = &ui.prompt {
         let text = prompt.text();
         let line = Line::from(vec![
-            Span::raw(prompt.label()),
-            Span::styled(text, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(prompt.label(), theme.status),
+            Span::styled(text, theme.status.add_modifier(Modifier::BOLD)),
         ]);
         Paragraph::new(line).render(area, buffer);
         let before: String = prompt.text[..prompt.cursor].iter().collect();
@@ -284,6 +385,11 @@ fn draw_status(
         Connection::Live if ui.sidebar.open => "agents · Esc closes".to_owned(),
         Connection::Live => "^b ? help".to_owned(),
     };
+    if let Some(hint) = scroll_hint
+        && matches!(ui.connection, Connection::Live)
+    {
+        right = format!("{hint} · {right}");
+    }
     if let Some(attention) = agents::attention(rows).text() {
         right = format!("{attention} · {right}");
     }
@@ -291,17 +397,166 @@ fn draw_status(
     let left_width = Span::raw(left.as_str()).width();
     let right_width = Span::raw(right.as_str()).width();
     let spacer = width.saturating_sub(left_width + right_width).max(1);
-    let style = Style::default().add_modifier(Modifier::REVERSED);
     let line = Line::from(vec![
-        Span::styled(left, style),
+        Span::styled(left, theme.status),
         Span::raw(" ".repeat(spacer)),
-        Span::styled(right, style.add_modifier(Modifier::BOLD)),
+        Span::styled(right, theme.status.add_modifier(Modifier::BOLD)),
     ]);
-    Paragraph::new(line).style(style).render(area, buffer);
+    Paragraph::new(line)
+        .style(theme.status)
+        .render(area, buffer);
     None
 }
 
-fn draw_sidebar(buffer: &mut Buffer, area: Rect, ui: &UiState, rows: &[AgentRow]) {
+/// The search bar drawn in the status row: the literal query, the match
+/// counts and the cursor.
+fn draw_search(
+    buffer: &mut Buffer,
+    area: Rect,
+    search: &super::state::SearchState,
+    theme: &Theme,
+) -> Option<(u16, u16)> {
+    buffer.set_style(area, theme.status);
+    let query = search.line.text();
+    let label = " search: ";
+    let left = format!("{label}{query}");
+    let right = if query.is_empty() {
+        "type to search scrollback · Esc close".to_owned()
+    } else if !search.complete {
+        "searching…".to_owned()
+    } else if search.total == 0 {
+        "no matches · Esc close".to_owned()
+    } else {
+        let position = search.selected.map(|index| index + 1).unwrap_or(0);
+        format!(
+            "{position}/{} matches · Enter next · Up prev · Esc close",
+            search.total
+        )
+    };
+    let width = area.width as usize;
+    let left_width = Span::raw(left.as_str()).width();
+    let right_width = Span::raw(right.as_str()).width();
+    let spacer = width.saturating_sub(left_width + right_width).max(1);
+    let line = Line::from(vec![
+        Span::styled(left, theme.status.add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(spacer)),
+        Span::styled(right, theme.status),
+    ]);
+    Paragraph::new(line)
+        .style(theme.status)
+        .render(area, buffer);
+    let before: String = search.line.text[..search.line.cursor].iter().collect();
+    let x = area
+        .x
+        .saturating_add(Span::raw(label).width() as u16)
+        .saturating_add(Span::raw(before.as_str()).width() as u16)
+        .min(area.x.saturating_add(area.width.saturating_sub(1)));
+    Some((x, area.y))
+}
+
+/// The command palette overlay: a query line, the filtered commands and their
+/// configured prefix key hints. It reuses the command table; it never writes
+/// the layout or the shared document itself.
+fn draw_palette(
+    buffer: &mut Buffer,
+    area: Rect,
+    ui: &UiState,
+    theme: &Theme,
+) -> Option<(u16, u16)> {
+    let state = ui.palette.as_ref()?;
+    if area.width < 16 || area.height < 6 {
+        return None;
+    }
+    let width = area.width.saturating_sub(4).min(72);
+    let height = area.height.saturating_sub(2).min(18);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + 1,
+        width,
+        height,
+    );
+    Clear.render(rect, buffer);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.overlay))
+        .title(Line::from(Span::styled(
+            " palette · Enter run · Esc close ",
+            Style::default()
+                .fg(theme.overlay)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(rect);
+    block.render(rect, buffer);
+    if inner.width < 4 || inner.height < 2 {
+        return None;
+    }
+    let query = state.line.text();
+    let before = state.line.before();
+    let head = format!("› {query}");
+    Paragraph::new(Line::from(Span::styled(
+        head,
+        Style::default().add_modifier(Modifier::BOLD),
+    )))
+    .render(Rect::new(inner.x, inner.y, inner.width, 1), buffer);
+    let rows = palette::filter(&palette::entries(&ui.keymap), &query);
+    let list = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    if list.height == 0 {
+        return None;
+    }
+    if rows.is_empty() {
+        Paragraph::new(Line::from(Span::styled(
+            "no matching commands",
+            Style::default()
+                .fg(theme.highlight)
+                .add_modifier(Modifier::DIM),
+        )))
+        .render(list, buffer);
+    } else {
+        let selected = state.selected.min(rows.len() - 1);
+        let visible = (list.height as usize).min(rows.len());
+        // Keep the selected row visible in a short palette.
+        let offset = selected.saturating_add(1).saturating_sub(visible);
+        let lines: Vec<Line> = rows
+            .iter()
+            .skip(offset)
+            .take(visible)
+            .enumerate()
+            .map(|(index, entry)| {
+                let is_selected = offset + index == selected;
+                let style = if is_selected {
+                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let hint = match entry.hint {
+                    Some(key) => format!(" ^b {key} "),
+                    None => String::new(),
+                };
+                let pad = (list.width as usize).saturating_sub(
+                    Span::raw(entry.label).width() + Span::raw(hint.as_str()).width(),
+                );
+                Line::from(Span::styled(
+                    format!(" {}{}{}", entry.label, " ".repeat(pad), hint),
+                    style,
+                ))
+            })
+            .collect();
+        Paragraph::new(lines).render(list, buffer);
+    }
+    let x = inner
+        .x
+        .saturating_add(2)
+        .saturating_add(Span::raw(before.as_str()).width() as u16)
+        .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
+    Some((x, inner.y))
+}
+
+fn draw_sidebar(buffer: &mut Buffer, area: Rect, ui: &UiState, rows: &[AgentRow], theme: &Theme) {
     let rect = sidebar_rect(area);
     if rect.width == 0 || rect.height == 0 {
         return;
@@ -317,11 +572,11 @@ fn draw_sidebar(buffer: &mut Buffer, area: Rect, ui: &UiState, rows: &[AgentRow]
     title.push_str("· j/k move · Enter jump · i peek · p pin · u unread · Esc close ");
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.overlay))
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.overlay)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(rect);
@@ -396,6 +651,7 @@ fn draw_peek(
     ui: &UiState,
     screens: &BTreeMap<PaneId, VtScreen>,
     rows: &[AgentRow],
+    theme: &Theme,
 ) {
     let Some(pane) = ui.peek else {
         return;
@@ -417,12 +673,10 @@ fn draw_peek(
     Clear.render(rect, buffer);
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(Style::default().fg(theme.peek))
         .title(Line::from(Span::styled(
             " peek · any key closes ",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.peek).add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(rect);
     block.render(rect, buffer);
@@ -466,9 +720,7 @@ fn draw_peek(
     }
     Paragraph::new(Line::from(Span::styled(
         facts,
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.peek).add_modifier(Modifier::BOLD),
     )))
     .render(Rect::new(inner.x, inner.y, inner.width, 1), buffer);
     if inner.height <= 1 {
@@ -516,7 +768,7 @@ fn draw_peek(
     }
 }
 
-fn draw_help(buffer: &mut Buffer, area: Rect) {
+fn draw_help(buffer: &mut Buffer, area: Rect, theme: &Theme) {
     let width = (HELP.iter().map(|line| line.len()).max().unwrap_or(0) as u16 + 4).min(area.width);
     let height = (HELP.len() as u16 + 2).min(area.height);
     if width == 0 || height == 0 {
@@ -528,11 +780,11 @@ fn draw_help(buffer: &mut Buffer, area: Rect) {
     Clear.render(rect, buffer);
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.overlay))
         .title(Line::from(Span::styled(
             " help ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.overlay)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(rect);

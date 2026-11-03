@@ -358,14 +358,17 @@ impl CoreClient {
         Ok(record)
     }
 
-    /// Opens a raw stream to a live terminal at the given size.
-    pub fn attach(&self, terminal: &str, cols: u16, rows: u16) -> Result<Attached> {
+    /// Opens a raw stream to a live terminal at the given size, asking for up
+    /// to `history` lines above the screen so local scrollback also covers
+    /// output the program produced before this client attached.
+    pub fn attach(&self, terminal: &str, cols: u16, rows: u16, history: usize) -> Result<Attached> {
         let value = self.call(
             "terminal.attach",
             json!({
                 "terminal": terminal,
                 "cols": cols,
                 "rows": rows,
+                "history": history,
             }),
         )?;
         let result: AttachResult = serde_json::from_value(value)?;

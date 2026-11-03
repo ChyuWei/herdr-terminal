@@ -19,6 +19,8 @@
 mod agents;
 mod events;
 mod input;
+mod mouse;
+mod overlays;
 mod panes;
 mod reconnect;
 mod sync;
@@ -31,9 +33,11 @@ use super::model::{PaneId, StartRequest, Workspace};
 use super::state::UiState;
 use super::sync::DocState;
 use super::ui;
+use crate::config::Config;
 use crate::core::{CoreClient, Error, EventStream, Result, StreamItem};
 use crate::model::Model;
 use crate::session::{self, Session};
+use crate::theme::Theme;
 use crate::tui::{self, ScreenGuard, ScreenTerminal, display, vt_error};
 use crate::vt::{Screen as VtScreen, Vt};
 use crossterm::cursor::SetCursorStyle;
@@ -111,6 +115,37 @@ struct Reconnect {
     next: Instant,
 }
 
+/// A split boundary being dragged. The path names the split inside the active
+/// tab's layout; `last` is the pointer's row or column on the previous mouse
+/// event, so each drag applies only the cells it actually moved.
+struct ResizeDrag {
+    axis: super::model::Axis,
+    path: Vec<usize>,
+    index: usize,
+    last: u16,
+    area: Rect,
+}
+
+/// A press on a pane grid that may become a local selection. It stays a plain
+/// focus click until the pointer moves to another cell; only then does the
+/// selection start at `anchor`.
+#[derive(Clone, Copy)]
+struct SelectionPress {
+    pane: PaneId,
+    /// The screen cell where the button went down.
+    origin: (u16, u16),
+    /// The pane-local cell where the button went down.
+    anchor: (u16, u16),
+}
+
+/// The local settings resolved at startup: behavior and the resolved theme
+/// and key map.
+pub(super) struct Settings {
+    pub config: Config,
+    pub theme: Theme,
+    pub keys: super::keys::KeyMap,
+}
+
 /// A `terminal.run` whose reply was lost with the connection. The name is the
 /// unique one sent with the run, so a terminal that did reach core can be
 /// reclaimed instead of duplicated or orphaned.
@@ -152,12 +187,22 @@ pub(super) struct Screen<'a> {
     /// A key press consumed by the UI; its release must not reach a program.
     swallow: Option<KeyCode>,
     detach: bool,
+    /// The local settings resolved at startup.
+    config: Config,
+    theme: Theme,
+    /// A split boundary drag in progress.
+    resize_drag: Option<ResizeDrag>,
+    /// The pane whose local selection a mouse drag is extending.
+    selection_drag: Option<PaneId>,
+    /// A grid press that becomes a selection only once the pointer moves.
+    selection_press: Option<SelectionPress>,
 }
 
 impl<'a> Screen<'a> {
     pub(super) fn new(
         size: (u16, u16),
         options: &super::Options,
+        settings: Settings,
         guard: &'a mut ScreenGuard,
         boot: Boot,
     ) -> Result<Screen<'a>> {
@@ -175,6 +220,7 @@ impl<'a> Screen<'a> {
         } = boot;
         let mut ui = UiState {
             message: notice,
+            keymap: settings.keys.clone(),
             ..UiState::default()
         };
         ui.sidebar.open = view.sidebar_open();
@@ -204,6 +250,11 @@ impl<'a> Screen<'a> {
             mouse_on: false,
             swallow: None,
             detach: false,
+            config: settings.config,
+            theme: settings.theme,
+            resize_drag: None,
+            selection_drag: None,
+            selection_press: None,
         };
         let workspace_panes: Vec<PaneId> = screen.workspace.panes().map(|pane| pane.id).collect();
         screen.seen.extend(workspace_panes);
@@ -278,6 +329,7 @@ impl<'a> Screen<'a> {
             return Ok(());
         }
         self.poll_input(had_data)?;
+        self.drive_search();
         self.sync_mouse()?;
         self.refresh_agents()?;
         if self.reconn.is_some() {
@@ -376,10 +428,24 @@ impl<'a> Screen<'a> {
             return Err(error);
         }
 
+        // Local selections follow their cells; only visible panes need the
+        // highlight rectangles this frame.
+        let mut selections: BTreeMap<PaneId, Vec<(u16, u16, u16)>> = BTreeMap::new();
+        for pane in screens.keys() {
+            if let Some(link) = self.links.get_mut(pane) {
+                let spans = link.vt.selection_rects();
+                if !spans.is_empty() {
+                    selections.insert(*pane, spans);
+                }
+            }
+        }
+
         let ui_state = self.ui.clone();
         let workspace = &self.workspace;
         let visible = &screens;
         let rows = &self.agents.rows;
+        let theme = &self.theme;
+        let scroll_hint = self.scroll_hint();
         // A finished pane has no prompt to type into; its final cursor would
         // suggest otherwise.
         let finished: Vec<PaneId> = self
@@ -388,23 +454,30 @@ impl<'a> Screen<'a> {
             .filter(|(_, link)| link.finalized)
             .map(|(pane, _)| *pane)
             .collect();
+        let live_cursor = self
+            .workspace
+            .focused_pane()
+            .and_then(|pane| self.links.get(&pane))
+            .is_none_or(|link| link.vt.at_bottom());
         let mut shape: Option<SetCursorStyle> = None;
         self.terminal
             .draw(|frame| {
                 let area = frame.area();
-                let rendered = ui::render_view(
-                    frame.buffer_mut(),
-                    area,
-                    workspace,
-                    &ui_state,
-                    visible,
+                let view = ui::View {
+                    screens: visible,
                     rows,
-                );
+                    theme,
+                    selections: &selections,
+                    scroll_hint: scroll_hint.as_deref(),
+                };
+                let rendered =
+                    ui::render_with(frame.buffer_mut(), area, workspace, &ui_state, &view);
                 if let Some((x, y)) = rendered.prompt_cursor {
                     frame.set_cursor_position((x, y));
                     shape = Some(SetCursorStyle::DefaultUserShape);
                 } else if let Some((pane, inner)) = rendered.focused
                     && !finished.contains(&pane)
+                    && live_cursor
                     && let Some(screen) = visible.get(&pane)
                 {
                     let cursor = screen.cursor;

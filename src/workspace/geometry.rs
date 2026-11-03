@@ -5,8 +5,9 @@
 //! weight; gaps shrink before panes do. Rectangles include the pane border;
 //! the terminal grid is [`inner`].
 
-use super::model::{Axis, Direction, Layout, PaneId, Tab};
+use super::model::{Axis, Direction, Layout, PaneId, Space, Tab, TabId};
 use ratatui::layout::Rect;
+use ratatui::text::Span;
 
 /// The tab bar's height.
 pub const TAB_BAR_HEIGHT: u16 = 1;
@@ -113,6 +114,122 @@ pub fn compute_without_zoom(tab: Option<&Tab>, viewport: Rect) -> Rects {
     }
 }
 
+/// A draggable split boundary: one gap cell column or row between two
+/// children of the split at `path`, child `index` before and `index + 1`
+/// after.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gap {
+    pub axis: Axis,
+    /// Child indices from the tab root to the split that owns the gap.
+    pub path: Vec<usize>,
+    /// The child before the gap in that split.
+    pub index: usize,
+    pub rect: Rect,
+}
+
+/// Every split boundary with a visible gap, in tree order. Zoom is ignored:
+/// the boundaries of a zoomed layout are not on screen.
+pub fn gaps(tab: Option<&Tab>, viewport: Rect) -> Vec<Gap> {
+    let mut out = Vec::new();
+    let (_, _, workspace) = bars(viewport);
+    if let Some(tab) = tab
+        && let Some(layout) = &tab.layout
+    {
+        match tab.zoomed {
+            Some(zoomed) if layout.contains(zoomed) => {}
+            _ => collect_gaps(layout, workspace, &mut Vec::new(), &mut out),
+        }
+    }
+    out
+}
+
+/// The split boundary under a screen cell, if any.
+pub fn gap_at(tab: Option<&Tab>, viewport: Rect, x: u16, y: u16) -> Option<Gap> {
+    gaps(tab, viewport)
+        .into_iter()
+        .find(|gap| contains(gap.rect, x, y))
+}
+
+fn collect_gaps(layout: &Layout, area: Rect, path: &mut Vec<usize>, out: &mut Vec<Gap>) {
+    let Layout::Split { axis, children } = layout else {
+        return;
+    };
+    let length = match axis {
+        Axis::Columns => area.width,
+        Axis::Rows => area.height,
+    };
+    let weights: Vec<u32> = children.iter().map(|child| child.size).collect();
+    let (spans, gap) = distribute(length, &weights);
+    let mut at = 0u16;
+    for (index, child) in children.iter().enumerate() {
+        let span = spans.get(index).copied().unwrap_or(0);
+        let rect = match axis {
+            Axis::Columns => Rect::new(area.x.saturating_add(at), area.y, span, area.height),
+            Axis::Rows => Rect::new(area.x, area.y.saturating_add(at), area.width, span),
+        };
+        if gap > 0 && index + 1 < children.len() {
+            let boundary = match axis {
+                Axis::Columns => Rect::new(
+                    area.x.saturating_add(at).saturating_add(span),
+                    area.y,
+                    gap,
+                    area.height,
+                ),
+                Axis::Rows => Rect::new(
+                    area.x,
+                    area.y.saturating_add(at).saturating_add(span),
+                    area.width,
+                    gap,
+                ),
+            };
+            out.push(Gap {
+                axis: *axis,
+                path: path.clone(),
+                index,
+                rect: boundary,
+            });
+        }
+        path.push(index);
+        collect_gaps(&child.layout, rect, path, out);
+        path.pop();
+        at = at.saturating_add(span).saturating_add(gap);
+    }
+}
+
+/// The clickable tab rectangles in the tab bar, in the same order and widths
+/// as the drawn tab bar. The space name's own header is not a tab.
+pub fn tab_spans(space: &Space, area: Rect) -> Vec<(TabId, Rect)> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let end = area.x.saturating_add(area.width);
+    let mut x = area.x.saturating_add(width(&format!(" {} ", space.name)));
+    let mut spans = Vec::new();
+    for (index, tab) in space.tabs.iter().enumerate() {
+        let text = format!(" {} {} ", index + 1, tab.name);
+        let span = width(&text);
+        if x >= end {
+            break;
+        }
+        let visible = span.min(end - x);
+        spans.push((tab.id, Rect::new(x, area.y, visible, area.height)));
+        x = x.saturating_add(span);
+    }
+    spans
+}
+
+/// The tab under a screen cell in the tab bar.
+pub fn tab_at(space: &Space, area: Rect, x: u16, y: u16) -> Option<TabId> {
+    tab_spans(space, area)
+        .into_iter()
+        .find(|(_, rect)| contains(*rect, x, y))
+        .map(|(id, _)| id)
+}
+
+fn width(text: &str) -> u16 {
+    u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX)
+}
+
 /// A pane's terminal grid: the rectangle inside its border, when it has room.
 pub fn inner(rect: Rect) -> Option<Rect> {
     if rect.width > 2 && rect.height > 2 {
@@ -183,7 +300,7 @@ fn place(layout: &Layout, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
                 Axis::Columns => area.width,
                 Axis::Rows => area.height,
             };
-            let weights: Vec<u32> = children.iter().map(|child| child.size.max(1)).collect();
+            let weights: Vec<u32> = children.iter().map(|child| child.size).collect();
             let (spans, gap) = distribute(length, &weights);
             let mut at = 0u16;
             for (index, child) in children.iter().enumerate() {
@@ -207,7 +324,10 @@ fn place(layout: &Layout, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
 /// Splits `length` into one span per weight, with `gap` between siblings.
 /// Every child gets the minimum when it fits; the rest is proportional to the
 /// weights, with the leftover cells going to the largest fractional parts.
-fn distribute(length: u16, weights: &[u32]) -> (Vec<u16>, u16) {
+/// A zero weight is a child pinned at the minimum: that is how a drag stores
+/// an exact minimum after [`MIN_PANE`] cells, and it keeps later resizes at
+/// the same boundary.
+pub(super) fn distribute(length: u16, weights: &[u32]) -> (Vec<u16>, u16) {
     let count = weights.len();
     if count == 0 {
         return (Vec::new(), 0);
@@ -222,10 +342,21 @@ fn distribute(length: u16, weights: &[u32]) -> (Vec<u16>, u16) {
     let minimum = u32::from(MIN_PANE).min(available / count);
     let rest = available - minimum * count;
     let total: u32 = weights.iter().copied().sum::<u32>().max(1);
+    if weights.iter().all(|weight| *weight == 0) {
+        // No ratio to preserve: share the remainder evenly.
+        let base = rest / count;
+        let extra = rest % count;
+        let spans = (0..count)
+            .map(|index| {
+                let add = if index < extra { 1 } else { 0 };
+                (minimum + base + add) as u16
+            })
+            .collect();
+        return (spans, gap);
+    }
     let mut spans: Vec<u32> = Vec::with_capacity(count as usize);
     let mut fractions: Vec<(usize, u32)> = Vec::with_capacity(count as usize);
     for (index, weight) in weights.iter().copied().enumerate() {
-        let weight = weight.max(1);
         let share = rest * weight / total;
         spans.push(minimum + share);
         fractions.push((index, rest * weight % total));

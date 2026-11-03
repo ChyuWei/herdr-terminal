@@ -114,8 +114,21 @@ The TUI owns the screen. It does not ask core for frames or scrape `terminal.rea
 - Enable keyboard enhancement flags and bracketed paste; restore on exit.
 - Encode keys through the local VT so kitty keyboard protocol and Windows win32-input-mode are honored.
 - Send keys as **DATA** on the terminal's attach channel.
-- Mouse: wheel and click first; drag/resize later. Mouse reporting is terminal-dependent.
-- Clipboard: OSC 52 and/or native clipboard, with a configurable fallback (open question).
+- Mouse: chrome first, then panes. A click focuses the pane or selects a tab;
+  a click without a drag only focuses and never starts selecting. Dragging on
+  a grid selects locally (Shift-drag even over a tracking program); a
+  Shift-press and release without a drag is local too and sends no report. A
+  split gap drags; the wheel scrolls local history unless the program tracks
+  the mouse; a tracking program receives pane-local events. A fresh press
+  leaves an active selection and is routed normally. Chrome is never
+  forwarded. Mouse reporting is terminal-dependent and can be disabled.
+- Clipboard: OSC 52 by default, with a configurable native helper, both, or
+  off. An empty selection copies nothing. Paste is bracketed only when the
+  focused program enabled DEC 2004, and an overlay consumes it (a selection
+  counts as an overlay for paste). Selection keys are y/Enter (copy), Esc
+  (cancel) and h/j/k/l/arrows (extend); any other key leaves selection and
+  reaches the focused program, so selecting never traps typing. A forwarded
+  key also forwards its release when the program requested kitty key events.
 
 ### 4.5 State and persistence
 
@@ -303,13 +316,11 @@ Statuses:
 
 | Phase | Feature | Notes |
 |---|---|---|
-| 1 | Mouse resize/drag, tab reorder | Mouse and keyboard |
-| 2 | Command palette, configurable keybindings, settings | Native widgets |
+| 1 | Tab reorder | Mouse and keyboard |
 | 3 | Machines: add/connect/list/rename/rm | Remote terminals and events |
 | 3 | Files: read/write/edit, diff, external editor | Core `file.*`; no embedded editor |
 | 3 | File picker | Simple list; use `machine.exec`/`file.*` |
-| 4 | Scrollback search, copy/paste, clipboard | Terminal-dependent |
-| 4 | Custom layouts, themes, accessibility | Settings and config |
+| 4 | Custom layouts, accessibility | Settings and config |
 | 4 | Packaging, install, `--skill`, CLI docs | Distribution |
 | 5 | Mods/plugins (manifest + external commands) | See §6.3 |
 | 5 | Kitty graphics/images | See §6.3 |
@@ -367,11 +378,28 @@ currently implements.
   workspace, `ht screen` runs or reattaches to one terminal and `ht probe`
   copies the raw attach bytes. `Ctrl-]` detaches and the programs keep
   running.
+- **Mouse and history:** clicks focus panes and select tabs, split gaps drag,
+  and chrome never reaches a program. Programs that track the mouse receive
+  pane-local events; otherwise the wheel scrolls local history, requested
+  from core at attach and bounded by the configured line and byte limits.
+  Shift-PgUp/PgDn, Shift-Home/End and any ordinary key return to live.
+- **Search and clipboard:** literal case-insensitive scrollback search with a
+  match count and next/previous jumps, driven in bounded steps; local
+  selection with no cell padding; copy through OSC 52 by default, optionally
+  a native helper; bracketed paste only to a focused program that enabled
+  DEC 2004.
+- **Palette and settings:** the command palette reuses the command table and
+  shows configured key hints; startup settings in
+  `$XDG_CONFIG_HOME/herdr-terminal/config.json` cover theme, scrollback,
+  mouse, clipboard and prefix key overrides. The default, dark and light
+  themes style chrome only, mapped to 16, 256 and truecolor; terminal cells
+  keep their own colors.
 
-This implements the Phase 0 and Phase 1 scope and the agent-facing part of
-Phase 2. Still planned: the command palette, configurable keybindings,
-settings and themes; mouse resize/drag, tab reorder, scrollback search and
-copy/paste; machines, files, packaging/install, `ht status`, and mods.
+This implements the Phase 0 and Phase 1 scope, the agent-facing part of
+Phase 2, and the daily-driver input, history, clipboard, palette and settings
+work of Phase 4. Still planned: tab reorder, machines, files,
+packaging/install, `ht status`, accessibility and mods. Settings are read at
+startup; there is no settings UI and no live reload.
 
 The implementation is unreleased: there is no release, packaging or install
 procedure yet. See §3 for the boundary rules, §7 for conventions, and
@@ -466,7 +494,8 @@ procedure yet. See §3 for the boundary rules, §7 for conventions, and
 1. **VT binding:** extract a shared `ghostty-vt` crate, reuse Herdr App's `ghostty-sys`, or create a TUI-local binding? The TUI needs styled cells and key/mouse encoding, which core's minimal binding does not expose. A pure-Rust VT (for example `alacritty_terminal`) would remove the Zig build dependency but diverge from App/Core behavior; decide before Phase 0.
 2. **Async runtime:** threads + channels vs tokio. Start simple; measure.
 3. **Document layout:** one `herdr-terminal` document per core with machine-qualified ids, or one document per machine like Herdr App? Start local, revisit for Phase 3.
-4. **Clipboard:** OSC 52 vs native clipboard vs both; terminal-dependent.
+4. **Clipboard:** resolved for v1: OSC 52 by default, with a configured native
+   helper, both, or off; a native failure falls back to OSC 52.
 5. **Notifications:** bell/OSC 9/777 vs platform notifications; what is portable?
 6. **Kitty graphics:** is it a real requirement or a demo feature?
 7. **Mods:** when, and how closely to follow Herdr 1.x's manifest? v1 has none.

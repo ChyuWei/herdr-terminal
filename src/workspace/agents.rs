@@ -239,6 +239,8 @@ pub enum Overlay {
     None,
     Help,
     Prompt,
+    Palette,
+    Search,
     Sidebar,
     Peek(PaneId),
 }
@@ -257,7 +259,9 @@ pub fn visible_panes(
         return visible;
     }
     match overlay {
-        Overlay::Help | Overlay::Prompt | Overlay::Sidebar => return visible,
+        Overlay::Help | Overlay::Prompt | Overlay::Palette | Overlay::Search | Overlay::Sidebar => {
+            return visible;
+        }
         Overlay::Peek(pane) => {
             if workspace.pane(pane).is_some() {
                 visible.insert(pane);

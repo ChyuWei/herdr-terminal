@@ -119,6 +119,11 @@ impl Session {
         self.root.join("state")
     }
 
+    /// The XDG config root this session's clients read.
+    pub fn config_home(&self) -> PathBuf {
+        self.root.join("config")
+    }
+
     /// Reads a core document over a short framed connection. Documents are
     /// API-only, so tests need their own `hc connect`.
     pub fn doc(&self, name: &str) -> serde_json::Value {

@@ -12,9 +12,14 @@
 mod keys;
 mod mouse;
 mod screen;
+mod scroll;
+mod search;
+mod selection;
 
 pub use keys::is_detach;
 pub use screen::{Attrs, Cell, Color, Cursor, CursorShape, Screen};
+pub use scroll::Scrollbar;
+pub use search::SearchProgress;
 
 use ghostty_sys as sys;
 use std::ffi::{c_char, c_void};
@@ -66,6 +71,10 @@ pub struct Vt {
     cells: sys::GhosttyRenderStateRowCells,
     key_encoder: sys::GhosttyKeyEncoder,
     mouse_encoder: sys::GhosttyMouseEncoder,
+    /// The local scrollback search, when one is open.
+    search: Option<search::Search>,
+    /// The local cell selection, when one is active.
+    selection: Option<selection::Selection>,
     cols: u16,
     rows_count: u16,
     buttons: u8,
@@ -75,9 +84,33 @@ pub struct Vt {
     csi_len: usize,
 }
 
+/// Bytes of memory allowed per configured scrollback line. Ghostty also
+/// enforces a byte limit; its default is tiny (10 KB) and would prune a large
+/// history long before the line limit. This estimate keeps the line limit in
+/// charge while still bounding memory.
+const SCROLLBACK_BYTES_PER_LINE: usize = 2 * 1024;
+/// The absolute scrollback memory bound, even when config asks for a million
+/// lines.
+const MAX_SCROLLBACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// The byte budget paired with a line budget.
+fn scrollback_bytes(max_lines: usize) -> usize {
+    max_lines
+        .saturating_mul(SCROLLBACK_BYTES_PER_LINE)
+        .min(MAX_SCROLLBACK_BYTES)
+}
+
 impl Vt {
-    /// Creates a terminal of at least one column and one row.
+    /// Creates a terminal of at least one column and one row, with no local
+    /// scrollback. The workspace uses [`Vt::new_with_scrollback`].
     pub fn new(cols: u16, rows: u16) -> Result<Vt> {
+        Vt::new_with_scrollback(cols, rows, 0)
+    }
+
+    /// Creates a terminal with a bounded local scrollback of `max_lines`
+    /// lines (0 keeps only the viewport). History lives in the VT; nothing is
+    /// duplicated by this client.
+    pub fn new_with_scrollback(cols: u16, rows: u16, max_lines: usize) -> Result<Vt> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         // SAFETY: every pointer is an out-parameter for a fresh handle, and
@@ -91,6 +124,29 @@ impl Vt {
             if terminal.is_null() {
                 return Err(VtError {
                     what: "terminal_new",
+                });
+            }
+            let lines = max_lines;
+            let bytes = scrollback_bytes(max_lines);
+            // The line limit is the user-visible one; the byte limit bounds
+            // memory for programs that use many styles or wide cells.
+            let result = sys::ghostty_terminal_set(
+                terminal,
+                sys::GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES,
+                &lines as *const usize as *const c_void,
+            );
+            if result == sys::GHOSTTY_SUCCESS {
+                // SAFETY: the input pointer is a valid size_t for this option.
+                sys::ghostty_terminal_set(
+                    terminal,
+                    sys::GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+                    &bytes as *const usize as *const c_void,
+                );
+            }
+            if result != sys::GHOSTTY_SUCCESS {
+                sys::ghostty_terminal_free(terminal);
+                return Err(VtError {
+                    what: "set_scrollback_max_lines",
                 });
             }
             let mut render = ptr::null_mut();
@@ -150,6 +206,8 @@ impl Vt {
                 cells,
                 key_encoder,
                 mouse_encoder,
+                search: None,
+                selection: None,
                 cols,
                 rows_count: rows,
                 buttons: 0,
@@ -682,6 +740,10 @@ impl Vt {
 
 impl Drop for Vt {
     fn drop(&mut self) {
+        // The search and selection borrow this terminal; release them first so
+        // their tracked state is detached while the terminal is still alive.
+        self.search = None;
+        self.selection = None;
         // SAFETY: each handle was created in `new` and is freed once, in the
         // reverse order of creation.
         unsafe {

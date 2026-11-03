@@ -7,8 +7,9 @@ use crate::term::{self, RawMode};
 use crate::vt::{Color, Screen};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -46,13 +47,14 @@ pub(crate) fn vt_error(error: crate::vt::VtError) -> Error {
 }
 
 /// Owns the outer terminal: raw mode, the alternate screen, focus reporting,
-/// keyboard enhancement and mouse capture. `restore` is idempotent and runs
-/// on drop, so every return path puts the terminal back.
+/// keyboard enhancement, bracketed paste and mouse capture. `restore` is
+/// idempotent and runs on drop, so every return path puts the terminal back.
 pub(crate) struct ScreenGuard {
     raw: Option<RawMode>,
     alternate: bool,
     focus: bool,
     keyboard: bool,
+    paste: bool,
     mouse: bool,
     restored: bool,
 }
@@ -66,14 +68,15 @@ impl ScreenGuard {
             alternate: false,
             focus: false,
             keyboard: false,
+            paste: false,
             mouse: false,
             restored: false,
         };
         let mut out = stdout();
         execute!(out, EnterAlternateScreen).map_err(Error::Io)?;
         guard.alternate = true;
-        // Focus and keyboard enhancement are nice-to-have: a terminal that
-        // does not know them still renders and accepts input.
+        // Focus, keyboard enhancement and bracketed paste are nice-to-have: a
+        // terminal that does not know them still renders and accepts input.
         if execute!(out, EnableFocusChange).is_ok() {
             guard.focus = true;
         }
@@ -87,6 +90,12 @@ impl ScreenGuard {
         .is_ok()
         {
             guard.keyboard = true;
+        }
+        // Bracketed paste framing is decided per program by its own DEC 2004
+        // mode; this only lets the outer terminal report a paste as one event
+        // instead of a burst of keys.
+        if execute!(out, EnableBracketedPaste).is_ok() {
+            guard.paste = true;
         }
         Ok(guard)
     }
@@ -113,6 +122,10 @@ impl ScreenGuard {
         }
         self.restored = true;
         let mut out = stdout();
+        if self.paste {
+            let _ = execute!(out, DisableBracketedPaste);
+            self.paste = false;
+        }
         if self.mouse {
             let _ = execute!(out, DisableMouseCapture);
             self.mouse = false;

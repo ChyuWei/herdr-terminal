@@ -1,9 +1,10 @@
 use super::*;
+use crate::theme::{ColorDepth, ThemeChoice, theme};
 use crate::vt::Vt;
 use crate::workspace::agents::{AgentRow, Priority, sort_rows};
 use crate::workspace::commands::RenameTarget;
 use crate::workspace::model::{Axis, PaneId, StartKind, Workspace};
-use crate::workspace::state::{Prompt, UiState};
+use crate::workspace::state::{Line, PaletteState, Prompt, SearchState, UiState};
 use ratatui::style::Color;
 use std::collections::BTreeMap;
 
@@ -121,7 +122,16 @@ fn render_agents(
         screens.insert(*pane, vt.snapshot().expect("snapshot"));
     }
     let mut buffer = Buffer::empty(area);
-    let rendered = render_view(&mut buffer, area, workspace, ui, &screens, rows);
+    let theme = Theme::default();
+    let empty = BTreeMap::new();
+    let view = View {
+        screens: &screens,
+        rows,
+        theme: &theme,
+        selections: &empty,
+        scroll_hint: None,
+    };
+    let rendered = render_with(&mut buffer, area, workspace, ui, &view);
     (buffer, rendered)
 }
 
@@ -253,7 +263,7 @@ fn help_is_an_overlay_listing_the_prefix_keys() {
         help: true,
         ..UiState::default()
     };
-    let (buffer, rendered) = render_ws(&workspace, &ui, 60, 16);
+    let (buffer, rendered) = render_ws(&workspace, &ui, 100, 26);
     let text = lines(&buffer).join("\n");
     assert!(text.contains("help"), "{text}");
     assert!(text.contains("prefix Ctrl-b"), "{text}");
@@ -261,6 +271,10 @@ fn help_is_an_overlay_listing_the_prefix_keys() {
     assert!(text.contains("a agents") && text.contains("i peek agent"));
     assert!(text.contains("g/G next/prev agent"));
     assert!(text.contains("sidebar: j/k move") && text.contains("p pin / unpin"));
+    assert!(text.contains(": palette") && text.contains("f search scrollback"));
+    assert!(text.contains("selection: drag or h/j/k/l"));
+    assert!(text.contains("Shift-PgUp/PgDn scroll history"));
+    assert!(text.contains("drag a split gap to resize"));
     assert!(text.contains("any key closes help"));
     assert_eq!(rendered.focused, None);
     assert_eq!(rendered.prompt_cursor, None);
@@ -390,4 +404,281 @@ fn peek_shows_local_vt_and_core_facts_without_stealing_the_cursor() {
     assert!(text.contains("PEEKED"), "the local VT is drawn: {text}");
     assert_eq!(rendered.focused, None);
     assert_eq!(rendered.prompt_cursor, None);
+}
+
+#[test]
+fn the_palette_filters_the_command_table_and_shows_key_hints() {
+    let (workspace, _) = one_pane();
+    let state = PaletteState {
+        line: Line::new("split"),
+        ..PaletteState::default()
+    };
+    let ui = UiState {
+        palette: Some(state),
+        ..UiState::default()
+    };
+    let (buffer, rendered) = render_ws(&workspace, &ui, 80, 20);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("palette · Enter run · Esc close"), "{text}");
+    assert!(text.contains("› split"), "{text}");
+    assert!(text.contains("split left/right"), "{text}");
+    assert!(text.contains("split top/bottom"), "{text}");
+    assert!(text.contains("^b v"), "configured key hint: {text}");
+    assert!(text.contains("^b s"), "configured key hint: {text}");
+    assert!(!text.contains("new tab"), "the filter hides others: {text}");
+    assert_eq!(rendered.focused, None);
+    let (x, y) = rendered.prompt_cursor.expect("palette cursor");
+    assert_eq!(y, 2, "the query line is inside the palette border");
+    assert!(
+        lines(&buffer)[y as usize].contains("split"),
+        "cursor row: {y}"
+    );
+    assert_eq!(x, 12, "after '› ' and the query text");
+}
+
+#[test]
+fn the_palette_says_when_nothing_matches() {
+    let (workspace, _) = one_pane();
+    let state = PaletteState {
+        line: Line::new("zzzz"),
+        ..PaletteState::default()
+    };
+    let ui = UiState {
+        palette: Some(state),
+        ..UiState::default()
+    };
+    let (buffer, _) = render_ws(&workspace, &ui, 80, 20);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("no matching commands"), "{text}");
+}
+
+#[test]
+fn the_search_bar_shows_the_query_and_match_counts() {
+    let (workspace, pane) = one_pane();
+    let mut search = SearchState::new(pane);
+    search.line = Line::new("hi");
+    search.total = 2;
+    search.selected = Some(0);
+    search.complete = true;
+    let ui = UiState {
+        search: Some(search),
+        ..UiState::default()
+    };
+    let (buffer, rendered) = render_ws(&workspace, &ui, 80, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.contains("search: hi"), "{row:?}");
+    assert!(row.contains("1/2 matches"), "{row:?}");
+    assert!(
+        row.contains("Enter next") && row.contains("Esc close"),
+        "{row:?}"
+    );
+    assert!(
+        !row.contains("^b ? help"),
+        "the search bar owns the status row"
+    );
+    assert_eq!(
+        rendered.prompt_cursor,
+        Some((11, 11)),
+        "after ' search: ' plus the two-char query"
+    );
+    assert_eq!(rendered.focused, None);
+}
+
+#[test]
+fn the_search_bar_reports_progress_and_an_empty_query() {
+    let (workspace, pane) = one_pane();
+    let search = SearchState::new(pane);
+    let ui = UiState {
+        search: Some(search),
+        ..UiState::default()
+    };
+    let (buffer, rendered) = render_ws(&workspace, &ui, 80, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.contains("type to search scrollback"), "{row:?}");
+    assert_eq!(rendered.prompt_cursor, Some((9, 11)), "after ' search: '");
+
+    let mut search = SearchState::new(pane);
+    search.line = Line::new("needle");
+    search.pending = true;
+    let ui = UiState {
+        search: Some(search),
+        ..UiState::default()
+    };
+    let (buffer, _) = render_ws(&workspace, &ui, 80, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.contains("searching…"), "{row:?}");
+}
+
+#[test]
+fn a_local_selection_paints_its_cells_with_the_theme_selection_color() {
+    let (workspace, pane) = one_pane();
+    let area = Rect::new(0, 0, 40, 12);
+    let rects = geometry::compute(workspace.active_tab(), area);
+    let mut screens = BTreeMap::new();
+    let mut vt = Vt::new(2, 1).expect("vt");
+    vt.feed(b"hi");
+    screens.insert(pane, vt.snapshot().expect("snapshot"));
+    let mut selections = BTreeMap::new();
+    selections.insert(pane, vec![(0, 0, 2)]);
+    let theme = Theme::default();
+    let view = View {
+        screens: &screens,
+        rows: &[],
+        theme: &theme,
+        selections: &selections,
+        scroll_hint: None,
+    };
+    let mut buffer = Buffer::empty(area);
+    render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
+    let inner = geometry::inner(rects.pane(pane).expect("pane")).expect("inner");
+    assert_eq!(buffer[(inner.x, inner.y)].symbol(), "h");
+    assert_eq!(buffer[(inner.x, inner.y)].bg, theme.selection);
+    assert_eq!(buffer[(inner.x + 1, inner.y)].bg, theme.selection);
+    assert_ne!(buffer[(inner.x + 2, inner.y)].bg, theme.selection);
+    assert_ne!(buffer[(inner.x, inner.y + 1)].bg, theme.selection);
+}
+
+#[test]
+fn the_scroll_hint_replaces_the_idle_status_hint() {
+    let (workspace, _) = one_pane();
+    let area = Rect::new(0, 0, 80, 12);
+    let rects = geometry::compute(workspace.active_tab(), area);
+    let mut screens = BTreeMap::new();
+    let inner = geometry::inner(rects.panes[0].1).expect("inner");
+    let mut vt = Vt::new(inner.width, inner.height).expect("vt");
+    vt.feed(b"hi");
+    screens.insert(rects.panes[0].0, vt.snapshot().expect("snapshot"));
+    let theme = Theme::default();
+    let view = View {
+        screens: &screens,
+        rows: &[],
+        theme: &theme,
+        selections: &BTreeMap::new(),
+        scroll_hint: Some("scroll 2/18 · Shift-PgDn live"),
+    };
+    let mut buffer = Buffer::empty(area);
+    render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.contains("scroll 2/18"), "{row:?}");
+    assert!(row.contains("Shift-PgDn live"), "{row:?}");
+}
+
+#[test]
+fn explicit_themes_style_the_chrome_consistently() {
+    let (workspace, _) = one_pane();
+    let area = Rect::new(0, 0, 40, 12);
+    let rects = geometry::compute(workspace.active_tab(), area);
+    let mut screens = BTreeMap::new();
+    let inner = geometry::inner(rects.panes[0].1).expect("inner");
+    let mut vt = Vt::new(inner.width, inner.height).expect("vt");
+    vt.feed(b"hi");
+    screens.insert(rects.panes[0].0, vt.snapshot().expect("snapshot"));
+    let mut seen = Vec::new();
+    for choice in [ThemeChoice::Dark, ThemeChoice::Light] {
+        let theme = theme(choice, ColorDepth::TrueColor);
+        let view = View {
+            screens: &screens,
+            rows: &[],
+            theme: &theme,
+            selections: &BTreeMap::new(),
+            scroll_hint: None,
+        };
+        let mut buffer = Buffer::empty(area);
+        render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
+        let space = buffer[(1, 0)].fg;
+        let border = buffer[(0, 1)].fg;
+        let status_bg = buffer[(0, 11)].bg;
+        assert_eq!(space, theme.accent, "tab bar accent: {choice:?}");
+        assert_eq!(border, theme.accent, "focused border: {choice:?}");
+        assert_eq!(
+            status_bg,
+            theme.status.bg.expect("status background"),
+            "status bar: {choice:?}"
+        );
+        seen.push((space, border, status_bg));
+    }
+    assert_ne!(seen[0], seen[1], "dark and light differ");
+}
+
+#[test]
+fn the_terminal_grid_is_not_painted_by_the_theme() {
+    let (workspace, pane) = one_pane();
+    let area = Rect::new(0, 0, 40, 12);
+    let rects = geometry::compute(workspace.active_tab(), area);
+    let inner = geometry::inner(rects.pane(pane).expect("pane")).expect("inner");
+    let mut vt = Vt::new(inner.width, inner.height).expect("vt");
+    vt.feed(b"hi");
+    let mut screens = BTreeMap::new();
+    screens.insert(pane, vt.snapshot().expect("snapshot"));
+    let theme = theme(ThemeChoice::Light, ColorDepth::TrueColor);
+    let view = View {
+        screens: &screens,
+        rows: &[],
+        theme: &theme,
+        selections: &BTreeMap::new(),
+        scroll_hint: None,
+    };
+    let mut buffer = Buffer::empty(area);
+    render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
+    assert_eq!(buffer[(inner.x, inner.y)].symbol(), "h");
+    assert_ne!(
+        buffer[(inner.x, inner.y)].bg,
+        theme.status.bg.expect("status background")
+    );
+}
+
+#[test]
+fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
+    let (workspace, pane) = one_pane();
+    let area = Rect::new(0, 0, 40, 12);
+    let rects = geometry::compute(workspace.active_tab(), area);
+    let inner = geometry::inner(rects.pane(pane).expect("pane")).expect("inner");
+    let mut vt = Vt::new_with_scrollback(inner.width, inner.height, 100).expect("vt");
+    for index in 0..100 {
+        vt.feed(format!("LINE-{index:03}\r\n").as_bytes());
+    }
+    vt.scroll_lines(-20);
+    let theme = Theme::default();
+    let mut screens = BTreeMap::new();
+    screens.insert(pane, vt.snapshot().expect("snapshot"));
+    let view = View {
+        screens: &screens,
+        rows: &[],
+        theme: &theme,
+        selections: &BTreeMap::new(),
+        scroll_hint: Some("scroll 20/60 · Shift-PgDn live"),
+    };
+    let mut buffer = Buffer::empty(area);
+    let started = std::time::Instant::now();
+    for _ in 0..100 {
+        buffer = Buffer::empty(area);
+        render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
+    }
+    let elapsed = started.elapsed();
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("LINE-079"), "history is drawn: {text}");
+    assert!(
+        !text.contains("LINE-099"),
+        "live rows are below the viewport: {text}"
+    );
+    assert!(text.contains("scroll 20/60"), "scroll hint: {text}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "100 redraws took {elapsed:?}"
+    );
+
+    vt.scroll_to_bottom();
+    screens.insert(pane, vt.snapshot().expect("snapshot"));
+    let stopped = View {
+        screens: &screens,
+        rows: &[],
+        theme: &theme,
+        selections: &BTreeMap::new(),
+        scroll_hint: None,
+    };
+    let mut buffer = Buffer::empty(area);
+    render_with(&mut buffer, area, &workspace, &UiState::default(), &stopped);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("LINE-099"), "the live bottom is back: {text}");
+    assert!(!text.contains("scroll 20/60"));
 }

@@ -90,6 +90,7 @@ impl Run {
         command
             .args(["--cols", &cols_arg, "--rows", &rows_arg])
             .args(program)
+            .env("COLORTERM", "truecolor")
             .stdin(stdin)
             .stdout(stdout)
             .stderr(Stdio::piped());
@@ -116,6 +117,11 @@ impl Run {
         let mut vt = Vt::new(self.cols, self.rows).expect("local VT");
         vt.feed(&self.output.bytes());
         vt.snapshot().expect("snapshot").lines().join("\n")
+    }
+
+    /// The outer terminal's raw bytes, for OSC 52 and other non-screen output.
+    fn raw(&self) -> String {
+        String::from_utf8_lossy(&self.output.bytes()).into_owned()
     }
 
     fn wait_screen(&self, timeout: Duration, mut check: impl FnMut(&str) -> bool) -> bool {
@@ -269,6 +275,25 @@ fn wait_sizes_changed(
             .zip(before)
             .all(|(now, old)| now != old)
     })
+}
+
+/// SGR mouse input as the outer terminal sends it; the helper takes cells
+/// 0-based and adds the one-based wire coordinates.
+fn sgr(button: u8, release: bool, x: u16, y: u16) -> String {
+    format!(
+        "\x1b[<{button};{};{}{}",
+        x + 1,
+        y + 1,
+        if release { 'm' } else { 'M' }
+    )
+}
+
+fn click(x: u16, y: u16) -> String {
+    format!("{}{}", sgr(0, false, x, y), sgr(0, true, x, y))
+}
+
+fn wheel_up(x: u16, y: u16) -> String {
+    sgr(64, false, x, y)
 }
 
 fn cleanup_all(session: &Session) {
@@ -1389,6 +1414,441 @@ fn agents_jump_and_peek_across_tabs_end_to_end() {
             !screen.contains("peek · any key closes")
         }),
         "peek did not close: {}",
+        run.rendered()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+// --- mouse, scrollback, search, copy, paste, palette, config ---------------
+
+#[test]
+fn mouse_clicks_focus_a_pane_and_dragging_a_split_resizes_it() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn(&session, 80, 24);
+    wait_addresses(&session, 1, secs(10));
+    run.command(b'v');
+    let known = wait_addresses(&session, 2, secs(10));
+    assert!(run.wait_text("space 1", secs(10)), "{:?}", run.rendered());
+
+    // The split focuses the new right pane. A grid click moves the focus back
+    // to the left pane. A click without a drag is focus-only: typing the next
+    // command must reach the program with no Esc.
+    run.send(click(10, 5).as_bytes());
+    run.title("CLICK-LEFT");
+    assert!(
+        wait_title(&session, &known[0], "CLICK-LEFT", secs(10)),
+        "typing after the click did not reach the left pane: {:?}",
+        known
+            .iter()
+            .map(|address| (address, title_of(&session, address)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !run.rendered().contains("selection:"),
+        "a plain click entered selection mode: {:?}",
+        run.rendered()
+    );
+    assert_ne!(title_of(&session, &known[1]), "CLICK-LEFT");
+
+    // The gap between the 40- and 39-cell panes is one column.
+    run.send(sgr(0, false, 40, 10).as_bytes());
+    run.send(sgr(32, false, 44, 10).as_bytes());
+    run.send(sgr(0, true, 44, 10).as_bytes());
+    assert!(
+        wait_until(secs(10), || {
+            sizes(&session, &known) == vec![(42, 20), (33, 20)]
+        }),
+        "the drag did not reach both programs at their exact sizes: {:?}",
+        sizes(&session, &known)
+    );
+
+    // The palette reuses the command table and changes no geometry.
+    let before = sizes(&session, &known);
+    run.command(b':');
+    assert!(
+        run.wait_text("palette · Enter run · Esc close", secs(10)),
+        "the palette did not open: {:?}",
+        run.rendered()
+    );
+    run.send(b"help");
+    run.send(b"\r");
+    assert!(
+        run.wait_text("any key closes help", secs(10)),
+        "the palette did not run help: {:?}",
+        run.rendered()
+    );
+    assert_eq!(sizes(&session, &known), before, "help resized a pane");
+    run.send(&[0x1b]);
+    assert!(
+        run.wait_screen(secs(5), |screen| !screen.contains("any key closes help")),
+        "help did not close: {:?}",
+        run.rendered()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+#[test]
+fn wheel_scrolls_local_history_and_search_jumps_to_a_match() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn_with(
+        &session,
+        80,
+        24,
+        &[
+            "--",
+            "sh",
+            "-c",
+            "i=1; while [ $i -le 100 ]; do printf 'LINE-%03d\\n' $i; i=$((i+1)); done; sleep 30",
+        ],
+    );
+    wait_addresses(&session, 1, secs(10));
+    assert!(
+        run.wait_text("LINE-100", secs(10)),
+        "the history fixture did not paint: {:?}",
+        run.rendered()
+    );
+
+    // Enough wheel events to reach the top of 100 local history lines.
+    let wheel: String = std::iter::repeat_with(|| wheel_up(10, 5))
+        .take(40)
+        .collect();
+    run.send(wheel.as_bytes());
+    assert!(
+        run.wait_screen(secs(10), |screen| {
+            screen.contains("LINE-001") && !screen.contains("LINE-100")
+        }),
+        "the wheel did not scroll local history: {:?}",
+        run.rendered()
+    );
+    assert!(
+        run.wait_text("scroll ", secs(5)),
+        "the scroll position was not shown: {:?}",
+        run.rendered()
+    );
+
+    // Any ordinary key snaps back to the live bottom.
+    run.send(b"x");
+    assert!(
+        run.wait_screen(secs(10), |screen| {
+            screen.contains("LINE-100") && !screen.contains("scroll ")
+        }),
+        "a key did not return the pane to live: {:?}",
+        run.rendered()
+    );
+
+    // Search the local history and jump to a literal, case-insensitive match.
+    run.command(b'f');
+    assert!(
+        run.wait_text("search:", secs(10)),
+        "the search bar did not open: {:?}",
+        run.rendered()
+    );
+    run.send(b"line-042");
+    assert!(
+        run.wait_text("matches · Enter next", secs(10)),
+        "the search did not count the match: {:?}",
+        run.rendered()
+    );
+    run.send(b"\r");
+    assert!(
+        run.wait_screen(secs(10), |screen| {
+            screen.contains("LINE-042") && screen.contains("1/1 matches")
+        }),
+        "Enter did not jump to the match: {:?}",
+        run.rendered()
+    );
+    run.send(&[0x1b]);
+    assert!(
+        run.wait_screen(secs(5), |screen| !screen.contains("search:")),
+        "Esc did not close the search bar: {:?}",
+        run.rendered()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+#[test]
+fn copying_a_selection_emits_osc52_to_the_outer_terminal() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn_with(
+        &session,
+        80,
+        24,
+        &["--", "sh", "-c", "printf hello; sleep 30"],
+    );
+    wait_addresses(&session, 1, secs(10));
+    assert!(
+        run.wait_text("hello", secs(10)),
+        "the copy fixture did not paint: {:?}",
+        run.rendered()
+    );
+
+    run.command(b'[');
+    assert!(
+        run.wait_text("selection:", secs(10)),
+        "selection mode did not open: {:?}",
+        run.rendered()
+    );
+    run.send(b"hhhhh");
+    run.send(b"y");
+    let expected = format!(
+        "\x1b]52;c;{}\x07",
+        herdr_terminal::clipboard::base64(b"hello")
+    );
+    assert!(
+        wait_until(secs(10), || run.raw().contains(&expected)),
+        "the outer terminal did not receive OSC 52: {:?}",
+        run.raw()
+    );
+    assert!(
+        run.wait_text("copied 5 characters", secs(10)),
+        "the copy did not report five characters: {:?}",
+        run.rendered()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+#[test]
+fn a_bracketed_paste_reaches_the_program_byte_for_byte() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn_with(
+        &session,
+        100,
+        24,
+        &[
+            "--",
+            "sh",
+            "-c",
+            "stty -echo -icanon; printf '\\033[?2004hPASTE-ON\\n'; head -c 23 | od -An -tx1; sleep 30",
+        ],
+    );
+    wait_addresses(&session, 1, secs(10));
+    assert!(
+        run.wait_text("PASTE-ON", secs(10)),
+        "the paste fixture did not enable bracketed paste: {:?}",
+        run.rendered()
+    );
+    run.send(b"\x1b[200~hello paste\x1b[201~");
+    let hex = "1b5b3230307e68656c6c6f2070617374651b5b3230317e";
+    assert!(
+        run.wait_screen(secs(10), |screen| {
+            // Keep only hex digits: od separates bytes with spaces and the
+            // pane border sits between wrapped rows.
+            let compact: String = screen.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            compact.to_ascii_lowercase().contains(hex)
+        }),
+        "the program did not receive the bracketed paste bytes: {:?}",
+        run.rendered()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+#[test]
+fn config_applies_theme_and_rebound_keys_at_startup() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let dir = session.config_home().join("herdr-terminal");
+    std::fs::create_dir_all(&dir).expect("config dir");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"theme":"light","keys":{"new_tab":"t"}}"#,
+    )
+    .expect("seed config");
+    let mut run = Run::spawn(&session, 80, 24);
+    wait_addresses(&session, 1, secs(10));
+    assert!(
+        run.wait_text("space 1", secs(10)),
+        "the workspace did not start with a config: {:?}",
+        run.rendered()
+    );
+    assert!(
+        run.raw().contains("38;2;30;102;245"),
+        "the light accent was not drawn in truecolor: {:?}",
+        run.raw()
+    );
+    assert!(
+        !run.errors().contains("warning"),
+        "a valid config warned: {:?}",
+        run.errors()
+    );
+
+    run.command(b't');
+    assert!(
+        wait_addresses(&session, 2, secs(10)).len() == 2,
+        "the rebound new-tab key did not start a terminal: {:?}",
+        addresses(&session)
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+#[test]
+fn a_malformed_config_warns_and_still_starts_the_workspace() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let dir = session.config_home().join("herdr-terminal");
+    std::fs::create_dir_all(&dir).expect("config dir");
+    std::fs::write(dir.join("config.json"), "{not json").expect("seed config");
+    let mut run = Run::spawn(&session, 80, 24);
+    wait_addresses(&session, 1, secs(10));
+    assert!(
+        run.wait_text("space 1", secs(10)),
+        "a malformed config stopped the UI: stderr={:?}",
+        run.errors()
+    );
+    assert!(
+        run.errors().contains("ht: warning:") && run.errors().contains("not valid JSON"),
+        "the malformed config was not reported: {:?}",
+        run.errors()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+#[test]
+fn a_mouse_aware_program_receives_grid_events_but_not_chrome() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let mut run = Run::spawn_with(
+        &session,
+        80,
+        24,
+        &[
+            "--",
+            "sh",
+            "-c",
+            "printf '\\033[?1000h\\033[?1002h\\033[?1006hMOUSE-READY\\n'; cat",
+        ],
+    );
+    wait_addresses(&session, 1, secs(10));
+    assert!(
+        run.wait_text("MOUSE-READY", secs(10)),
+        "the mouse-aware program did not start: {:?}",
+        run.rendered()
+    );
+
+    // The program's terminal echoes the bytes it receives, so the pane text is
+    // the pane-local SGR report: click at screen (10,5) inside an inner grid
+    // that starts at (1,2), so the program sees column 9, row 3.
+    run.send(click(10, 5).as_bytes());
+    assert!(
+        run.wait_text("^[[<0;10;4M", secs(10)),
+        "the click was not forwarded with local coordinates: {:?}",
+        run.rendered()
+    );
+    run.send(wheel_up(10, 5).as_bytes());
+    assert!(
+        run.wait_text("^[[<64;10;4M", secs(10)),
+        "the wheel was not forwarded to the tracking program: {:?}",
+        run.rendered()
+    );
+
+    // Chrome never reaches the program: the tab bar, status bar and pane
+    // border add no mouse reports.
+    let reports = run.rendered().matches("^[[<").count();
+    run.send(click(10, 0).as_bytes());
+    run.send(click(10, 23).as_bytes());
+    run.send(click(0, 5).as_bytes());
+    run.send(b"printf 'CHROME-DONE\\n'\r");
+    assert!(
+        run.wait_text("CHROME-DONE", secs(10)),
+        "the program stalled after chrome clicks: {:?}",
+        run.rendered()
+    );
+    assert_eq!(
+        run.rendered().matches("^[[<").count(),
+        reports,
+        "a chrome click reached the program: {:?}",
+        run.rendered()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+#[test]
+fn a_large_output_burst_keeps_the_workspace_responsive() {
+    let Some(mut session) = session() else { return };
+    session.start();
+    let started = Instant::now();
+    let mut run = Run::spawn_with(
+        &session,
+        80,
+        24,
+        &[
+            "--",
+            "sh",
+            "-c",
+            "yes BURST | head -c 2000000; printf '\\nBURST-END\\n'; sleep 30",
+        ],
+    );
+    wait_addresses(&session, 1, secs(10));
+    assert!(
+        run.wait_text("BURST-END", secs(20)),
+        "the burst's last line never reached the workspace; stderr={:?}",
+        run.errors()
+    );
+    let elapsed = started.elapsed();
+    eprintln!("workspace large output: 2 MiB in {elapsed:?}");
+
+    // Input still works after the burst: the palette opens and closes.
+    run.command(b':');
+    assert!(
+        run.wait_text("palette · Enter run · Esc close", secs(10)),
+        "input stalled after the burst: {:?}",
+        run.rendered()
+    );
+    run.send(&[0x1b]);
+    assert!(
+        run.wait_screen(secs(5), |screen| !screen.contains("palette ·")),
+        "the palette did not close: {:?}",
+        run.rendered()
+    );
+
+    // Local history is bounded and still scrollable; the newest line is at
+    // the live bottom.
+    run.send(&wheel_up(10, 5).as_bytes().repeat(20));
+    assert!(
+        run.wait_screen(secs(10), |screen| screen.contains("scroll ")
+            && !screen.contains("BURST-END")),
+        "the wheel did not scroll the bounded local history: {:?}",
+        run.rendered()
+    );
+    run.send(b"x");
+    assert!(
+        run.wait_screen(secs(10), |screen| screen.contains("BURST-END")),
+        "a key did not return the pane to live: {:?}",
         run.rendered()
     );
 

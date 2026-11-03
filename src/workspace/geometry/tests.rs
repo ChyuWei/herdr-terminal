@@ -182,3 +182,76 @@ fn a_tab_without_a_layout_has_only_bars() {
     assert!(rects.panes.is_empty());
     assert!(compute(None, Rect::new(0, 0, 20, 8)).panes.is_empty());
 }
+
+#[test]
+fn split_boundaries_are_hit_testable_on_the_gap_cell() {
+    let tab = make_tab(split(Axis::Columns, vec![leaf(1), leaf(2)]));
+    let viewport = Rect::new(0, 0, 80, 24);
+    let boundaries = gaps(Some(&tab), viewport);
+    assert_eq!(boundaries.len(), 1, "{boundaries:?}");
+    assert_eq!(boundaries[0].axis, Axis::Columns);
+    assert_eq!(boundaries[0].path, Vec::<usize>::new());
+    assert_eq!(boundaries[0].index, 0);
+    assert_eq!(boundaries[0].rect, Rect::new(40, 1, 1, 22));
+    assert_eq!(
+        gap_at(Some(&tab), viewport, 40, 10),
+        Some(boundaries[0].clone())
+    );
+    assert_eq!(gap_at(Some(&tab), viewport, 39, 10), None);
+    assert_eq!(gap_at(Some(&tab), viewport, 41, 10), None);
+    assert_eq!(gap_at(Some(&tab), viewport, 40, 0), None, "tab bar");
+
+    let nested = make_tab(split(
+        Axis::Rows,
+        vec![split(Axis::Columns, vec![leaf(1), leaf(2)]), leaf(3)],
+    ));
+    let nested_gaps = gaps(Some(&nested), viewport);
+    assert_eq!(nested_gaps.len(), 2, "{nested_gaps:?}");
+    assert_eq!(nested_gaps[1].axis, Axis::Columns);
+    assert_eq!(nested_gaps[1].path, vec![0]);
+    assert_eq!(nested_gaps[1].index, 0);
+    assert_eq!(nested_gaps[1].rect.y, 1);
+    assert_eq!(nested_gaps[1].rect.height, 11);
+}
+
+#[test]
+fn a_zoomed_pane_has_no_draggable_boundaries() {
+    let mut tab = make_tab(split(Axis::Columns, vec![leaf(1), leaf(2)]));
+    tab.zoomed = Some(PaneId(2));
+    assert!(gaps(Some(&tab), Rect::new(0, 0, 80, 24)).is_empty());
+}
+
+#[test]
+fn tab_spans_match_the_drawn_tab_bar_and_hit_the_right_tab() {
+    let mut space = Space {
+        id: super::super::model::SpaceId(1),
+        name: "space 1".into(),
+        folder: String::new(),
+        tabs: Vec::new(),
+        active: TabId(1),
+    };
+    space.tabs.push(Tab::new(TabId(1), "tab 1".into()));
+    space.tabs.push(Tab::new(TabId(2), "tab 2".into()));
+    space.active = TabId(2);
+    let area = Rect::new(0, 0, 80, 1);
+    let spans = tab_spans(&space, area);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0], (TabId(1), Rect::new(9, 0, 9, 1)));
+    assert_eq!(spans[1], (TabId(2), Rect::new(18, 0, 9, 1)));
+    assert_eq!(tab_at(&space, area, 9, 0), Some(TabId(1)));
+    assert_eq!(tab_at(&space, area, 17, 0), Some(TabId(1)));
+    assert_eq!(tab_at(&space, area, 18, 0), Some(TabId(2)));
+    assert_eq!(
+        tab_at(&space, area, 8, 0),
+        None,
+        "the space name is not a tab"
+    );
+    assert_eq!(tab_at(&space, area, 27, 0), None, "past the last tab");
+
+    let narrow = tab_spans(&space, Rect::new(0, 0, 20, 1));
+    assert_eq!(narrow.len(), 2);
+    assert_eq!(
+        narrow[1].1.width, 2,
+        "a clipped tab keeps its visible cells"
+    );
+}

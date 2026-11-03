@@ -8,10 +8,12 @@ If `AGENTS.local.md` exists, read it too: the maintainer's local rules.
 
 **Status: implemented, unreleased.** The client implements the core connection,
 local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
-`herdr-terminal` document with restore and multi-screen sync, and agent
-awareness (status, sidebar, peek, seen/pin, alerts). The tests exist and pass.
-Features such as the command palette, settings, machines, files and packaging
-remain planned. The design intent is in
+`herdr-terminal` document with restore and multi-screen sync, agent awareness
+(status, sidebar, peek, seen/pin, alerts), and the daily-driver input surface:
+mouse routing and split drags, bounded local scrollback with search, selection
+with OSC 52/native copy and bracketed paste, the command palette, and startup
+settings with default/dark/light themes. The tests exist and pass. Machines,
+files and packaging remain planned. The design intent is in
 [docs/01-core-and-app-reference.md](docs/01-core-and-app-reference.md) and
 [docs/02-architecture.md](docs/02-architecture.md). Read both before proposing
 code; do not invent a build or scaffolding that contradicts them.
@@ -95,20 +97,22 @@ src/
   main.rs, lib.rs       # CLI; terminal setup and restore
   core/                 # discovery, framed client, events, reconnect
   screen/               # single-pane screen: lifecycle, play, pointer, view
-  vt/                   # VT binding: screen, keys, mouse
+  vt/                   # VT binding: screen, keys, mouse, scroll, search, selection
   model.rs              # pure event/terminal model
   workspace/
     model.rs            # pure workspace state
     model/              # document schema, merge, restore, ids, local view
     geometry.rs         # split tree, geometry, hit testing
     commands.rs, keys.rs # command table and bindings
+    palette.rs          # pure palette entries and filtering
     agents.rs           # pure agent facts, ordering, alerts
-    runtime/            # event loop, attach, input, events, reconnect, agents
+    runtime/            # event loop, attach, input, mouse, overlays, reconnect, agents
     ui.rs               # ratatui composition
     startup.rs          # document claim and restore
     local.rs, state.rs  # local view and UI state
     sync.rs             # document CAS state
   tui.rs, term.rs, session.rs, probe.rs
+  config.rs, theme.rs, clipboard.rs  # settings, themes, copy paths
 crates/                 # the VT binding crate
 tests/                  # probe, screen, workspace, fake-core
 ```
@@ -149,7 +153,6 @@ edit it.
 
 ## Next step
 
-Pick up the remaining planned features in `docs/02-architecture.md` §5: the
-command palette and settings, machines, files, distribution and mods. Keep the
-same rule: prove protocol, VT, input and recovery behavior with tests before
-UI chrome.
+Pick up the remaining planned features in `docs/02-architecture.md` §5:
+machines, files, distribution, accessibility and mods. Keep the same rule:
+prove protocol, VT, input and recovery behavior with tests before UI chrome.

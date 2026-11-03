@@ -724,6 +724,122 @@ impl Workspace {
         true
     }
 
+    /// Focuses a pane in the active tab (a mouse click). Does not change the
+    /// active tab or space.
+    pub fn focus_pane(&mut self, pane: PaneId) -> bool {
+        let Some(tab) = self.active_tab_mut() else {
+            return false;
+        };
+        if !tab.contains(pane) || tab.focused == Some(pane) {
+            return false;
+        }
+        focus(tab, pane);
+        true
+    }
+
+    /// Selects a tab of the active space by id (a tab-bar click).
+    pub fn select_tab_id(&mut self, id: TabId) -> bool {
+        let Some(space) = self.active_space_mut() else {
+            return false;
+        };
+        if space.active == id || !space.tabs.iter().any(|tab| tab.id == id) {
+            return false;
+        }
+        space.active = id;
+        true
+    }
+
+    /// Moves the split boundary at `path`/`index` by `delta` cells (positive
+    /// right/down), keeping both sides at least [`geometry::MIN_PANE`] when
+    /// they have room. The new spans become the children's weights, so the
+    /// next resize keeps the ratio. Zoom hides boundaries, so a zoomed tab
+    /// refuses the resize.
+    pub fn resize_gap(&mut self, viewport: Rect, path: &[usize], index: usize, delta: i16) -> bool {
+        let Some(tab) = self.active_tab() else {
+            return false;
+        };
+        if tab.zoomed.is_some() {
+            return false;
+        }
+        let (_, _, workspace) = geometry::bars(viewport);
+        let Some(root) = tab.layout.as_ref() else {
+            return false;
+        };
+        let mut node = root;
+        let mut area = workspace;
+        for &child_index in path {
+            let Layout::Split { axis, children } = node else {
+                return false;
+            };
+            let length = match axis {
+                Axis::Columns => area.width,
+                Axis::Rows => area.height,
+            };
+            let weights: Vec<u32> = children.iter().map(|child| child.size).collect();
+            let (spans, gap) = geometry::distribute(length, &weights);
+            let Some(span) = spans.get(child_index) else {
+                return false;
+            };
+            let before: u32 = spans
+                .iter()
+                .take(child_index)
+                .map(|span| u32::from(*span))
+                .sum();
+            let offset = before + u32::from(gap) * child_index as u32;
+            area = match axis {
+                Axis::Columns => Rect::new(
+                    area.x.saturating_add(offset as u16),
+                    area.y,
+                    *span,
+                    area.height,
+                ),
+                Axis::Rows => Rect::new(
+                    area.x,
+                    area.y.saturating_add(offset as u16),
+                    area.width,
+                    *span,
+                ),
+            };
+            node = &children[child_index].layout;
+        }
+        let Layout::Split { axis, children } = node else {
+            return false;
+        };
+        if index + 1 >= children.len() {
+            return false;
+        }
+        let length = match axis {
+            Axis::Columns => area.width,
+            Axis::Rows => area.height,
+        };
+        let weights: Vec<u32> = children.iter().map(|child| child.size).collect();
+        let (spans, _) = geometry::distribute(length, &weights);
+        let (Some(&before), Some(&after)) = (spans.get(index), spans.get(index + 1)) else {
+            return false;
+        };
+        let floor = i32::from(geometry::MIN_PANE.min(before).min(after));
+        let delta = i32::from(delta).clamp(floor - i32::from(before), i32::from(after) - floor);
+        if delta == 0 {
+            return false;
+        }
+        let mut next = spans;
+        next[index] = (i32::from(before) + delta) as u16;
+        next[index + 1] = (i32::from(after) - delta) as u16;
+
+        let Some(tab) = self.active_tab_mut() else {
+            return false;
+        };
+        let Some(Layout::Split { children, .. }) =
+            tab.layout.as_mut().and_then(|root| split_at(root, path))
+        else {
+            return false;
+        };
+        for (child, span) in children.iter_mut().zip(next.iter()) {
+            child.size = u32::from(span.saturating_sub(geometry::MIN_PANE));
+        }
+        true
+    }
+
     /// Swaps the focused pane with its nearest neighbour in `direction`.
     /// The pane id and the focus stay the same; only the layout positions
     /// move. Only panes in the same tab take part.
@@ -1088,6 +1204,16 @@ fn remove_layout(layout: Layout, pane: PaneId) -> Option<Layout> {
                 _ => Some(Layout::Split { axis, children }),
             }
         }
+    }
+}
+
+fn split_at<'a>(layout: &'a mut Layout, path: &[usize]) -> Option<&'a mut Layout> {
+    match path.split_first() {
+        Some((&index, rest)) => match layout {
+            Layout::Split { children, .. } => split_at(&mut children.get_mut(index)?.layout, rest),
+            Layout::Leaf(_) => None,
+        },
+        None => Some(layout),
     }
 }
 

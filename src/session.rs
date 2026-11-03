@@ -89,11 +89,11 @@ impl Session {
         self.channel
     }
 
-    /// Attaches at the given size and remembers the channel for cleanup.
-    /// A successful attach clears the "leave it alone" state a reconnect or a
-    /// loss set.
-    pub fn attach(&mut self, cols: u16, rows: u16) -> Result<Attached> {
-        let attached = self.client.attach(&self.address, cols, rows)?;
+    /// Attaches at the given size, asking for `history` lines above the
+    /// screen, and remembers the channel for cleanup. A successful attach
+    /// clears the "leave it alone" state a reconnect or a loss set.
+    pub fn attach(&mut self, cols: u16, rows: u16, history: usize) -> Result<Attached> {
+        let attached = self.client.attach(&self.address, cols, rows, history)?;
         self.channel = Some(attached.channel);
         self.done = false;
         Ok(attached)

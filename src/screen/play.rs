@@ -652,7 +652,7 @@ impl<'a> Screen<'a> {
     // --- shared helpers ---------------------------------------------------
 
     fn try_attach(&mut self) -> Result<Attempt> {
-        match self.session.attach(self.cols, self.rows) {
+        match self.session.attach(self.cols, self.rows, 0) {
             Ok(attached) => Ok(Attempt::Attached(attached)),
             // Checked before the RPC kinds: a call interrupted by a dead
             // connection is also an `Error::Rpc`, with kind `lost`.

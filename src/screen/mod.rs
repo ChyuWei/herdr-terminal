@@ -69,7 +69,7 @@ pub fn run(options: Options) -> Result<i32> {
     // The pointer lets the next client find this terminal even when it was
     // discovered by its label; it is not the M4 workspace document.
     pointer::pointer(&core_id, session.address()).save();
-    let first = match session.attach(cols, rows) {
+    let first = match session.attach(cols, rows, 0) {
         Ok(attached) => play::First::Attached(Box::new(attached)),
         Err(Error::Rpc { error, .. }) if error.kind() == Some("finished") => {
             // The program ended before attach landed. There is no TUI to

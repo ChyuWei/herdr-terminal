@@ -80,7 +80,7 @@ pub fn run(options: Options) -> Result<i32> {
     let mut started = Session::start(client, &run)?;
     let mut stdout = std::io::stdout();
 
-    let attached = match started.attach(cols, rows) {
+    let attached = match started.attach(cols, rows, 0) {
         Ok(attached) => attached,
         Err(Error::Rpc { error, .. }) if error.kind() == Some("finished") => {
             return session::recover_finished(&mut started, &mut stdout, &error);

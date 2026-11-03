@@ -85,7 +85,7 @@ impl Screen<'_> {
                 return Ok(());
             };
             link.session
-                .attach(cols, rows)
+                .attach(cols, rows, self.config.scrollback)
                 .map_err(|error| (error, link.session.address().to_owned()))
         };
         let attached: Attached = match attempt {
@@ -123,7 +123,7 @@ impl Screen<'_> {
             }
         };
 
-        let vt = Vt::new(cols, rows).map_err(vt_error)?;
+        let vt = Vt::new_with_scrollback(cols, rows, self.config.scrollback).map_err(vt_error)?;
         if let Some(link) = self.links.get_mut(&pane) {
             link.vt = vt;
             link.vt_size = (cols, rows);
@@ -142,7 +142,7 @@ impl Screen<'_> {
 
     pub(super) fn add_link(&mut self, pane: PaneId, session: Session) -> Result<()> {
         let (cols, rows) = self.pane_attach_size(pane);
-        let vt = Vt::new(cols, rows).map_err(vt_error)?;
+        let vt = Vt::new_with_scrollback(cols, rows, self.config.scrollback).map_err(vt_error)?;
         self.links.insert(
             pane,
             Link {
@@ -196,20 +196,15 @@ impl Screen<'_> {
         Ok(())
     }
 
-    /// Enables outer mouse reporting only when the focused program tracks the
-    /// mouse and no overlay is open.
+    /// Enables outer mouse reporting whenever local mouse handling is on.
+    /// Clicks, wheel and drags are then interpreted locally first: chrome
+    /// clicks focus panes or tabs, non-tracking programs scroll their local
+    /// history, and only a program that tracks the mouse receives its events.
     pub(super) fn sync_mouse(&mut self) -> Result<()> {
-        let overlay = self.ui.help || self.ui.prompt.is_some();
-        let tracking = !overlay
-            && self
-                .workspace
-                .focused_pane()
-                .and_then(|pane| self.links.get(&pane))
-                .filter(|link| link.stream.is_some())
-                .is_some_and(|link| link.vt.mouse_tracking());
-        if tracking != self.mouse_on {
-            self.guard.set_mouse(tracking)?;
-            self.mouse_on = tracking;
+        let on = self.config.mouse;
+        if on != self.mouse_on {
+            self.guard.set_mouse(on)?;
+            self.mouse_on = on;
         }
         Ok(())
     }

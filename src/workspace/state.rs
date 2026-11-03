@@ -1,16 +1,86 @@
 //! Local UI state that is not part of the persisted workspace: the help
-//! overlay, the rename prompt, the last message, the prefix and the
-//! connection state. Pure and unit-testable.
+//! overlay, the rename prompt, the command palette, the scrollback search,
+//! selection mode, the last message, the prefix and the connection state.
+//! Pure and unit-testable.
 
 use super::agents::Overlay;
 use super::commands::RenameTarget;
+use super::keys::KeyMap;
 use super::model::PaneId;
+
+/// A one-line editable text field, used by the palette and the search bar.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Line {
+    pub text: Vec<char>,
+    pub cursor: usize,
+}
+
+impl Line {
+    pub fn new(text: &str) -> Line {
+        let text: Vec<char> = text.chars().collect();
+        Line {
+            cursor: text.len(),
+            text,
+        }
+    }
+
+    pub fn text(&self) -> String {
+        self.text.iter().collect()
+    }
+
+    /// Applies an editing action. Commit and Cancel are not edits; they are
+    /// handled by the overlay that owns the line.
+    pub fn edit(&mut self, edit: Edit) -> bool {
+        match edit {
+            Edit::Insert(c) => {
+                if c.is_control() {
+                    return false;
+                }
+                self.text.insert(self.cursor, c);
+                self.cursor += 1;
+            }
+            Edit::Backspace => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    self.text.remove(self.cursor);
+                }
+            }
+            Edit::Delete => {
+                if self.cursor < self.text.len() {
+                    self.text.remove(self.cursor);
+                }
+            }
+            Edit::Left => self.cursor = self.cursor.saturating_sub(1),
+            Edit::Right => {
+                if self.cursor < self.text.len() {
+                    self.cursor += 1;
+                }
+            }
+            Edit::Home => self.cursor = 0,
+            Edit::End => self.cursor = self.text.len(),
+            Edit::Commit | Edit::Cancel => return false,
+        }
+        true
+    }
+
+    /// The text before the cursor, for placing a cursor on screen.
+    pub fn before(&self) -> String {
+        self.text[..self.cursor].iter().collect()
+    }
+}
 
 /// The screen's local view state.
 #[derive(Clone, Debug)]
 pub struct UiState {
     pub help: bool,
     pub prompt: Option<Prompt>,
+    /// The modal command palette, when open.
+    pub palette: Option<PaletteState>,
+    /// The scrollback search bar, when open.
+    pub search: Option<SearchState>,
+    /// The pane whose local selection is being edited by the keyboard, when
+    /// selection mode is on.
+    pub selecting: Option<PaneId>,
     /// A transient message for the status bar (kept addresses, exit status).
     pub message: Option<String>,
     /// The prefix key was pressed and the next key is a command.
@@ -20,6 +90,8 @@ pub struct UiState {
     pub sidebar: Sidebar,
     /// The agent being peeked, when the peek overlay is open.
     pub peek: Option<PaneId>,
+    /// The effective prefix key map, so the palette can show current hints.
+    pub keymap: KeyMap,
 }
 
 impl Default for UiState {
@@ -27,11 +99,15 @@ impl Default for UiState {
         UiState {
             help: false,
             prompt: None,
+            palette: None,
+            search: None,
+            selecting: None,
             message: None,
             prefix: false,
             connection: Connection::Live,
             sidebar: Sidebar::default(),
             peek: None,
+            keymap: KeyMap::default(),
         }
     }
 }
@@ -44,12 +120,89 @@ impl UiState {
             Overlay::Help
         } else if self.prompt.is_some() {
             Overlay::Prompt
+        } else if self.palette.is_some() {
+            Overlay::Palette
+        } else if self.search.is_some() {
+            Overlay::Search
         } else if let Some(pane) = self.peek {
             Overlay::Peek(pane)
         } else if self.sidebar.open {
             Overlay::Sidebar
         } else {
             Overlay::None
+        }
+    }
+
+    /// Whether an overlay other than the text selection owns every key and
+    /// mouse event. A selection is modal for keys but lets a fresh mouse press
+    /// through, so mouse routing checks this rather than [`Self::modal`].
+    pub fn overlay(&self) -> bool {
+        self.help
+            || self.prompt.is_some()
+            || self.palette.is_some()
+            || self.search.is_some()
+            || self.peek.is_some()
+            || self.sidebar.open
+    }
+
+    /// Whether an overlay currently owns every key.
+    pub fn modal(&self) -> bool {
+        self.overlay() || self.selecting.is_some()
+    }
+}
+
+/// The command palette's editable query and selected row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaletteState {
+    pub line: Line,
+    pub selected: usize,
+}
+
+impl PaletteState {
+    /// Keeps the selection inside `len` rows after a filter change.
+    pub fn clamp(&mut self, len: usize) {
+        if len == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(len - 1);
+        }
+    }
+
+    pub fn move_by(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let current = self.selected.min(len - 1) as isize;
+        let next = (current + delta).rem_euclid(len as isize);
+        self.selected = next as usize;
+    }
+}
+
+/// The scrollback search bar's query and the latest counts from the local VT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchState {
+    pub pane: PaneId,
+    pub line: Line,
+    /// Matches found so far; grows while the search catches up.
+    pub total: usize,
+    /// The selected match as a 0-based index in newest-to-oldest order.
+    pub selected: Option<usize>,
+    /// The local VT has caught up with the query it was given.
+    pub complete: bool,
+    /// The query changed and the search restarted.
+    pub pending: bool,
+}
+
+impl SearchState {
+    pub fn new(pane: PaneId) -> SearchState {
+        SearchState {
+            pane,
+            line: Line::default(),
+            total: 0,
+            selected: None,
+            complete: false,
+            pending: false,
         }
     }
 }
@@ -264,9 +417,57 @@ mod tests {
             Overlay::Peek(PaneId(7)),
             "a peek over the sidebar counts only its target"
         );
+        ui.search = Some(SearchState::new(PaneId(3)));
+        assert_eq!(ui.agent_overlay(), Overlay::Search);
+        ui.palette = Some(PaletteState::default());
+        assert_eq!(ui.agent_overlay(), Overlay::Palette);
         ui.prompt = Some(prompt());
         assert_eq!(ui.agent_overlay(), Overlay::Prompt);
         ui.help = true;
         assert_eq!(ui.agent_overlay(), Overlay::Help);
+    }
+
+    #[test]
+    fn a_line_edits_at_the_cursor_and_ignores_commit() {
+        let mut line = Line::new("ab");
+        assert!(line.edit(Edit::Home));
+        assert!(line.edit(Edit::Insert('X')));
+        assert_eq!(line.text(), "Xab");
+        assert_eq!(line.before(), "X");
+        assert!(line.edit(Edit::End));
+        assert!(line.edit(Edit::Backspace));
+        assert_eq!(line.text(), "Xa");
+        assert!(line.edit(Edit::Delete));
+        assert_eq!(line.text(), "Xa");
+        assert!(!line.edit(Edit::Commit));
+        assert!(!line.edit(Edit::Cancel));
+        assert!(!line.edit(Edit::Insert('\u{2}')));
+    }
+
+    #[test]
+    fn the_palette_selection_clamps_and_wraps() {
+        let mut palette = PaletteState::default();
+        palette.move_by(1, 0);
+        assert_eq!(palette.selected, 0);
+        palette.move_by(1, 3);
+        assert_eq!(palette.selected, 1);
+        palette.move_by(-2, 3);
+        assert_eq!(palette.selected, 2);
+        palette.selected = 9;
+        palette.clamp(3);
+        assert_eq!(palette.selected, 2);
+        palette.clamp(0);
+        assert_eq!(palette.selected, 0);
+    }
+
+    #[test]
+    fn a_modal_ui_is_not_forwarding_keys() {
+        let mut ui = UiState::default();
+        assert!(!ui.modal());
+        ui.selecting = Some(PaneId(2));
+        assert!(ui.modal());
+        ui.selecting = None;
+        ui.search = Some(SearchState::new(PaneId(2)));
+        assert!(ui.modal());
     }
 }

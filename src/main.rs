@@ -30,6 +30,8 @@ Prefix Ctrl-b, then:
   z zoom   x close   e keep and close   X kill and close
   , rename tab   . rename space   ? help
   a agents sidebar   i peek agent   g/G next/prev agent
+  : command palette   f search scrollback   [ select mode   y copy
+  Shift-PgUp/PgDn scroll history   Shift-Home/End top/bottom
 The agents sidebar lists every agent in the workspace (a terminal counts only
 when core says it reported through OSC 7501). Pinned agents sort first, then
 blocked, done, working and idle. In the sidebar, j/k move, g/G jump to the
@@ -37,10 +39,24 @@ first/last row, Enter jumps to the agent, i peeks it, p pins or unpins it, u
 marks it unread; Esc or a closes. Prefix i peeks the focused agent and any key
 closes the peek. Seen and pinned state are core labels, not part of the saved
 document.
-Ctrl-] (or prefix q) detaches: every program keeps running and the document
-stays. Focus, zoom and the active tab are local per screen, named by
-HERDR_TERMINAL_SCREEN (default `default`). It needs a terminal on stdin and
-stdout.
+Mouse: a click focuses a pane or selects a tab; a click without a drag only
+focuses and never enters selection mode. Dragging on a pane grid selects
+locally, Shift-drag selects even over a program that tracks the mouse, and
+dragging a split gap resizes. The wheel scrolls local history unless the
+program tracks the mouse. Chrome never reaches a program. Scrollback and
+search are local: they never read core or change the document. A selection is
+copied with y (or Enter) and cancelled with Esc; any other key leaves selection
+and goes to the focused program, and a paste is ignored while selecting. Copy
+uses OSC 52 by default, optionally a native helper.
+Settings are read once at startup from
+`$XDG_CONFIG_HOME/herdr-terminal/config.json` (falling back to
+`$HOME/.config/herdr-terminal/config.json`): `theme` (default, dark, light),
+`scrollback` lines, `mouse` on/off, `clipboard` (osc52, native, both, off) and
+`keys` overrides for prefix bindings. A missing file is normal; a bad file
+warns and falls back. Ctrl-] (or prefix q) detaches: every program keeps
+running and the document stays. Focus, zoom and the active tab are local per
+screen, named by HERDR_TERMINAL_SCREEN (default `default`). It needs a
+terminal on stdin and stdout.
 
 `ht screen` is the single-pane screen. It draws one terminal's cells, colors,
 cursor and wide characters; keys and the mouse go to it, including Ctrl-C.

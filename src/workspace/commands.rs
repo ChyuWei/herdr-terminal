@@ -36,6 +36,14 @@ pub enum Command {
     Peek,
     /// Jump to the next or previous agent in sidebar order.
     JumpAgent(Jump),
+    /// Open the command palette.
+    Palette,
+    /// Search the focused pane's local scrollback.
+    Search,
+    /// Enter or leave mouse selection mode.
+    Select,
+    /// Copy the focused pane's current selection.
+    Copy,
     Detach,
 }
 
@@ -67,6 +75,14 @@ pub enum Effect {
     Peek,
     /// Jump to the next or previous agent.
     JumpAgent(Jump),
+    /// Open the command palette.
+    Palette,
+    /// Open the scrollback search bar for the focused pane.
+    Search,
+    /// Toggle mouse selection mode.
+    Select,
+    /// Copy the current local selection.
+    Copy,
     /// Close every attach stream and leave the client.
     Detach,
 }
@@ -99,6 +115,10 @@ impl Workspace {
             Command::Agents => Effect::Agents,
             Command::Peek => Effect::Peek,
             Command::JumpAgent(jump) => Effect::JumpAgent(jump),
+            Command::Palette => Effect::Palette,
+            Command::Search => Effect::Search,
+            Command::Select => Effect::Select,
+            Command::Copy => Effect::Copy,
             Command::Detach => Effect::Detach,
         }
     }

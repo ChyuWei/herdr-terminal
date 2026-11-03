@@ -147,6 +147,44 @@ fn run_tests() {
     workspace_missed_baseline_does_not_replay_an_alert();
     #[cfg(unix)]
     workspace_restores_an_open_sidebar_from_the_local_view();
+    #[cfg(unix)]
+    workspace_mouse_clicks_focus_panes_and_select_tabs();
+    #[cfg(unix)]
+    workspace_a_fresh_press_leaves_a_selection_and_routes_normally();
+    #[cfg(unix)]
+    workspace_an_ordinary_key_leaves_selection_and_reaches_the_program();
+    #[cfg(unix)]
+    workspace_a_selection_exit_key_forwards_its_release();
+    #[cfg(unix)]
+    workspace_a_drag_selection_extends_and_copies_the_range();
+    #[cfg(unix)]
+    workspace_dragging_a_split_sends_exact_resize_frames();
+    #[cfg(unix)]
+    workspace_wheel_scrolls_local_history_and_any_key_returns_live();
+    #[cfg(unix)]
+    workspace_the_live_cursor_is_hidden_in_history_and_returns_at_the_bottom();
+    #[cfg(unix)]
+    workspace_forwards_mouse_to_a_tracking_program_and_consumes_chrome();
+    #[cfg(unix)]
+    workspace_shift_drag_selects_locally_over_a_tracking_program();
+    #[cfg(unix)]
+    workspace_shift_click_is_local_over_a_tracking_program();
+    #[cfg(unix)]
+    workspace_overlays_consume_mouse_without_input_or_resize();
+    #[cfg(unix)]
+    workspace_palette_runs_a_command_and_view_commands_do_not_write();
+    #[cfg(unix)]
+    workspace_search_is_local_and_jumps_to_a_match();
+    #[cfg(unix)]
+    workspace_copy_emits_osc52_and_empty_selection_copies_nothing();
+    #[cfg(unix)]
+    workspace_paste_is_bracketed_and_overlays_consume_it();
+    #[cfg(unix)]
+    workspace_paste_frames_only_when_the_program_enabled_it();
+    #[cfg(unix)]
+    workspace_config_sets_theme_and_keys_and_malformed_config_warns();
+    #[cfg(unix)]
+    workspace_processes_a_large_output_burst();
     println!("fake-core tests passed");
 }
 
@@ -218,7 +256,11 @@ impl FakeScreen {
             .env("FAKE_SCENARIO", scenario)
             .env("FAKE_LOG", scratch.log())
             .env("HOME", &scratch.dir)
-            .env("XDG_STATE_HOME", scratch.state());
+            .env("XDG_STATE_HOME", scratch.state())
+            .env("XDG_CONFIG_HOME", scratch.config_root())
+            // Deterministic chrome colors in the captured frames.
+            .env("COLORTERM", "truecolor")
+            .env("TERM", "xterm-256color");
         if let Some(screen) = screen {
             command.env("HERDR_TERMINAL_SCREEN", screen);
         }
@@ -253,6 +295,13 @@ impl FakeScreen {
         vt.snapshot().expect("snapshot").lines().join("\n")
     }
 
+    /// The outer terminal's cursor after replaying everything the client drew.
+    fn cursor(&self) -> herdr_terminal::vt::Cursor {
+        let mut vt = herdr_terminal::vt::Vt::new(self.cols, self.rows).expect("local VT");
+        vt.feed(&self.output.bytes());
+        vt.snapshot().expect("snapshot").cursor
+    }
+
     fn send(&mut self, bytes: &[u8]) {
         self.input.write_all(bytes).expect("write to the screen");
         self.input.flush().expect("flush the screen");
@@ -270,6 +319,15 @@ impl FakeScreen {
     fn tail(&self) -> String {
         let raw = self.output.bytes();
         String::from_utf8_lossy(&raw[raw.len().saturating_sub(400)..]).into_owned()
+    }
+
+    /// The raw outer-terminal bytes, including OSC sequences such as OSC 52.
+    fn raw(&self) -> String {
+        String::from_utf8_lossy(&self.output.bytes()).into_owned()
+    }
+
+    fn errors(&self) -> String {
+        self.stderr.text()
     }
 }
 
@@ -2337,6 +2395,79 @@ fn resize_frames(scratch: &Scratch) -> usize {
         .count()
 }
 
+/// The exact `(cols, rows)` of every RESIZE the client sent.
+#[cfg(unix)]
+fn resize_payloads(scratch: &Scratch) -> Vec<(u16, u16)> {
+    scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["frame"]["kind"] == json!(3))
+        .filter_map(|entry| {
+            Some((
+                u16::try_from(entry["frame"]["cols"].as_u64()?).ok()?,
+                u16::try_from(entry["frame"]["rows"].as_u64()?).ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Every byte the client sent to a program, keyed by the terminal address the
+/// attach channel belongs to.
+#[cfg(unix)]
+fn program_input(scratch: &Scratch) -> Vec<(String, String)> {
+    let mut channels: BTreeMap<u64, String> = BTreeMap::new();
+    for entry in scratch.entries() {
+        if let (Some(channel), Some(target)) =
+            (entry["attached"].as_u64(), entry["terminal"].as_str())
+        {
+            channels.insert(channel, target.to_owned());
+        }
+    }
+    scratch
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let channel = entry["attach_data"]["channel"].as_u64()?;
+            let text = entry["attach_data"]["text"].as_str()?;
+            Some((
+                channels.get(&channel).cloned().unwrap_or_default(),
+                text.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn terminal_read_calls(scratch: &Scratch) -> usize {
+    scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["call"] == "terminal.read")
+        .count()
+}
+
+/// SGR mouse input as the outer terminal would send it (cells are 0-based in
+/// the test, 1-based on the wire).
+#[cfg(unix)]
+fn sgr(button: u8, release: bool, x: u16, y: u16) -> String {
+    format!(
+        "\x1b[<{button};{};{}{}",
+        x + 1,
+        y + 1,
+        if release { 'm' } else { 'M' }
+    )
+}
+
+#[cfg(unix)]
+fn click(x: u16, y: u16) -> String {
+    format!("{}{}", sgr(0, false, x, y), sgr(0, true, x, y))
+}
+
+#[cfg(unix)]
+fn wheel_up(x: u16, y: u16) -> String {
+    sgr(64, false, x, y)
+}
+
 #[cfg(unix)]
 fn generation_count(scratch: &Scratch) -> usize {
     scratch
@@ -3088,6 +3219,1119 @@ fn workspace_restores_an_open_sidebar_from_the_local_view() {
     assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
 }
 
+/// Mouse clicks focus the pane under the pointer and select tabs in the bar.
+/// Chrome clicks never reach a program.
+#[cfg(unix)]
+fn workspace_mouse_clicks_focus_panes_and_select_tabs() {
+    let scratch = Scratch::new("m6-click");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "the first pane did not paint: {:?}",
+        screen.rendered()
+    );
+    screen.command(b'v');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "the split did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "/ t2"),
+        "the new split should hold the focus: {:?}",
+        screen.rendered()
+    );
+
+    // A grid click moves the focus back to the first pane. It is a plain
+    // focus click: no selection mode, no Esc, and typing reaches the program
+    // immediately.
+    screen.send(click(10, 5).as_bytes());
+    assert!(
+        wait_for_text(&screen, "/ t1"),
+        "clicking the left pane did not focus it: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"x");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "x")
+        }),
+        "typing after a plain click did not reach t1: {:?}",
+        program_input(&scratch)
+    );
+    assert!(
+        !screen.rendered().contains("selection:"),
+        "a plain click entered selection mode: {:?}",
+        screen.rendered()
+    );
+
+    // The tab bar selects tabs; the workspace keeps them in the document, but
+    // which tab this screen shows is local.
+    screen.command(b'c');
+    assert!(
+        wait_for_text(&screen, "PANE-THREE"),
+        "the new tab did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(wait_for_text(&screen, "/ t3"), "{:?}", screen.rendered());
+    assert!(
+        wait_doc_has(&scratch, "t3"),
+        "the tab was not written to the document: {:?}",
+        scratch.doc_value()
+    );
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+
+    screen.send(click(10, 0).as_bytes());
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "clicking the first tab did not show it: {:?} stderr={:?}",
+        screen.rendered(),
+        screen.errors()
+    );
+    assert!(wait_for_text(&screen, "/ t1"), "{:?}", screen.rendered());
+    screen.send(click(19, 0).as_bytes());
+    assert!(
+        wait_for_text(&screen, "PANE-THREE"),
+        "clicking the second tab did not show it: {:?}",
+        screen.rendered()
+    );
+    assert!(wait_for_text(&screen, "/ t3"), "{:?}", screen.rendered());
+    assert_doc_untouched(&scratch, version, writes, "tab selection");
+}
+
+/// A selection never makes the mouse modal: a fresh press on the same pane,
+/// another pane or a tab leaves it and is routed normally.
+#[cfg(unix)]
+fn workspace_a_fresh_press_leaves_a_selection_and_routes_normally() {
+    let scratch = Scratch::new("m6-selection-click");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'v');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "{:?}",
+        screen.rendered()
+    );
+    assert!(wait_for_text(&screen, "/ t2"), "{:?}", screen.rendered());
+
+    // Focus the first pane and drag a local selection there.
+    screen.send(click(10, 5).as_bytes());
+    assert!(
+        wait_for_text(&screen, "/ t1"),
+        "the click did not focus t1: {:?}",
+        screen.rendered()
+    );
+    screen.send(sgr(0, false, 10, 5).as_bytes());
+    screen.send(sgr(32, false, 14, 5).as_bytes());
+    screen.send(sgr(0, true, 14, 5).as_bytes());
+    assert!(
+        wait_for_text(&screen, "selection:"),
+        "the drag did not start a selection: {:?}",
+        screen.rendered()
+    );
+
+    // A fresh click in the same pane ends the selection; the click and the
+    // next key are both processed.
+    screen.send(click(10, 6).as_bytes());
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("selection:")),
+        "a fresh click did not leave selection mode: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"w");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "w")
+        }),
+        "typing after the fresh click did not reach t1: {:?}",
+        program_input(&scratch)
+    );
+
+    // The same holds for a tab click: create a second tab, select in the
+    // first, then click the second tab and type.
+    screen.command(b'c');
+    assert!(
+        wait_for_text(&screen, "PANE-THREE"),
+        "the new tab did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(wait_for_text(&screen, "/ t3"), "{:?}", screen.rendered());
+    screen.send(click(10, 0).as_bytes());
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "the first tab was not selected: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(10, 5).as_bytes());
+    assert!(
+        wait_for_text(&screen, "/ t1"),
+        "t1 was not focused: {:?}",
+        screen.rendered()
+    );
+    screen.send(sgr(0, false, 10, 5).as_bytes());
+    screen.send(sgr(32, false, 14, 5).as_bytes());
+    screen.send(sgr(0, true, 14, 5).as_bytes());
+    assert!(
+        wait_for_text(&screen, "selection:"),
+        "the second drag did not start a selection: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(19, 0).as_bytes());
+    assert!(
+        wait_for_text(&screen, "PANE-THREE"),
+        "a tab click during selection did not select the tab: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("selection:")),
+        "the tab click did not leave selection mode: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"q");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t3" && text == "q")
+        }),
+        "typing after the tab click did not reach t3: {:?}",
+        program_input(&scratch)
+    );
+}
+
+/// Dragging the mouse extends the selection across cells and copies the whole
+/// range, not only the cell under the initial press.
+#[cfg(unix)]
+fn workspace_a_drag_selection_extends_and_copies_the_range() {
+    let scratch = Scratch::new("m6-drag-copy");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-copy");
+    assert!(
+        wait_for_text(&screen, "hello"),
+        "the copy fixture did not paint: {:?}",
+        screen.rendered()
+    );
+
+    // "hello" starts at the first inner cell, screen (1,2) in the single
+    // pane; drag from h to o in two steps, so the first drag starts the
+    // selection and the second one must extend it.
+    screen.send(sgr(0, false, 1, 2).as_bytes());
+    screen.send(sgr(32, false, 3, 2).as_bytes());
+    screen.send(sgr(32, false, 5, 2).as_bytes());
+    screen.send(sgr(0, true, 5, 2).as_bytes());
+    assert!(
+        wait_for_text(&screen, "selection:"),
+        "the drag did not start a selection: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"y");
+    let expected = format!(
+        "\x1b]52;c;{}\x07",
+        herdr_terminal::clipboard::base64(b"hello")
+    );
+    assert!(
+        common::wait_until(secs(10), || screen.raw().contains(&expected)),
+        "the drag selection did not copy the whole range: {:?}",
+        screen.tail()
+    );
+    assert!(
+        wait_for_text(&screen, "copied 5 characters"),
+        "the drag selection copied the wrong number of characters: {:?}",
+        screen.rendered()
+    );
+}
+
+/// Dragging a split gap resizes them exactly and sends RESIZE frames with
+/// the new inner grid sizes.
+#[cfg(unix)]
+fn workspace_dragging_a_split_sends_exact_resize_frames() {
+    let scratch = Scratch::new("m6-drag");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'v');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "{:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || {
+            resize_payloads(&scratch).contains(&(38, 20))
+        }),
+        "the split did not resize the left pane to its inner size: {:?}",
+        resize_payloads(&scratch)
+    );
+    let before = resize_payloads(&scratch).len();
+
+    // The gap is the single column between the 40- and 39-cell panes.
+    screen.send(sgr(0, false, 40, 10).as_bytes());
+    screen.send(sgr(32, false, 44, 10).as_bytes());
+    screen.send(sgr(0, true, 44, 10).as_bytes());
+    assert!(
+        common::wait_until(secs(10), || {
+            let payloads = resize_payloads(&scratch);
+            payloads.contains(&(42, 20)) && payloads.contains(&(33, 20))
+        }),
+        "the drag did not resize both panes: {:?}",
+        resize_payloads(&scratch)
+    );
+    assert_eq!(
+        resize_payloads(&scratch).len(),
+        before + 2,
+        "a 4-cell drag sent extra RESIZE frames: {:?}",
+        resize_payloads(&scratch)
+    );
+}
+
+/// The wheel scrolls a non-tracking program's local history and any key
+/// returns to the live bottom. Neither touches core or the document.
+#[cfg(unix)]
+fn workspace_wheel_scrolls_local_history_and_any_key_returns_live() {
+    let scratch = Scratch::new("m6-wheel");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-scroll");
+    assert!(
+        wait_for_text(&screen, "LIVE-BOTTOM"),
+        "the scrollback fixture did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(wait_doc_has(&scratch, "t1"), "{:?}", scratch.doc_value());
+    let attach = scratch
+        .entries()
+        .into_iter()
+        .find(|entry| entry["call"] == "terminal.attach")
+        .expect("the pane attached");
+    assert_eq!(
+        attach["params"]["history"],
+        json!(10_000),
+        "the default scrollback was not requested from core: {attach}"
+    );
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+    let resizes = resize_frames(&scratch);
+
+    screen.send(wheel_up(10, 5).as_bytes());
+    assert!(
+        common::wait_until(secs(10), || {
+            let rendered = screen.rendered();
+            rendered.contains("scroll ") && !rendered.contains("LIVE-BOTTOM")
+        }),
+        "the wheel did not scroll local history: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        program_input(&scratch).is_empty(),
+        "the wheel reached a non-tracking program: {:?}",
+        program_input(&scratch)
+    );
+    assert_eq!(
+        resize_frames(&scratch),
+        resizes,
+        "local scrolling resized a pane"
+    );
+    assert_eq!(
+        terminal_read_calls(&scratch),
+        0,
+        "local scrolling read a terminal"
+    );
+    assert_doc_untouched(&scratch, version, writes, "wheel scrolling");
+
+    // Any ordinary key snaps the pane back to live before it is forwarded.
+    screen.send(b"x");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "x")
+                && screen.rendered().contains("LIVE-BOTTOM")
+        }),
+        "the key did not return the pane to live: {:?}",
+        screen.rendered()
+    );
+    assert_doc_untouched(&scratch, version, writes, "returning to live");
+}
+
+/// The cursor is drawn only at the live bottom: scrolling the focused pane
+/// into history hides it, and returning live shows it again.
+#[cfg(unix)]
+fn workspace_the_live_cursor_is_hidden_in_history_and_returns_at_the_bottom() {
+    let scratch = Scratch::new("m6-cursor");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-scroll");
+    assert!(
+        wait_for_text(&screen, "LIVE-BOTTOM"),
+        "the scrollback fixture did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.cursor().visible,
+        "the live cursor was not drawn: {:?}",
+        screen.cursor()
+    );
+
+    // The fixture leaves the cursor three rows above the bottom, so after a
+    // three-line wheel scroll the terminal's own cursor is still inside the
+    // viewport. Only the live-bottom rule hides it.
+    screen.send(wheel_up(10, 5).as_bytes());
+    assert!(
+        wait_for_text(&screen, "scroll "),
+        "the wheel did not scroll local history: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || !screen.cursor().visible),
+        "the cursor stayed visible while the pane was scrolled: {:?}",
+        screen.cursor()
+    );
+
+    screen.send(b"\x1b[1;2F");
+    assert!(
+        common::wait_until(secs(10), || {
+            screen.rendered().contains("LIVE-BOTTOM") && screen.cursor().visible
+        }),
+        "the live cursor did not return at the bottom: {:?} {:?}",
+        screen.rendered(),
+        screen.cursor()
+    );
+}
+
+/// A program that tracks the mouse receives pane-local events on its grid.
+/// Clicks and wheels on chrome are consumed, never forwarded.
+#[cfg(unix)]
+fn workspace_forwards_mouse_to_a_tracking_program_and_consumes_chrome() {
+    let scratch = Scratch::new("m6-mouse");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-mouse");
+    assert!(
+        wait_for_text(&screen, "MOUSE-READY"),
+        "the mouse program did not paint: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(wheel_up(10, 5).as_bytes());
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(_, text)| text.contains("\x1b[<64;"))
+        }),
+        "the wheel was not forwarded to the tracking program: {:?}",
+        program_input(&scratch)
+    );
+    screen.send(click(10, 6).as_bytes());
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(_, text)| text.contains("\x1b[<0;"))
+        }),
+        "the grid click was not forwarded: {:?}",
+        program_input(&scratch)
+    );
+    let after_grid = program_input(&scratch).len();
+
+    // Tab bar, status bar and pane border are chrome: focus or selection only.
+    screen.send(click(10, 0).as_bytes());
+    screen.send(click(10, 23).as_bytes());
+    screen.send(click(0, 5).as_bytes());
+    screen.send(b"z");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "z")
+        }),
+        "the client stalled after chrome clicks: {:?}",
+        program_input(&scratch)
+    );
+    let forwarded: Vec<String> = program_input(&scratch)
+        .into_iter()
+        .skip(after_grid)
+        .map(|(_, text)| text)
+        .collect();
+    assert!(
+        forwarded.iter().all(|text| !text.contains("\x1b[<")),
+        "a chrome click reached the tracking program: {forwarded:?}"
+    );
+}
+
+/// Shift-drag is always local: even over a program that tracks the mouse it
+/// starts a selection and sends no mouse report to the program.
+#[cfg(unix)]
+fn workspace_shift_drag_selects_locally_over_a_tracking_program() {
+    let scratch = Scratch::new("m6-shift-select");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-mouse");
+    assert!(
+        wait_for_text(&screen, "MOUSE-READY"),
+        "the mouse program did not paint: {:?}",
+        screen.rendered()
+    );
+    let before = program_input(&scratch).len();
+
+    screen.send(sgr(4, false, 10, 6).as_bytes());
+    screen.send(sgr(36, false, 14, 6).as_bytes());
+    screen.send(sgr(4, true, 14, 6).as_bytes());
+    assert!(
+        wait_for_text(&screen, "selection:"),
+        "Shift-drag did not start a local selection: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        program_input(&scratch).len(),
+        before,
+        "a Shift-drag reached the tracking program: {:?}",
+        program_input(&scratch)
+    );
+
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("selection:")),
+        "Esc did not leave the selection: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        program_input(&scratch).len(),
+        before,
+        "Esc from a local selection reached the tracking program: {:?}",
+        program_input(&scratch)
+    );
+}
+
+/// A Shift-click is a local click: over a tracking program neither its press
+/// nor its release reaches the program. A later plain click is the barrier
+/// that proves the program's input stream is still live.
+#[cfg(unix)]
+fn workspace_shift_click_is_local_over_a_tracking_program() {
+    let scratch = Scratch::new("m6-shift-click");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-mouse");
+    assert!(
+        wait_for_text(&screen, "MOUSE-READY"),
+        "the mouse program did not paint: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(sgr(4, false, 10, 6).as_bytes());
+    screen.send(sgr(4, true, 10, 6).as_bytes());
+    screen.send(click(10, 7).as_bytes());
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text.contains("\x1b[<0;"))
+        }),
+        "the barrier click was not forwarded: {:?}",
+        program_input(&scratch)
+    );
+    let forwarded: Vec<String> = program_input(&scratch)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect();
+    assert!(
+        forwarded
+            .iter()
+            .all(|text| !text.contains("\x1b[<4;") && !text.contains("\x1b[<36;")),
+        "the Shift-click reached the tracking program: {forwarded:?}"
+    );
+    assert!(
+        !screen.rendered().contains("selection:"),
+        "a Shift-click entered selection mode: {:?}",
+        screen.rendered()
+    );
+}
+
+/// An ordinary key during a selection leaves it, snaps the pane back to the
+/// live bottom and reaches the program exactly once.
+#[cfg(unix)]
+fn workspace_an_ordinary_key_leaves_selection_and_reaches_the_program() {
+    let scratch = Scratch::new("m6-key-exit");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-scroll");
+    assert!(
+        wait_for_text(&screen, "LIVE-BOTTOM"),
+        "the scrollback fixture did not paint: {:?}",
+        screen.rendered()
+    );
+
+    screen.command(b'[');
+    assert!(
+        wait_for_text(&screen, "selection:"),
+        "selection mode did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(wheel_up(10, 5).as_bytes());
+    assert!(
+        common::wait_until(secs(10), || {
+            let rendered = screen.rendered();
+            rendered.contains("scroll ") && !rendered.contains("LIVE-BOTTOM")
+        }),
+        "the wheel did not scroll the selected pane: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("selection:"),
+        "scrolling ended the selection: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(b"w");
+    assert!(
+        common::wait_until(secs(10), || {
+            let rendered = screen.rendered();
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "w")
+                && rendered.contains("LIVE-BOTTOM")
+                && !rendered.contains("selection:")
+                && !rendered.contains("scroll ")
+        }),
+        "the ordinary key did not leave selection at the live bottom: {:?} input={:?}",
+        screen.rendered(),
+        program_input(&scratch)
+    );
+    let forwarded: Vec<String> = program_input(&scratch)
+        .into_iter()
+        .filter(|(target, _)| target == "t1")
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(
+        forwarded,
+        vec!["w".to_string()],
+        "the ordinary key was not forwarded exactly once: {forwarded:?}"
+    );
+    assert!(
+        screen.cursor().visible,
+        "the live cursor did not return: {:?}",
+        screen.cursor()
+    );
+}
+
+/// When a program requests kitty key events, the key that leaves a selection
+/// is forwarded with both its press and its release.
+#[cfg(unix)]
+fn workspace_a_selection_exit_key_forwards_its_release() {
+    let scratch = Scratch::new("m6-kitty-exit");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-kitty");
+    assert!(
+        wait_for_text(&screen, "KITTY-READY"),
+        "the kitty fixture did not paint: {:?}",
+        screen.rendered()
+    );
+    screen.command(b'[');
+    assert!(
+        wait_for_text(&screen, "selection:"),
+        "selection mode did not open: {:?}",
+        screen.rendered()
+    );
+
+    // Kitty CSI u: 'w' press (event type 1), then its release (type 3). A
+    // plain printable press stays legacy text; the release is the CSI u form.
+    screen.send(b"\x1b[119;1:1u");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "w")
+        }),
+        "the kitty press was not forwarded: {:?}",
+        program_input(&scratch)
+    );
+    screen.send(b"\x1b[119;1:3u");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "\x1b[119;1:3u")
+        }),
+        "the kitty release was not forwarded: {:?}",
+        program_input(&scratch)
+    );
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("selection:")),
+        "the kitty key did not leave selection mode: {:?}",
+        screen.rendered()
+    );
+}
+
+/// An open overlay consumes every mouse event: no input reaches a program and
+/// no pane is resized.
+#[cfg(unix)]
+fn workspace_overlays_consume_mouse_without_input_or_resize() {
+    let scratch = Scratch::new("m6-overlay-mouse");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    assert!(wait_doc_has(&scratch, "t1"), "{:?}", scratch.doc_value());
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+    let resizes = resize_frames(&scratch);
+
+    screen.command(b':');
+    assert!(
+        wait_for_text(&screen, "palette · Enter run · Esc close"),
+        "the palette did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(10, 5).as_bytes());
+    screen.send(wheel_up(10, 5).as_bytes());
+    screen.send(click(10, 0).as_bytes());
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("palette ·")),
+        "the palette did not close: {:?}",
+        screen.rendered()
+    );
+
+    screen.command(b'f');
+    assert!(
+        wait_for_text(&screen, "search:"),
+        "the search bar did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(10, 5).as_bytes());
+    screen.send(wheel_up(10, 5).as_bytes());
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("search:")),
+        "the search bar did not close: {:?}",
+        screen.rendered()
+    );
+
+    assert!(
+        program_input(&scratch).is_empty(),
+        "an overlay mouse event reached the program: {:?}",
+        program_input(&scratch)
+    );
+    assert_eq!(
+        resize_frames(&scratch),
+        resizes,
+        "an overlay mouse event resized a pane"
+    );
+    assert_doc_untouched(&scratch, version, writes, "overlay mouse events");
+}
+
+/// The palette reuses the command table: a view command writes nothing, and a
+/// layout command does exactly what its key would.
+#[cfg(unix)]
+fn workspace_palette_runs_a_command_and_view_commands_do_not_write() {
+    let scratch = Scratch::new("m6-palette");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-palette");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    assert!(wait_doc_has(&scratch, "t1"), "{:?}", scratch.doc_value());
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+
+    screen.command(b':');
+    assert!(
+        wait_for_text(&screen, "palette · Enter run · Esc close"),
+        "the palette did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"help");
+    assert!(
+        wait_for_text(&screen, "› help"),
+        "the palette did not filter: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        wait_for_text(&screen, "any key closes help"),
+        "Enter did not run help: {:?}",
+        screen.rendered()
+    );
+    assert_doc_untouched(&scratch, version, writes, "palette help");
+    assert_eq!(
+        terminal_read_calls(&scratch),
+        0,
+        "the palette read a terminal"
+    );
+
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(10), || !screen
+            .rendered()
+            .contains("any key closes help")),
+        "help did not close: {:?}",
+        screen.rendered()
+    );
+
+    screen.command(b':');
+    assert!(wait_for_text(&screen, "palette · Enter run · Esc close"));
+    screen.send(b"split top");
+    assert!(
+        wait_for_text(&screen, "› split top"),
+        "the palette did not filter the split command: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "the palette split did not run: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_doc_has(&scratch, "t2"),
+        "the palette split was not persisted: {:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        scratch.doc_version() > version || doc_set_calls(&scratch) > writes,
+        "the palette split did not write the layout"
+    );
+    assert_eq!(
+        terminal_read_calls(&scratch),
+        0,
+        "the palette read a terminal"
+    );
+}
+
+/// Search is local: it never calls `terminal.read` or writes the document, and
+/// Enter jumps the viewport to the matching history line.
+#[cfg(unix)]
+fn workspace_search_is_local_and_jumps_to_a_match() {
+    let scratch = Scratch::new("m6-search");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-scroll");
+    assert!(
+        wait_for_text(&screen, "LIVE-BOTTOM"),
+        "the scrollback fixture did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(wait_doc_has(&scratch, "t1"), "{:?}", scratch.doc_value());
+    let version = scratch.doc_version();
+    let writes = doc_set_calls(&scratch);
+    let resizes = resize_frames(&scratch);
+
+    screen.command(b'f');
+    assert!(
+        wait_for_text(&screen, "search:"),
+        "the search bar did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"HIST-250");
+    assert!(
+        wait_for_text(&screen, "matches · Enter next"),
+        "the search did not count the match: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("0/1 matches"),
+        "the search found the wrong number of matches: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(10), || {
+            let rendered = screen.rendered();
+            rendered.contains("HIST-250") && rendered.contains("1/1 matches")
+        }),
+        "Enter did not jump to the match: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(terminal_read_calls(&scratch), 0, "search read a terminal");
+    assert_doc_untouched(&scratch, version, writes, "scrollback search");
+    assert_eq!(resize_frames(&scratch), resizes, "search resized a pane");
+
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("search:")),
+        "Esc did not close the search bar: {:?}",
+        screen.rendered()
+    );
+}
+
+/// A selection copied with `y` reaches the outer terminal as OSC 52, without
+/// padding. An empty selection never emits a clipboard sequence.
+#[cfg(unix)]
+fn workspace_copy_emits_osc52_and_empty_selection_copies_nothing() {
+    let scratch = Scratch::new("m6-copy");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-copy");
+    assert!(
+        wait_for_text(&screen, "hello"),
+        "the copy fixture did not paint: {:?}",
+        screen.rendered()
+    );
+
+    screen.command(b'[');
+    assert!(
+        wait_for_text(&screen, "selection:"),
+        "selection mode did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"hhhhh");
+    screen.send(b"y");
+    let expected = format!(
+        "\x1b]52;c;{}\x07",
+        herdr_terminal::clipboard::base64(b"hello")
+    );
+    assert!(
+        common::wait_until(secs(10), || screen.raw().contains(&expected)),
+        "the copy did not emit OSC 52 for \"hello\": {:?}",
+        screen.tail()
+    );
+    assert!(
+        wait_for_text(&screen, "copied 5 characters"),
+        "the copy did not report five characters: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(terminal_read_calls(&scratch), 0, "copy read a terminal");
+
+    // At the cursor, a fresh selection covers one blank cell: nothing to copy.
+    let sequences = screen.raw().matches("\x1b]52;c;").count();
+    screen.command(b'[');
+    screen.send(b"y");
+    assert!(
+        wait_for_text(&screen, "nothing selected"),
+        "the empty copy was not reported: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        screen.raw().matches("\x1b]52;c;").count(),
+        sequences,
+        "an empty selection emitted a clipboard sequence: {:?}",
+        screen.tail()
+    );
+}
+
+/// A paste is framed only when the focused program enabled bracketed paste,
+/// and an open overlay consumes it instead.
+#[cfg(unix)]
+fn workspace_paste_is_bracketed_and_overlays_consume_it() {
+    let scratch = Scratch::new("m6-paste");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-paste");
+    assert!(
+        wait_for_text(&screen, "PASTE-READY"),
+        "the paste fixture did not paint: {:?}",
+        screen.rendered()
+    );
+    let paste = "\x1b[200~hello paste\x1b[201~";
+    screen.send(paste.as_bytes());
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == paste)
+        }),
+        "the paste was not bracketed to the focused program: {:?}",
+        program_input(&scratch)
+    );
+    assert!(
+        screen.raw().contains("\x1b[?2004h"),
+        "the outer terminal was not put in bracketed-paste mode"
+    );
+
+    let after_paste = program_input(&scratch).len();
+    screen.command(b':');
+    assert!(
+        wait_for_text(&screen, "palette · Enter run · Esc close"),
+        "the palette did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"second paste");
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("palette ·")),
+        "the palette did not close: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"w");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch).iter().any(|(_, text)| text == "w")
+        }),
+        "the client stalled after the overlay paste: {:?}",
+        program_input(&scratch)
+    );
+    let extra: Vec<String> = program_input(&scratch)
+        .into_iter()
+        .skip(after_paste)
+        .map(|(_, text)| text)
+        .collect();
+    assert!(
+        extra.iter().all(|text| !text.contains("second paste")),
+        "a paste reached the program through an overlay: {extra:?}"
+    );
+}
+
+/// The inner bracketed-paste framing follows the focused program's DEC 2004
+/// mode: without it the text is forwarded unframed.
+#[cfg(unix)]
+fn workspace_paste_frames_only_when_the_program_enabled_it() {
+    let plain = Scratch::new("m6-paste-plain");
+    let mut screen = FakeScreen::spawn_workspace(&plain, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "the plain program did not paint: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\x1b[200~plain paste\x1b[201~");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&plain)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "plain paste")
+        }),
+        "the paste was not forwarded unframed: {:?}",
+        program_input(&plain)
+    );
+    assert!(
+        program_input(&plain)
+            .iter()
+            .all(|(_, text)| !text.contains("\x1b[200~")),
+        "a program without DEC 2004 received bracketed-paste framing: {:?}",
+        program_input(&plain)
+    );
+
+    let framed = Scratch::new("m6-paste-framed");
+    let mut screen = FakeScreen::spawn_workspace(&framed, "m6-paste");
+    assert!(
+        wait_for_text(&screen, "PASTE-READY"),
+        "the bracketed program did not paint: {:?}",
+        screen.rendered()
+    );
+    let expected = "\x1b[200~plain paste\x1b[201~";
+    screen.send(b"\x1b[200~plain paste\x1b[201~");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&framed)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == expected)
+        }),
+        "a program with DEC 2004 did not receive the framed paste: {:?}",
+        program_input(&framed)
+    );
+}
+
+/// Config is read before the UI starts: theme and rebound keys apply, and a
+/// malformed file warns on stderr while the UI still runs.
+#[cfg(unix)]
+fn workspace_config_sets_theme_and_keys_and_malformed_config_warns() {
+    let scratch = Scratch::new("m6-config");
+    scratch.seed_config(r#"{"theme":"light","keys":{"new_tab":"t"}}"#);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.raw().contains("38;2;30;102;245"),
+        "the light theme accent was not drawn in truecolor: {:?}",
+        screen.tail()
+    );
+    assert!(
+        screen.raw().contains("\x1b[?1006h"),
+        "mouse reporting was not enabled by default"
+    );
+    assert!(
+        !screen.errors().contains("warning"),
+        "a valid config warned: {:?}",
+        screen.errors()
+    );
+
+    screen.command(b't');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "the rebound new-tab key did not run: {:?}",
+        screen.rendered()
+    );
+    screen.command(b':');
+    assert!(
+        wait_for_text(&screen, "palette · Enter run · Esc close"),
+        "the palette did not open: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "^b t"),
+        "the palette did not show the configured key hint: {:?}",
+        screen.rendered()
+    );
+    screen.send(&[0x1b]);
+
+    let bad = Scratch::new("m6-config-bad");
+    bad.seed_config("{not json");
+    let screen = FakeScreen::spawn_workspace(&bad, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "a malformed config stopped the UI: stderr={:?} rendered={:?}",
+        screen.errors(),
+        screen.rendered()
+    );
+    assert!(
+        screen.errors().contains("ht: warning:") && screen.errors().contains("not valid JSON"),
+        "a malformed config was not reported: {:?}",
+        screen.errors()
+    );
+
+    // `mouse: false` keeps the outer terminal out of mouse reporting.
+    let no_mouse = Scratch::new("m6-config-no-mouse");
+    no_mouse.seed_config(r#"{"mouse":false}"#);
+    let screen = FakeScreen::spawn_workspace(&no_mouse, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "the workspace did not start with mouse off: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.raw().contains("\x1b[?1006h"),
+        "mouse off still asked the outer terminal for mouse events: {:?}",
+        screen.tail()
+    );
+}
+
+/// Four MiB of program output is consumed with credit and leaves the client
+/// responsive; the history is bounded rather than growing without limit.
+#[cfg(unix)]
+fn workspace_processes_a_large_output_burst() {
+    let scratch = Scratch::new("m6-large");
+    let started = std::time::Instant::now();
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-large");
+    assert!(
+        wait_for_text(&screen, "LARGE-END"),
+        "the large burst did not paint within the bound: {:?}",
+        screen.tail()
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < secs(15),
+        "4 MiB of output took {elapsed:?}, above the 15s bound"
+    );
+    assert!(
+        scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["frame"]["kind"] == json!(1)),
+        "the client never sent a credit frame: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        terminal_read_calls(&scratch),
+        0,
+        "the burst read a terminal"
+    );
+
+    // Still interactive after the burst.
+    screen.command(b':');
+    assert!(
+        wait_for_text(&screen, "palette · Enter run · Esc close"),
+        "the client was unresponsive after the burst: {:?}",
+        screen.rendered()
+    );
+}
+
 fn fake_connect() -> io::Result<()> {
     let scenario = std::env::var("FAKE_SCENARIO").unwrap_or_else(|_| "finished".into());
     let log_path = std::env::var_os("FAKE_LOG").map(PathBuf::from);
@@ -3168,10 +4412,14 @@ fn fake_connect() -> io::Result<()> {
     let mut flush_conflicts = 4u32;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
-        log(
-            log_path,
-            json!({"frame": {"channel": channel, "kind": kind, "len": payload.len()}}),
-        );
+        let mut frame = json!({"channel": channel, "kind": kind, "len": payload.len()});
+        // RESIZE carries exactly the two u16s the client asked for, so tests
+        // can assert the grid size after a drag without guessing.
+        if kind == 3 && payload.len() >= 4 {
+            frame["cols"] = json!(u16::from_le_bytes([payload[0], payload[1]]));
+            frame["rows"] = json!(u16::from_le_bytes([payload[2], payload[3]]));
+        }
+        log(log_path, json!({"frame": frame}));
 
         // The client closing its stream: forget the channel, so a later
         // attach is treated as a fresh paint.
@@ -3351,6 +4599,19 @@ fn fake_connect() -> io::Result<()> {
                     record("finished")
                 } else if scenario == "workspace-missed" && runs > 1 {
                     named_record("t2", name, 4444)
+                } else if scenario.starts_with("m6-") {
+                    // Interactive UI scenarios: every start gets its own
+                    // address so a click can be traced to one terminal.
+                    let address = match runs {
+                        1 => "t1",
+                        2 => "t2",
+                        _ => "t3",
+                    };
+                    let mut record = live_record(4300 + runs);
+                    record["address"] = json!(address);
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    record
                 } else if doc_scenario(&scenario) {
                     // A split's terminal, with the labels the client sent.
                     let address = if scenario.starts_with("doc-conflict") {
@@ -3428,6 +4689,12 @@ fn fake_connect() -> io::Result<()> {
                         && matches!(scenario.as_str(), "workspace-pending" | "workspace-missed");
                     let attached_record = if second_pane {
                         named_record("t2", pending_name.as_deref().unwrap_or("ht-0-2"), 5151)
+                    } else if scenario.starts_with("m6-") {
+                        // Interactive scenarios attach several panes; the
+                        // record must name the terminal that was attached.
+                        let mut record = live_record(4242);
+                        record["address"] = json!(target);
+                        record
                     } else if doc_scenario(&scenario)
                         && target == last_run_address
                         && target != "t1"
@@ -3604,6 +4871,58 @@ fn fake_connect() -> io::Result<()> {
                         }
                         "screen-detach" => {
                             write_frame(&mut output, channel, DATA, b"READY\n")?;
+                        }
+                        "m6-scroll" => {
+                            // Enough history to scroll and to search.
+                            let mut text = Vec::new();
+                            for index in 0..300 {
+                                text.extend_from_slice(format!("HIST-{index:03}\r\n").as_bytes());
+                            }
+                            text.extend_from_slice(b"LIVE-BOTTOM\r\n");
+                            // Leave the cursor three rows above the bottom, so
+                            // a three-line wheel scroll still has it inside
+                            // the viewport and only the live-bottom rule can
+                            // hide it.
+                            text.extend_from_slice(b"\x1b[3A");
+                            write_frame(&mut output, channel, DATA, &text)?;
+                        }
+                        "m6-large" => {
+                            // Four MiB of program output, ended by a marker.
+                            let line = b"0123456789abcdefghijklmnopqrstuvwxyz\r\n";
+                            let mut text = Vec::with_capacity(4 * 1024 * 1024 + 16);
+                            while text.len() < 4 * 1024 * 1024 {
+                                text.extend_from_slice(line);
+                            }
+                            text.extend_from_slice(b"LARGE-END\r\n");
+                            write_frame(&mut output, channel, DATA, &text)?;
+                        }
+                        "m6-mouse" => {
+                            // Any-event tracking with SGR coordinates.
+                            write_frame(
+                                &mut output,
+                                channel,
+                                DATA,
+                                b"\x1b[?1000h\x1b[?1002h\x1b[?1006hMOUSE-READY\n",
+                            )?;
+                        }
+                        "m6-paste" => {
+                            write_frame(&mut output, channel, DATA, b"\x1b[?2004hPASTE-READY\n")?;
+                        }
+                        "m6-kitty" => {
+                            // Push disambiguate + report-event-types, so the
+                            // program's key encoder emits press and release.
+                            write_frame(&mut output, channel, DATA, b"\x1b[>3uKITTY-READY\n")?;
+                        }
+                        "m6-copy" => {
+                            write_frame(&mut output, channel, DATA, b"hello")?;
+                        }
+                        "m6-multi" | "m6-palette" => {
+                            let text: &[u8] = match target.as_str() {
+                                "t2" => b"PANE-TWO\n",
+                                "t3" => b"PANE-THREE\n",
+                                _ => b"PANE-ONE\n",
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
                         }
                         "screen-lost-restarted" if first => {
                             write_frame(&mut output, channel, DATA, b"BEFORE\n")?;
@@ -4602,6 +5921,18 @@ impl Scratch {
 
     fn state(&self) -> PathBuf {
         self.dir.join("state")
+    }
+
+    fn config_root(&self) -> PathBuf {
+        self.dir.join("config")
+    }
+
+    /// Writes this client's config where XDG_CONFIG_HOME points.
+    #[cfg(unix)]
+    fn seed_config(&self, text: &str) {
+        let dir = self.config_root().join("herdr-terminal");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("config.json"), text).expect("seed config");
     }
 
     fn docs(&self) -> PathBuf {

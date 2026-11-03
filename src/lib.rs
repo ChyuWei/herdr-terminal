@@ -6,12 +6,15 @@
 //! M3 spaces/tabs/panes client. Both full-screen clients are built on [`vt`],
 //! [`session`] and ratatui.
 
+pub mod clipboard;
+pub mod config;
 pub mod core;
 pub mod model;
 pub mod probe;
 pub mod screen;
 pub mod session;
 pub mod term;
+pub mod theme;
 mod tui;
 pub mod vt;
 pub mod workspace;

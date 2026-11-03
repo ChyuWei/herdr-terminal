@@ -21,16 +21,19 @@ pub mod geometry;
 pub mod keys;
 mod local;
 pub mod model;
+pub mod palette;
 mod runtime;
 mod startup;
 pub mod state;
 mod sync;
 pub mod ui;
 
+use crate::config;
 use crate::core::Result;
 use crate::session;
+use crate::theme::{self, ColorDepth};
 use crate::tui::ScreenGuard;
-use runtime::{Finish, Screen};
+use runtime::{Finish, Screen, Settings};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default)]
@@ -49,9 +52,33 @@ pub fn run(options: Options) -> Result<i32> {
     crate::tui::require_tty()?;
     let size = crate::tui::viewport(options.cols, options.rows);
 
+    // Settings are startup-only: the file is read once, before the alternate
+    // screen so warnings are plain lines. A bad file never stops the UI.
+    let loaded = config::load();
+    let config = loaded.config;
+    let theme = theme::theme(config.theme, ColorDepth::detect());
+    let (keys, key_warnings) = keys::KeyMap::from_config(&config.keys);
+    let mut warnings = loaded.warnings;
+    warnings.extend(key_warnings);
+    for warning in &warnings {
+        eprintln!("ht: warning: {warning}");
+    }
+    let settings = Settings {
+        config,
+        theme,
+        keys,
+    };
+
     // Restore or claim the shared document before the alternate screen, so a
     // failure is a plain error message rather than a broken TUI.
     let mut opened = startup::open(&options)?;
+    if !warnings.is_empty() {
+        let text = warnings.join("; ");
+        opened.boot.notice = Some(match opened.boot.notice.take() {
+            Some(notice) => format!("{notice}; {text}"),
+            None => text,
+        });
+    }
     let claim = opened.claim.take();
     let mut guard = match ScreenGuard::enter() {
         Ok(guard) => guard,
@@ -67,7 +94,7 @@ pub fn run(options: Options) -> Result<i32> {
             return Err(error);
         }
     };
-    let screen = match Screen::new(size, &options, &mut guard, opened.boot) {
+    let screen = match Screen::new(size, &options, settings, &mut guard, opened.boot) {
         Ok(screen) => screen,
         Err(error) => {
             if let Some(claim) = claim
