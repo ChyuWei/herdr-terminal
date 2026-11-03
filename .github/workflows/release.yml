@@ -1,0 +1,137 @@
+# A release: push a tag v<version> matching Cargo.toml. This builds the macOS
+# Apple Silicon package, waits for the ci.yml push run on that commit, and
+# attaches the package to a GitHub Release; there is no R2 or other secret.
+#
+# Publishing requires BOTH `github.event_name == 'push'` and
+# `github.ref_type == 'tag'`. workflow_dispatch accepts a branch OR a tag as
+# its ref, so a manual run at a tag must still build/upload only the workflow
+# artifact: the `publish` job's condition is the only release path, and it
+# never runs for workflow_dispatch.
+#
+# The binary is unsigned. Ad-hoc signing can be added later; the package layout
+# and the release notes already say the download is unsigned.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  macos:
+    # Apple Silicon first. Add an x86_64-apple-darwin entry when Intel becomes
+    # a release target; scripts/package already accepts its Rust target.
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-macos-aarch64-zig${{ env.ZIG_VERSION }}
+          cache-bin: false
+      - name: Version matches the tag
+        # A manual dispatch may target a tag; it still builds only.
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          want="v$(scripts/package-version)"
+          [ "$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $want"; exit 1; }
+      - name: Build and package
+        run: scripts/package
+      - name: Check the package
+        run: |
+          archive=$(ls dist/herdr-terminal-*-macos-*.tar.gz)
+          mkdir -p /tmp/herdr-terminal-package
+          tar -xzf "$archive" -C /tmp/herdr-terminal-package
+          /tmp/herdr-terminal-package/herdr-terminal/ht --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: herdr-terminal-macos-aarch64
+          path: dist/herdr-terminal-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # A tag pushed straight to the repository does not wait for CI (only
+  # scripts/release-publish does). This job makes it wait: it follows the
+  # ci.yml push run for the tagged commit and refuses the release unless that
+  # run succeeded. It never runs for workflow_dispatch, which cannot publish.
+  ci-passed:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for ci on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while :; do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=1" \
+              --jq '.workflow_runs[0] | "\(.status) \(.conclusion) \(.id)"') || run="api error"
+            echo "ci for $GITHUB_SHA: $run"
+            case "$run" in
+              "completed success "*) exit 0 ;;
+              "completed cancelled "*) echo "cancelled by a newer push: rerun that ci run, this job keeps waiting" ;;
+              completed*) exit 1 ;;
+            esac
+            sleep 30
+          done
+
+  # The only job that can create or update a GitHub Release. It needs the
+  # tagged build and the CI gate, and its condition repeats both the push and
+  # tag requirements, so no manual dispatch can reach it.
+  publish:
+    needs: [macos, ci-passed]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create or update the GitHub Release
+      actions: read # download this run's artifact
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: herdr-terminal-macos-aarch64
+          path: dist
+      - name: Publish the GitHub Release
+        # The job condition already requires push+tag; repeat it on the only
+        # step that writes a Release so no second path can publish.
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job has no checkout, so gh cannot find a git remote. Name the
+          # repository explicitly for view, upload and create alike.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          archive=$(ls dist/herdr-terminal-*-macos-*.tar.gz)
+          version="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$archive" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$archive" \
+              --title "HerdR Terminal $version" \
+              --notes "macOS Apple Silicon package (unsigned). It does not include Herdr Core; install or update Herdr Core 0.1.17 or newer first."
+          fi

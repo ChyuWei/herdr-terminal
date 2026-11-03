@@ -26,7 +26,7 @@ mod common;
 
 use common::{Capture, HT, Probe, secs};
 #[cfg(unix)]
-use herdr_terminal::core::{Attached, CoreClient, Error, StreamItem};
+use herdr_terminal::core::{Attached, CoreClient, Error, Mismatch, StreamItem};
 
 const DATA: u8 = 0;
 const CLOSE: u8 = 2;
@@ -196,7 +196,9 @@ fn run_tests() {
     #[cfg(unix)]
     observer_attach_negotiates_resize_notifications_and_applies_them_in_order();
     #[cfg(unix)]
-    observer_attach_is_unavailable_without_the_feature_and_normal_attach_is_unchanged();
+    an_older_core_is_refused_at_connect();
+    #[cfg(unix)]
+    a_core_without_resize_notifications_is_refused_at_connect();
     #[cfg(unix)]
     observer_attach_requires_a_confirmed_reply_and_leaves_no_channel();
     #[cfg(unix)]
@@ -4516,7 +4518,7 @@ fn workspace_processes_a_large_output_burst() {
 /// The wrapper is a small shell script so the scenario reaches the child
 /// `hc connect` without touching this process's environment.
 #[cfg(unix)]
-fn observer_client(scratch: &Scratch, scenario: &str) -> CoreClient {
+fn observer_connect(scratch: &Scratch, scenario: &str) -> herdr_terminal::core::Result<CoreClient> {
     use std::os::unix::fs::PermissionsExt;
     let exe = std::env::current_exe().expect("test executable");
     let wrapper = scratch.dir.join("hc");
@@ -4528,7 +4530,12 @@ fn observer_client(scratch: &Scratch, scenario: &str) -> CoreClient {
     std::fs::write(&wrapper, script).expect("write hc wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
         .expect("make wrapper executable");
-    CoreClient::connect(Some(&wrapper)).expect("connect to the scripted core")
+    CoreClient::connect(Some(&wrapper))
+}
+
+#[cfg(unix)]
+fn observer_client(scratch: &Scratch, scenario: &str) -> CoreClient {
+    observer_connect(scratch, scenario).expect("connect to the scripted core")
 }
 
 #[cfg(unix)]
@@ -4661,53 +4668,46 @@ fn observer_attach_negotiates_resize_notifications_and_applies_them_in_order() {
     );
 }
 
-/// Without the feature there is no observer path, and a normal attach still
-/// carries no observer fields.
+/// A core older than the supported minimum is refused during `hello`, before
+/// any call, with a message that names the versions and the update path.
 #[cfg(unix)]
-fn observer_attach_is_unavailable_without_the_feature_and_normal_attach_is_unchanged() {
-    let scratch = Scratch::new("observe-missing");
-    let client = observer_client(&scratch, "observe-missing");
-    assert!(!client.hello().supports("resize_notifications"));
-    let Err(error) = client.attach_observer("t1", 80, 24, 0) else {
-        panic!("an observer attach needs the feature");
+fn an_older_core_is_refused_at_connect() {
+    let scratch = Scratch::new("old-core-version");
+    let Err(error) = observer_connect(&scratch, "old-core-version") else {
+        panic!("an older core must be refused");
     };
     assert!(
-        matches!(error, Error::Protocol(_)),
-        "clear protocol error, got {error:?}"
+        matches!(error, Error::Mismatch(Mismatch::VersionTooOld { .. })),
+        "clear version mismatch, got {error:?}"
     );
+    let message = error.to_string();
+    assert!(message.contains("0.1.16"), "{message}");
+    assert!(message.contains("0.1.17"), "{message}");
+    assert!(message.contains("hc update"), "{message}");
     assert!(
-        error.to_string().contains("resize_notifications"),
-        "the error names the missing feature: {error}"
+        !log_records(&scratch)
+            .iter()
+            .any(|record| record["call"].is_string()),
+        "no call follows the refused hello: {:?}",
+        log_records(&scratch)
     );
+}
+
+/// The required `resize_notifications` feature is checked at `hello` too:
+/// there is no normal-attach or `size`-event fallback.
+#[cfg(unix)]
+fn a_core_without_resize_notifications_is_refused_at_connect() {
+    let scratch = Scratch::new("old-core-feature");
+    let Err(error) = observer_connect(&scratch, "old-core-feature") else {
+        panic!("a core without the required feature must be refused");
+    };
+    let message = error.to_string();
+    assert!(message.contains("resize_notifications"), "{message}");
     assert!(
         !log_records(&scratch)
             .iter()
             .any(|record| record["call"] == "terminal.attach"),
         "the client must not attach as a normal viewer instead"
-    );
-
-    let attached = client
-        .attach("t1", 80, 24, 0)
-        .expect("a normal attach still works");
-    assert!(!attached.resize_notifications);
-    assert!(
-        matches!(next_item(&attached), StreamItem::Data(bytes) if bytes.as_slice() == b"NORMAL\n")
-    );
-    assert!(matches!(next_item(&attached), StreamItem::Closed(_)));
-
-    let records = log_records(&scratch);
-    let attach = records
-        .iter()
-        .find(|record| record["call"] == "terminal.attach")
-        .expect("terminal.attach was called");
-    let params = attach["params"].as_object().expect("params");
-    assert!(
-        !params.contains_key("observe"),
-        "normal attach params are unchanged: {params:?}"
-    );
-    assert!(
-        !params.contains_key("resize_notifications"),
-        "normal attach params are unchanged: {params:?}"
     );
 }
 
@@ -5043,14 +5043,20 @@ fn fake_connect() -> io::Result<()> {
     let hello: serde_json::Value =
         serde_json::from_str(line.trim()).map_err(|error| invalid(error.to_string()))?;
     assert_eq!(hello["method"], "hello");
-    let mut features = vec!["framed", "attach", "events"];
-    if scenario.starts_with("observe") && scenario != "observe-missing" {
-        // A relay path can lose support; an old core simply never had it.
-        features.push("resize_notifications");
+    let mut features = vec!["framed", "attach", "events", "resize_notifications"];
+    // Two scripted old cores: one predates the minimum version, one lacks the
+    // now-required resize feature. Everything else is a current core.
+    let version = if scenario == "old-core-version" {
+        "0.1.16"
+    } else {
+        "9.9.9-fake"
+    };
+    if scenario == "old-core-feature" {
+        features.retain(|feature| *feature != "resize_notifications");
     }
     let result = json!({
         "generation": 1,
-        "version": "9.9.9-fake",
+        "version": version,
         "core": {"id": "fake", "name": "fake"},
         "framed": true,
         "methods": [
@@ -5494,16 +5500,6 @@ fn fake_connect() -> io::Result<()> {
                         // registered before the frame arrives.
                         "observe-bad-resize" => {
                             write_frame(&mut output, channel, DATA, b"READY\n")?;
-                        }
-                        // A normal attach on a core without the feature.
-                        "observe-missing" => {
-                            write_frame(&mut output, channel, DATA, b"NORMAL\n")?;
-                            write_frame(
-                                &mut output,
-                                channel,
-                                CLOSE,
-                                br#"{"reason":"exited","exit_code":0}"#,
-                            )?;
                         }
                         // RESIZE on an attach stream, then output that wraps
                         // at the new grid. A viewer that ignores it would draw

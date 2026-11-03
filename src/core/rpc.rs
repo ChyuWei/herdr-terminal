@@ -17,10 +17,55 @@ pub const REQUIRED_METHODS: &[&str] = &[
     "doc.get",
     "doc.set",
 ];
-/// Features this client needs, as `hello` reports them.
-pub const REQUIRED_FEATURES: &[&str] = &["framed", "attach", "events"];
-/// The optional feature that lets an observer receive RESIZE before paints.
+/// The feature that lets an observer receive RESIZE before paints. Observer
+/// attach has no fallback, so this feature is required.
 pub const RESIZE_NOTIFICATIONS: &str = "resize_notifications";
+/// Features this client needs, as `hello` reports them. Observer attach is the
+/// only path and has no fallback, so `resize_notifications` is required.
+pub const REQUIRED_FEATURES: &[&str] = &["framed", "attach", "events", RESIZE_NOTIFICATIONS];
+
+/// The oldest Core this client works with.
+pub const MINIMUM_CORE: CoreVersion = CoreVersion {
+    major: 0,
+    minor: 1,
+    patch: 17,
+};
+
+/// A core version's numeric `major.minor.patch`. A trailing `-suffix` or
+/// `+build` is ignored; anything else that is not exactly three numbers is
+/// unreadable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CoreVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl CoreVersion {
+    pub fn parse(text: &str) -> Option<CoreVersion> {
+        let head = text.trim().split(['-', '+']).next()?;
+        let mut parts = head.split('.');
+        let version = CoreVersion {
+            major: number(parts.next()?)?,
+            minor: number(parts.next()?)?,
+            patch: number(parts.next()?)?,
+        };
+        parts.next().is_none().then_some(version)
+    }
+}
+
+fn number(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+impl fmt::Display for CoreVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct CoreInfo {
@@ -66,6 +111,21 @@ impl Hello {
                 want: GENERATION,
             });
         }
+        match CoreVersion::parse(&self.version) {
+            Some(have) if have >= MINIMUM_CORE => {}
+            Some(have) => {
+                return Err(Mismatch::VersionTooOld {
+                    have,
+                    want: MINIMUM_CORE,
+                });
+            }
+            None => {
+                return Err(Mismatch::VersionUnreadable {
+                    have: self.version.clone(),
+                    want: MINIMUM_CORE,
+                });
+            }
+        }
         let missing: Vec<String> = REQUIRED_METHODS
             .iter()
             .filter(|method| !self.methods.iter().any(|have| have == *method))
@@ -90,7 +150,18 @@ impl Hello {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mismatch {
     NotFramed,
-    Generation { have: u32, want: u32 },
+    Generation {
+        have: u32,
+        want: u32,
+    },
+    VersionTooOld {
+        have: CoreVersion,
+        want: CoreVersion,
+    },
+    VersionUnreadable {
+        have: String,
+        want: CoreVersion,
+    },
     MissingMethods(Vec<String>),
     MissingFeatures(Vec<String>),
 }
@@ -105,6 +176,16 @@ impl fmt::Display for Mismatch {
                     "core speaks protocol generation {have}; this client speaks generation {want}"
                 )
             }
+            Mismatch::VersionTooOld { have, want } => write!(
+                f,
+                "core {have} is older than the minimum supported {want}; update herdr-core \
+                 (for example with `hc update`)"
+            ),
+            Mismatch::VersionUnreadable { have, want } => write!(
+                f,
+                "core reported an unreadable version \"{have}\"; this client needs herdr-core \
+                 {want} or newer (update with `hc update`)"
+            ),
             Mismatch::MissingMethods(methods) => {
                 write!(f, "core lacks required methods: {}", methods.join(", "))
             }
@@ -291,7 +372,8 @@ pub struct AttachResult {
     #[serde(default)]
     pub terminal: Terminal,
     /// True only when an observer asked for resize notifications and the
-    /// whole path confirmed them. Absent or false means track `size` events.
+    /// whole path confirmed them. An observer whose reply is absent or false
+    /// is an error; there is no normal-attach fallback.
     #[serde(default)]
     pub resize_notifications: bool,
 }
@@ -333,7 +415,7 @@ mod tests {
     fn hello(generation: u32, framed: bool, methods: &[&str], features: &[&str]) -> Hello {
         Hello {
             generation,
-            version: "0.1.16".into(),
+            version: "0.1.17".into(),
             framed,
             methods: methods.iter().map(|m| (*m).to_owned()).collect(),
             features: features.iter().map(|f| (*f).to_owned()).collect(),
@@ -345,20 +427,117 @@ mod tests {
         hello(GENERATION, true, REQUIRED_METHODS, REQUIRED_FEATURES)
     }
 
+    fn at_version(version: &str) -> Hello {
+        Hello {
+            version: version.into(),
+            ..full()
+        }
+    }
+
     #[test]
     fn optional_features_are_read_from_hello_not_from_a_version() {
         let bare = full();
         assert!(bare.supports("framed"));
-        assert!(!bare.supports(RESIZE_NOTIFICATIONS));
+        assert!(bare.supports(RESIZE_NOTIFICATIONS));
+        assert!(!bare.supports("automatic_input"));
 
         let supporting = hello(
             GENERATION,
             true,
             REQUIRED_METHODS,
-            &["framed", "attach", "events", RESIZE_NOTIFICATIONS],
+            &[
+                "framed",
+                "attach",
+                "events",
+                RESIZE_NOTIFICATIONS,
+                "automatic_input",
+            ],
         );
-        assert!(supporting.supports(RESIZE_NOTIFICATIONS));
+        assert!(supporting.supports("automatic_input"));
         assert_eq!(supporting.check(), Ok(()));
+    }
+
+    #[test]
+    fn the_minimum_core_version_is_enforced() {
+        for version in [
+            "0.1.17",
+            "0.1.17-9",
+            "0.1.17+build.2",
+            "0.1.17-rc.1+any",
+            " 0.1.17 ",
+            "0.1.18",
+            "0.2.0",
+            "1.0.0",
+        ] {
+            assert_eq!(at_version(version).check(), Ok(()), "{version:?}");
+        }
+
+        assert_eq!(
+            at_version("0.1.16").check(),
+            Err(Mismatch::VersionTooOld {
+                have: CoreVersion {
+                    major: 0,
+                    minor: 1,
+                    patch: 16
+                },
+                want: MINIMUM_CORE,
+            })
+        );
+        assert_eq!(
+            at_version("0.0.99").check(),
+            Err(Mismatch::VersionTooOld {
+                have: CoreVersion {
+                    major: 0,
+                    minor: 0,
+                    patch: 99
+                },
+                want: MINIMUM_CORE,
+            })
+        );
+        for version in ["", "dev", "0.1", "0.1.x", "0.1.17.1", "v0.1.17", "0.1.17x"] {
+            assert!(
+                matches!(
+                    at_version(version).check(),
+                    Err(Mismatch::VersionUnreadable { .. })
+                ),
+                "{version:?} must be unreadable"
+            );
+        }
+
+        let message = at_version("0.1.16").check().unwrap_err().to_string();
+        assert!(message.contains("0.1.16"), "{message}");
+        assert!(message.contains("0.1.17"), "{message}");
+        assert!(message.contains("hc update"), "{message}");
+
+        let message = at_version("").check().unwrap_err().to_string();
+        assert!(message.contains("unreadable"), "{message}");
+        assert!(message.contains("0.1.17"), "{message}");
+    }
+
+    #[test]
+    fn a_version_is_three_numeric_parts_with_an_ignored_suffix() {
+        let version = |major, minor, patch| CoreVersion {
+            major,
+            minor,
+            patch,
+        };
+        assert_eq!(CoreVersion::parse("0.1.17"), Some(version(0, 1, 17)));
+        assert_eq!(
+            CoreVersion::parse("12.34.56-rc.1"),
+            Some(version(12, 34, 56))
+        );
+        assert_eq!(
+            CoreVersion::parse("12.34.56+deadbeef"),
+            Some(version(12, 34, 56))
+        );
+        assert_eq!(CoreVersion::parse(" 12.34.56 "), Some(version(12, 34, 56)));
+        for bad in [
+            "", " ", "dev", "0", "0.1", "0.1.x", "0.1.17.1", "-1.2.3", "1.2.3. ", "0.1.17 x",
+        ] {
+            assert_eq!(CoreVersion::parse(bad), None, "{bad:?}");
+        }
+        assert!(version(0, 1, 17) < version(0, 1, 18));
+        assert!(version(0, 2, 0) > version(0, 1, 99));
     }
 
     #[test]
@@ -412,6 +591,6 @@ mod tests {
         let Err(Mismatch::MissingFeatures(features)) = missing.check() else {
             panic!("missing feature not detected")
         };
-        assert_eq!(features, ["events"]);
+        assert_eq!(features, ["events", RESIZE_NOTIFICATIONS]);
     }
 }

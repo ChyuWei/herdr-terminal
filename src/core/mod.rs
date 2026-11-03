@@ -11,8 +11,8 @@ pub use connection::{Attached, CoreClient, LABEL_TIMEOUT, RunOptions, StreamItem
 pub use events::{EventKind, EventStream, LineBuffer, Notification, parse_notification};
 pub use frames::{Frame, FrameDecoder, FrameError, Kind};
 pub use rpc::{
-    AttachResult, CoreInfo, Display, DocGetResult, DocSetResult, Foreground, Hello, Mismatch,
-    ReadResult, RpcError, Snapshot, Status, Terminal,
+    AttachResult, CoreInfo, CoreVersion, Display, DocGetResult, DocSetResult, Foreground, Hello,
+    MINIMUM_CORE, Mismatch, ReadResult, RpcError, Snapshot, Status, Terminal,
 };
 
 use std::fmt;
