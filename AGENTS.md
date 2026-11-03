@@ -59,6 +59,14 @@ records, raw output, attach, events, status, documents and machines.
   program that reads its size once starts with the right layout. Use the exact
   grid the terminal will attach at, not a guess, and omit the field when it is
   unknown. Older cores ignore it; do not add a version gate.
+- **Observer attaches are read-only.** `terminal.attach` takes `observe` and
+  `resize_notifications`; request them only when `hello.features` advertises
+  `resize_notifications` (no version gate), and require the reply to confirm.
+  An observer applies each RESIZE before the DATA that follows it and pays no
+  credit for it; it sends no keys, mouse reports, RESIZE, FOCUS or FACTS. If
+  the feature or confirmation is absent, fail clearly; never fall back to a
+  normal attach, which would take over the grid. Normal attaches are unchanged.
+  This is attach-layer plumbing for a future peek; no peek UI uses it yet.
 - **Reconnect semantics.** A dropped connection is not a dead program. On
   `missed`, resnapshot; on `lost`/`restarted`, reattach; on `finished`, drop
   the stream. Never assume the program died.
@@ -82,8 +90,8 @@ records, raw output, attach, events, status, documents and machines.
 
 The Cargo workspace builds and tests. The suites cover the protocol, VT,
 single-pane lifecycle, workspace, persistence, agents, the daily-driver input
-layer (mouse, scrollback/search, clipboard, palette, config and themes), and
-grapheme width and initial terminal size.
+layer (mouse, scrollback/search, clipboard, palette, config and themes),
+grapheme width, initial terminal size, and observer attach/resize ordering.
 
 ```sh
 cargo build --locked

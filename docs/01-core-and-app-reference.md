@@ -49,7 +49,7 @@ Framed frame: `[channel u32 LE][kind u8][len u32 LE][payload]`.
 | 0 | DATA | Channel 0: one JSON-RPC message; other channels: terminal stream bytes |
 | 1 | CREDIT | Bytes the receiver consumed |
 | 2 | CLOSE | Channel ended; from core, a JSON reason |
-| 3 | RESIZE | Viewer → core: `u16 cols, u16 rows` |
+| 3 | RESIZE | Viewer → core, or core → observer: `u16 cols, u16 rows` |
 | 4 | FOCUS | Viewer → core: 1 gained, 0 lost |
 | 5 | FACTS | Viewer → core: JSON display facts (`fg`, `bg`, `cursor`, `cell`) |
 
@@ -60,9 +60,11 @@ Framed frame: `[channel u32 LE][kind u8][len u32 LE][payload]`.
 1. the **first paint** (current screen, optional history, latest status report and title, and the win32-input-mode state);
 2. the program's raw output, minus queries core already answered.
 
-The viewer sends keys as DATA, plus RESIZE, FOCUS and FACTS as they change. Core never encodes keys. A stream starts with 256 KiB of credit; a viewer more than 4 MiB behind gets a fresh repaint. The last active viewer sets the terminal size.
+A normal viewer sends keys as DATA, plus RESIZE, FOCUS and FACTS as they change. Core never encodes keys. A stream starts with 256 KiB of credit; a viewer more than 4 MiB behind gets a fresh repaint. The last active normal viewer sets the terminal size.
 
 `terminal.run` also accepts an optional `size: {cols, rows}`. A core that supports it starts the program at that grid before any viewer attaches; a core that predates the field ignores it and uses its configured default. A client should send the grid the terminal will attach at when it knows it, and omit the field otherwise. This lets a program that reads its terminal size once at startup draw its first frame at the right size; the size still changes when a viewer attaches and sends RESIZE.
+
+`terminal.attach` also accepts `observe: true` and `resize_notifications: true`. A client should request them only when `hello.features` advertises `resize_notifications`; no version string is needed. The attach reply must confirm `resize_notifications`; a client should refuse the stream rather than fall back to a normal viewer attach, which would take over the terminal size. An observer is read-only: it sends no keys, mouse reports, RESIZE, FOCUS or FACTS. Core sends it a RESIZE frame (kind 3, four little-endian bytes: `cols`, then `rows`) before each paint that uses a new grid, including the first paint and later replacements; apply it to the local VT before the following DATA. RESIZE is not terminal data and pays no stream credit. Normal attaches are unchanged. A core without the feature does not support observer attach; normal attaches on such a core still learn about size changes from the `size` event.
 
 ### 2.4 Events
 

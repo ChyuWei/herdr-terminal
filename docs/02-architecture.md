@@ -323,6 +323,20 @@ Older cores ignore the unknown field; no version gate is used. This matters
 because a program that reads its size once at startup, before a viewer
 attaches, would otherwise draw its first frame at core's default size.
 
+**Observer attach**
+
+The client library can attach a terminal as a read-only observer for a future
+peek view; no peek UI uses it yet. `terminal.attach` takes `observe` and
+`resize_notifications`; the client requests them only when `hello.features`
+advertises `resize_notifications`, and no Core version string is consulted. The
+reply must confirm the feature, or the client abandons the channel and fails
+instead of falling back to a normal attach that would take over the grid. A
+confirmed observer receives RESIZE (kind 3, four little-endian bytes) before
+each paint that uses a new grid, applies it to the local VT before the following
+DATA, and pays no stream credit for it. It sends no keys, mouse reports, RESIZE,
+FOCUS or FACTS. Normal attaches are unchanged; on a core without the feature,
+normal attaches still use the `size` event.
+
 **Reconnect**
 
 - A dropped connection does **not** mean the programs died.
@@ -480,6 +494,11 @@ currently implements.
   emoji form one cluster two cells wide, followed by a zero-width spacer cell,
   and RIS keeps it on. Every spawn path sends the optional `terminal.run` size
   when the attach grid is known; older cores ignore the field and still work.
+- **Observer attach (foundation):** the library can attach a read-only
+  observer when the core advertises and confirms resize notifications; it
+  applies RESIZE before the following DATA, pays no credit for it, and sends no
+  input or control frames. No peek UI uses it yet; normal attaches are
+  unchanged.
 - **Mouse and history:** clicks focus panes and select tabs, split gaps drag,
   and chrome never reaches a program. Programs that track the mouse receive
   pane-local events; otherwise the wheel scrolls local history, requested
