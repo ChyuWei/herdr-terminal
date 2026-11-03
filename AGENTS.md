@@ -9,13 +9,15 @@ If `AGENTS.local.md` exists, read it too: the maintainer's local rules.
 **Status: implemented, unreleased.** The client implements the core connection,
 local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
 `herdr-terminal` document with restore and multi-screen sync, agent awareness
-(status, sidebar, local-VT peek, seen/pin, alerts), and the daily-driver input surface:
-mouse routing and split drags, bounded local scrollback with search, selection
-with OSC 52/native copy and bracketed paste, the command palette, and startup
-settings with default/dark/light themes. The local VT enables grapheme clustering
-as Core does, and new terminals start at the grid they will attach at. Settings
-are read at startup only: there is no settings UI or live reload. The tests
-exist and pass. Machines, files, install scripts and accessibility remain planned.
+(status, sidebar, local-VT peek, seen/pin, alerts), the Core-wide terminal
+manager (`prefix t`; Show/Hide and a read-only Preview), and the daily-driver input
+surface: mouse routing and split drags, bounded local scrollback with search,
+selection with OSC 52/native copy and bracketed paste, the command palette,
+and startup settings with default/dark/light themes. The local VT enables
+grapheme clustering as Core does, and new terminals start at the grid they
+will attach at. Settings are read at startup only: there is no settings UI or
+live reload. The tests exist and pass. Machines, files, install scripts and
+accessibility remain planned.
 The design intent is in the
 [core reference](docs/01-core-and-app-reference.md) and the
 [architecture](docs/02-architecture.md). Read both before proposing code; do
@@ -71,8 +73,28 @@ records, raw output, attach, events, status, documents and machines.
   An observer applies each RESIZE before the DATA that follows it and pays no
   credit for it; it sends no keys, mouse reports, RESIZE, FOCUS or FACTS. If
   confirmation is absent, fail clearly; never fall back to a normal attach,
-  which would take over the grid. Normal attaches are unchanged.
-  This is attach-layer plumbing for a future peek; no peek UI uses it yet.
+  which would take over the grid. Normal attaches are unchanged. The terminal
+  manager's Preview uses observer attach; the local-VT agent peek is a
+  different feature.
+- **Terminal manager inventory is the event model.** The Core-wide manager
+  (`prefix t`) lists every live terminal from the `events.subscribe` model,
+  including terminals that are not in this workspace. Never call
+  `terminal.read`, never build the inventory from screen text, and never infer
+  status. Show adopts the existing address (`owned=false`, no `terminal.run`,
+  no spawn or respawn); a shown address focuses instead of adding a second
+  pane. Hide detaches the stream and removes the pane, never `terminal.kill` or
+  `terminal.rm`. Preview is an observer attach only: read-only, no keys,
+  mouse, RESIZE, FOCUS or FACTS, and no workspace or document write. Selection,
+  filter and scroll are `UiState`, not the document or the per-screen view.
+- **Hide clears only this screen's labels.** Hide always removes the pane from
+  the shared layout, but it clears the four identity labels only when the
+  terminal carries this client's `herdr.client` value and its pane label is in
+  this screen's id namespace. Another `ht` screen's labels stay so that screen
+  can recover the terminal; a later label-based recovery may re-add it, so
+  Hide is durable across restarts only for terminals this screen created.
+  Durable cross-screen hide needs a shared-document marker, which this feature
+  does not have. A manager-shown pane restores by address as unowned: `x`/`e`
+  detach, `X` kills.
 - **Reconnect semantics.** A dropped connection is not a dead program. On
   `missed`, resnapshot; on `lost`/`restarted`, reattach; on `finished`, drop
   the stream. Never assume the program died.
@@ -97,7 +119,8 @@ records, raw output, attach, events, status, documents and machines.
 The Cargo workspace builds and tests. The suites cover the protocol, VT,
 single-pane lifecycle, workspace, persistence, agents, the daily-driver input
 layer (mouse, scrollback/search, clipboard, palette, config and themes),
-grapheme width, initial terminal size, and observer attach/resize ordering.
+grapheme width, initial terminal size, the terminal manager, and observer
+attach/resize ordering.
 
 ```sh
 cargo build --locked
@@ -152,7 +175,8 @@ src/
     commands.rs, keys.rs # command table and bindings
     palette.rs          # pure palette entries and filtering
     agents.rs           # pure agent facts, ordering, alerts
-    runtime/            # event loop, attach, input, mouse, overlays, reconnect, agents
+    manager.rs          # pure Core-wide inventory, sort/filter, labels
+    runtime/            # event loop, attach, input, mouse, overlays, reconnect, agents, manager
     ui.rs               # ratatui composition
     startup.rs          # document claim and restore
     local.rs, state.rs  # local view and UI state

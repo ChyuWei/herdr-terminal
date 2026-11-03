@@ -19,7 +19,8 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 - **Text rendering:** Grapheme clustering is on by default, matching Core and Herdr App, so variation-selector emoji such as `✍️` and `❤️` form one cluster two cells wide, followed by a zero-width spacer cell, instead of splitting across cells.
 - **Terminal sizing:** New terminals are spawned with the grid they will attach at — the initial shell, splits/tabs/spaces, explicit programs, `ht screen`, reconnect replacements and `ht probe` — so a program that reads its size once starts with the right layout. Every supported Core applies it, so no version gate is needed.
 - **Workspace:** Create spaces, tabs and panes; split/close/move; focus, zoom; rename tabs and spaces.
-- **Terminal management:** Labels, keep, kill/rm, shell or command.
+- **Terminal operations:** Labels, keep, kill/rm, shell or command.
+- **Terminal manager:** `prefix t` opens a Core-wide list of every live terminal, with a marker for panes shown here, its OSC 7501 status (or `unknown`), age, address, and optional name/title/parent/machine/cwd; rows sort blocked/error first, then working, done, idle and unknown, and filter by case-insensitive substring. `Enter` shows a hidden terminal by adopting its existing address (no new program) or hides a shown one by detaching and removing the pane (never kill/rm); `p` previews it read-only through an observer attach, separate from the agent peek. Selection and filter are local UI state.
 - **Agents:** Status, turn, title, foreground, agent sidebar, local-VT peek, jump, seen/pinned, blocked/finished alerts.
 - **State:** Own `herdr-terminal` document, restore, multi-screen sync; rediscover terminals by labels.
 - **Recovery:** Detach keeps programs running; reconnect, reattach, and resnapshot after a missed event.

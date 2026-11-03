@@ -62,7 +62,7 @@ Rules:
 - **Core never sends draw commands.** The TUI runs its own VT and composes its own cells.
 - **Status is only OSC 7501.** No screen scraping, no agent registry, no vendor logic.
 - **A client owns its document and label namespace.** Do not read another client's private state as yours.
-- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar flag stay in the per-screen view; scrollback, search, selection and theme stay in memory.
+- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar flag stay in the per-screen view; scrollback, search, selection, theme and terminal-manager state stay in memory.
 - **Feature-gate on `hello`.** Check generation, version, methods and features; generation 1 only grows.
 
 ## 4. Architecture
@@ -87,7 +87,7 @@ Start with threads and channels; introduce an async runtime only if a measured n
 | `model` | Pure event and terminal model shared by the screen and workspace |
 | `screen` | Single-pane lifecycle, attach playback, pointer and view |
 | `vt` | libghostty-vt binding: cells and grapheme clusters, keys, mouse, scrollback, search, selection |
-| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect and agent handling |
+| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, terminal manager, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect, manager and agent handling |
 | `workspace::state`, `workspace::local` | Runtime UI state and per-screen view |
 | `config` | Startup settings: theme, scrollback, mouse, clipboard, prefix keys |
 | `theme` | Chrome colors, default/dark/light, 16/256/truecolor mapping |
@@ -128,9 +128,9 @@ placement, selection and search consistent with Core.
 **Mouse precedence**, in order:
 
 1. An in-progress split resize or selection drag owns every mouse event.
-2. An open overlay (help, prompt, palette, search, peek, sidebar) consumes
-   every mouse event. A selection is not in that list: a fresh press leaves
-   selection and is routed as if none existed.
+2. An open overlay (help, prompt, palette, search, manager, preview, peek,
+   sidebar) consumes every mouse event. A selection is not in that list: a
+   fresh press leaves selection and is routed as if none existed.
 3. Chrome: a tab-bar click selects a tab, a status-bar click is consumed, and
    a split-gap press starts a resize. Chrome never reaches a program.
 4. A pane-grid press focuses the pane; a border press only focuses it. With
@@ -229,10 +229,14 @@ snapshot is still restored. A pane whose terminal is confirmed gone is pruned
 from the document; the tab stays. A deleted document is rebuilt from the
 labels of live terminals at its retained version instead of being replaced by
 a new shell. An explicitly given PROGRAM starts in a new tab (or the empty
-tab), not in place of a restored pane. Restored and
-recovered panes are workspace-owned for close semantics (`x` ends a non-kept
-program, `e` detaches, `X` kills), while their `Session` is adopted so a local
-startup or fatal error never kills a program this process did not start.
+tab), not in place of a restored pane. Restored and recovered panes that carry
+this client's label and match their own pane label are workspace-owned for
+close semantics (`x` ends a non-kept program, `e` detaches, `X` kills), while
+their `Session` is adopted so a local startup or fatal error never kills a
+program this process did not start. A manager-shown pane is matched by the
+document's address and restored unowned: it is a viewer for that program, so
+`x`/`e` detach and `X` kills. A missing or stale pane label never grants
+ownership.
 
 ### 4.6 Agents, attention and the sidebar
 
@@ -287,7 +291,51 @@ terminals start with `herdr.seen=0`. These labels are deliberately excluded
 from document capture and from restore's repair comparison: seen/pin changes
 must never dirty the layout document.
 
-### 4.7 Core client and lifecycle
+### 4.7 Terminal manager and preview
+
+**Manager** (`prefix t`; palette "terminal manager", action `terminals`) is a
+modal overlay. It lists every live terminal in the connected Core from the
+existing `events.subscribe` model, including terminals that are not in this
+workspace; it never calls `terminal.read` and never reads screen text. A row
+shows `*` when the terminal is shown here, its OSC 7501 word (`unknown` when
+the program never reported), age and address, then name, title, parent,
+machine and cwd when present. Rows sort blocked/error, working, done, idle,
+unknown, then oldest first and address. `j`/`k` or the arrows move, `g`/`G` go
+to the first/last row, `/` edits the filter, and Esc closes; the filter is a
+case-insensitive substring of the facts the row shows. At narrow widths a row
+keeps the marker, status word and address, then adds name and the other facts
+only while they fit; it shortens the address with `…` rather than wrapping.
+Selection, filter and scroll offset live in `UiState`; they are not persisted
+in the shared document or the per-screen view.
+
+`Enter` toggles the selected terminal. Showing a hidden terminal inserts a pane
+that adopts the existing address (`owned = false`) and attaches to the program
+already running; it never calls `terminal.run` and never spawns or respawns. A
+terminal already shown is focused instead of adding a second pane. Hiding
+detaches the pane's stream and removes the pane from the layout; it never sends
+`terminal.kill` or `terminal.rm`, so the program keeps running and can be shown
+again by address.
+
+**Preview** (`p`) attaches the selected terminal as a read-only observer,
+renders it through a local VT, applies each RESIZE before the DATA that follows
+it, and sends no keys, mouse reports, RESIZE, FOCUS or FACTS. It does not
+change the workspace or the document. Any key or Esc closes it, and no key
+reaches the manager or the program. The local-VT agent peek is a separate
+feature and is unchanged.
+
+**Hide labels and ownership.** Hide always removes the pane from the shared
+layout. It clears the four identity labels (`herdr.client`,
+`herdr.terminal.space`, `herdr.terminal.tab`, `herdr.terminal.pane`) only when
+the terminal carries this client's `herdr.client` value and its pane label is
+in this screen's id namespace. Labels written by another `ht` screen are left
+for that screen's recovery, so Hide is durable across restarts only for
+terminals this screen created; a later label-based recovery may re-add a
+terminal whose labels were not cleared. Durable cross-screen hide would need a
+shared-document marker, which this feature does not have. A manager-shown pane
+is captured in the document and restored by address as unowned: it is a
+viewer, so `x`/`e` detach and `X` kills.
+
+### 4.8 Core client and lifecycle
 
 **Supported Core**
 
@@ -344,16 +392,16 @@ attaches, would otherwise draw its first frame at core's default size.
 
 **Observer attach**
 
-The client library can attach a terminal as a read-only observer for a future
-peek view; no peek UI uses it yet. `terminal.attach` takes `observe` and
-`resize_notifications`; the connection requires the feature, so the client
-requests both unconditionally and consults no Core version string. The reply
-must confirm the feature, or the client abandons the channel and fails instead
-of falling back to a normal attach that would take over the grid. A confirmed
-observer receives RESIZE (kind 3, four little-endian bytes) before each paint
-that uses a new grid, applies it to the local VT before the following DATA, and
-pays no stream credit for it. It sends no keys, mouse reports, RESIZE, FOCUS or
-FACTS. Normal attaches are unchanged.
+The terminal manager's Preview attaches a terminal as a read-only observer; the
+local-VT agent peek is a different feature and does not use this path.
+`terminal.attach` takes `observe` and `resize_notifications`; the connection
+requires the feature, so the client requests both unconditionally and consults
+no Core version string. The reply must confirm the feature, or the client
+abandons the channel and fails instead of falling back to a normal attach that
+would take over the grid. A confirmed observer receives RESIZE (kind 3, four
+little-endian bytes) before each paint that uses a new grid, applies it to the
+local VT before the following DATA, and pays no stream credit for it. It sends
+no keys, mouse reports, RESIZE, FOCUS or FACTS. Normal attaches are unchanged.
 
 **Reconnect**
 
@@ -368,7 +416,7 @@ FACTS. Normal attaches are unchanged.
   same bounded conflict/merge budget as a normal write, and save the local
   view; do not stop core unless the user explicitly asks.
 
-### 4.8 Scrollback, search, palette, settings and themes
+### 4.9 Scrollback, search, palette, settings and themes
 
 **Scrollback** is Ghostty's own bounded history per pane. Attach asks core for
 history above the screen, so output printed before a screen attached is
@@ -433,6 +481,7 @@ Statuses:
 | Connection | Core discovery, long-lived framed connection, `hello` check, reconnect |
 | Terminals | Run, attach, render, keys, mouse wheel/click, resize, focus, FACTS |
 | Workspace | Spaces, tabs, panes, split/close/move, focus, zoom |
+| Terminal manager | Core-wide live-terminal inventory, Show/Hide, read-only Preview |
 | Terminals | New/close/rename, labels, keep, kill/rm, shell/command |
 | Agents | Status, turn, title, foreground, list/sidebar, peek, seen/pinned |
 | UI | Tab bar, pane borders, status bar, command palette, help, toast/confirm/prompt |
@@ -500,6 +549,11 @@ currently implements.
   display facts, credit-based flow control, and the attach lifecycle (`lost`,
   `restarted`, `finished`, reattach).
 - **Workspace:** spaces, tabs, panes, split/close/move, focus and zoom.
+- **Terminal manager:** a Core-wide modal inventory of every live terminal
+  from the event model, with a shown marker, status word, age and optional
+  facts; status sort and substring filter; Show adopts an existing address and
+  Hide detaches without kill/rm; a read-only observer Preview; selection and
+  filter live in `UiState`.
 - **Persistence:** the `herdr-terminal` document, restore, multi-screen
   compare-and-set, and terminal rediscovery by labels.
 - **Agents:** status, turn, title and foreground from core; the agent
@@ -515,11 +569,11 @@ currently implements.
   and RIS keeps it on. Every spawn path sends the optional `terminal.run` size
   when the attach grid is known; the minimum supported Core applies it, so no
   version gate is needed.
-- **Observer attach (foundation):** the connection requires
-  `resize_notifications`, and the attach reply must confirm it; the library can
-  then attach a read-only observer. It applies RESIZE before the following
-  DATA, pays no credit for it, and sends no input or control frames. No peek UI
-  uses it yet; normal attaches are unchanged.
+- **Observer attach:** the connection requires `resize_notifications`, and the
+  attach reply must confirm it; the terminal manager's Preview then attaches a
+  read-only observer. It applies RESIZE before the following DATA, pays no
+  credit for it, and sends no input or control frames. Normal attaches are
+  unchanged.
 - **Mouse and history:** clicks focus panes and select tabs, split gaps drag,
   and chrome never reaches a program. Programs that track the mouse receive
   pane-local events; otherwise the wheel scrolls local history, requested
@@ -543,13 +597,14 @@ currently implements.
 The implemented set covers the connection and terminal foundation, the
 workspace and its persistence, agent awareness, the daily-driver input layer
 (mouse, history, search, selection, clipboard, palette, settings and themes),
-the local VT's grapheme clustering, initial terminal sizes and the
-observer-attach foundation. Packaging, notices, CI and versioning are also
-implemented; the package is macOS Apple Silicon. Still planned: tab reorder,
-custom layouts, accessibility, general confirm/toast prompts, machines, files,
-install scripts, `ht status` and mods. Scrollback, search, selection and theme
-stay in memory and are never written to the shared document or the per-screen
-view. Settings are read at startup; there is no settings UI and no live reload.
+the local VT's grapheme clustering, initial terminal sizes, the Core-wide
+terminal manager and its read-only Preview. Packaging, notices, CI and
+versioning are also implemented; the package is macOS Apple Silicon. Still
+planned: tab reorder, custom layouts, accessibility, general confirm/toast
+prompts, machines, files, install scripts, `ht status` and mods. Scrollback,
+search, selection, theme and terminal-manager state stay in memory and are
+never written to the shared document or the per-screen view. Settings are read
+at startup; there is no settings UI and no live reload.
 
 The implementation is unreleased: the macOS package and CI exist, but no
 version has been tagged yet. See §3 for the boundary rules, §7 for conventions,
