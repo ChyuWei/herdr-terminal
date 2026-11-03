@@ -71,6 +71,10 @@ pub struct RunOptions {
     pub keep: bool,
     /// Do not let an ambient terminal become its parent.
     pub no_parent: bool,
+    /// The grid the terminal should start at, when the caller knows the size
+    /// it will attach with. Older cores ignore the field; a core that applies
+    /// it starts the program at this size before the first attach.
+    pub size: Option<(u16, u16)>,
 }
 
 impl Default for RunOptions {
@@ -83,6 +87,7 @@ impl Default for RunOptions {
             rm: false,
             keep: false,
             no_parent: true,
+            size: None,
         }
     }
 }
@@ -99,6 +104,27 @@ pub fn client_env() -> BTreeMap<String, String> {
 /// Labels that let this client find its own terminals again.
 pub fn client_labels() -> BTreeMap<String, String> {
     BTreeMap::from([("herdr.client".to_owned(), "herdr-terminal".to_owned())])
+}
+
+/// The `terminal.run` params. `size` is included only when the caller knows
+/// the grid the terminal will attach at; cores that predate the field ignore
+/// it, and a core that applies it starts the program at that size.
+fn run_params(options: &RunOptions) -> Value {
+    let mut params = json!({
+        "argv": &options.argv,
+        "env": &options.env,
+        "labels": &options.labels,
+        "rm": options.rm,
+        "keep": options.keep,
+        "no_parent": options.no_parent,
+    });
+    if let Some(name) = &options.name {
+        params["name"] = json!(name);
+    }
+    if let Some((cols, rows)) = options.size {
+        params["size"] = json!({"cols": cols, "rows": rows});
+    }
+    params
 }
 
 /// One framed connection to core.
@@ -319,18 +345,7 @@ impl CoreClient {
 
     /// Starts a program in a new core terminal.
     pub fn run(&self, options: &RunOptions) -> Result<Terminal> {
-        let mut params = json!({
-            "argv": &options.argv,
-            "env": &options.env,
-            "labels": &options.labels,
-            "rm": options.rm,
-            "keep": options.keep,
-            "no_parent": options.no_parent,
-        });
-        if let Some(name) = &options.name {
-            params["name"] = json!(name);
-        }
-        let value = self.call("terminal.run", params)?;
+        let value = self.call("terminal.run", run_params(options))?;
         let terminal: Terminal = serde_json::from_value(value.clone())?;
         if terminal.address.is_empty() {
             return Err(Error::Protocol(format!(
@@ -763,6 +778,17 @@ mod tests {
             close_reason(b"not json"),
             None,
             "a broken reason does not end the world"
+        );
+    }
+
+    #[test]
+    fn run_params_carry_the_initial_size_only_when_it_is_known() {
+        let mut options = RunOptions::default();
+        assert!(run_params(&options).get("size").is_none());
+        options.size = Some((78, 20));
+        assert_eq!(
+            run_params(&options)["size"],
+            json!({"cols": 78, "rows": 20})
         );
     }
 }

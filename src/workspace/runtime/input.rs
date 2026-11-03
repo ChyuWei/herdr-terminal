@@ -318,12 +318,14 @@ impl Screen<'_> {
     /// the reply is lost with the connection, the name is how the reconnect
     /// finds (or safely redoes) the start instead of orphaning a terminal.
     fn start_with_name(&mut self, request: StartRequest, name: String) -> Result<()> {
+        let size = self.workspace.pending_attach_size(&request, self.area());
         let run = RunOptions {
             argv: Vec::new(),
             name: Some(name.clone()),
             labels: request.labels(),
             keep: true,
             rm: false,
+            size: Some(size),
             ..RunOptions::default()
         };
         let session = match Session::start(self.client.clone(), &run) {

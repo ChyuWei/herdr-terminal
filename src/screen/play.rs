@@ -622,6 +622,7 @@ impl<'a> Screen<'a> {
                     argv: self.argv.clone(),
                     keep: true,
                     rm: false,
+                    size: Some((self.cols, self.rows)),
                     ..RunOptions::default()
                 };
                 match Session::start(client, &run) {

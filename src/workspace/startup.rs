@@ -21,6 +21,7 @@ use super::sync::{DOC_TIMEOUT, DocState, is_conflict};
 use crate::core::{CoreClient, Error, Result, RunOptions, Terminal};
 use crate::model::Model;
 use crate::session::{self, Session};
+use ratatui::layout::Rect;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -73,7 +74,7 @@ enum Claimed {
     Lost { value: Value, version: u64 },
 }
 
-pub(super) fn open(options: &Options) -> Result<Opened> {
+pub(super) fn open(options: &Options, viewport: Rect) -> Result<Opened> {
     let screen = local::screen_id()?;
     let mut view = ViewStore::load(&screen);
     let mut notes: Vec<String> = view.take_warning().into_iter().collect();
@@ -134,7 +135,7 @@ pub(super) fn open(options: &Options) -> Result<Opened> {
             }
             // No labeled terminal survived: this is a new document at a
             // retained version. Only the claim winner starts a shell.
-            match claim_empty(&client, &screen, version, &options.argv)? {
+            match claim_empty(&client, &screen, version, &options.argv, viewport)? {
                 Claimed::Won {
                     workspace,
                     sessions,
@@ -163,7 +164,7 @@ pub(super) fn open(options: &Options) -> Result<Opened> {
             }
         }
         // Never written: this screen claims the brand-new document.
-        match claim_empty(&client, &screen, 0, &options.argv)? {
+        match claim_empty(&client, &screen, 0, &options.argv, viewport)? {
             Claimed::Won {
                 workspace,
                 sessions,
@@ -197,7 +198,8 @@ pub(super) fn open(options: &Options) -> Result<Opened> {
     };
 
     if !started_initial && !options.argv.is_empty() {
-        let (pane, session) = start_program(&client, &mut resolved.workspace, &options.argv)?;
+        let (pane, session) =
+            start_program(&client, &mut resolved.workspace, &options.argv, viewport)?;
         resolved.seen.insert(pane);
         resolved.sessions.push((pane, session));
     }
@@ -293,6 +295,7 @@ fn claim_empty(
     screen: &str,
     version: u64,
     argv: &[String],
+    viewport: Rect,
 ) -> Result<Claimed> {
     let mut workspace = Workspace::for_screen(screen);
     let empty = workspace.capture_doc();
@@ -303,7 +306,8 @@ fn claim_empty(
                 version: set.version,
             };
             let request = workspace.start_request(StartKind::Initial);
-            let run = run_options(argv, &request);
+            let size = workspace.pending_attach_size(&request, viewport);
+            let run = run_options(argv, &request, size);
             let session = match Session::start(client.clone(), &run) {
                 Ok(session) => session,
                 Err(error) => {
@@ -348,6 +352,7 @@ fn start_program(
     client: &Arc<CoreClient>,
     workspace: &mut Workspace,
     argv: &[String],
+    viewport: Rect,
 ) -> Result<(PaneId, Session)> {
     let kind = if workspace.pane_count() == 0 {
         StartKind::Initial
@@ -355,7 +360,8 @@ fn start_program(
         StartKind::Tab
     };
     let request = workspace.start_request(kind);
-    let run = run_options(argv, &request);
+    let size = workspace.pending_attach_size(&request, viewport);
+    let run = run_options(argv, &request, size);
     let session = Session::start(client.clone(), &run).map_err(|error| {
         Error::Protocol(format!(
             "could not start {:?}: {error}",
@@ -406,13 +412,18 @@ fn startup_infos(
     Ok(infos)
 }
 
-fn run_options(argv: &[String], request: &super::model::StartRequest) -> RunOptions {
+fn run_options(
+    argv: &[String],
+    request: &super::model::StartRequest,
+    size: (u16, u16),
+) -> RunOptions {
     RunOptions {
         argv: argv.to_vec(),
         name: Some(session::start_name()),
         labels: request.labels(),
         keep: true,
         rm: false,
+        size: Some(size),
         ..RunOptions::default()
     }
 }

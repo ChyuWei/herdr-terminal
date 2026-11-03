@@ -99,6 +99,30 @@ fn an_emoji_is_two_cells_wide() {
 }
 
 #[test]
+fn a_variation_selector_makes_a_text_emoji_two_cells_wide() {
+    let mut vt = Vt::new(6, 2).expect("VT");
+    // U+270D is narrow on its own; VS16 gives it emoji presentation.
+    vt.feed("✍️".as_bytes());
+    let screen = vt.snapshot().expect("snapshot");
+    let sign = screen.cell(0, 0).expect("cell");
+    assert_eq!(sign.text, "✍️");
+    assert_eq!(sign.width, 2);
+    assert_eq!(screen.cell(1, 0).expect("spacer").width, 0);
+    assert_eq!(screen.cursor.x, 2);
+
+    // RIS restores the configured default, not Ghostty's built-in one.
+    vt.feed(b"\x1bc");
+    assert!(vt.mode(2027), "grapheme clustering is the reset default");
+    vt.feed("❤️".as_bytes());
+    let screen = vt.snapshot().expect("snapshot after RIS");
+    let heart = screen.cell(0, 0).expect("heart");
+    assert_eq!(heart.text, "❤️");
+    assert_eq!(heart.width, 2);
+    assert_eq!(screen.cell(1, 0).expect("spacer").width, 0);
+    assert_eq!(screen.cursor.x, 2);
+}
+
+#[test]
 fn resize_changes_the_grid_and_keeps_the_cursor_inside_it() {
     let mut vt = Vt::new(10, 3).expect("VT");
     vt.feed(b"abcdef");

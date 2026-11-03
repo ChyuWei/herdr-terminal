@@ -558,6 +558,19 @@ impl Workspace {
         }
     }
 
+    /// The size the reserved pane will attach at once
+    /// [`Workspace::insert_terminal`] runs, for the layout as it is now at
+    /// `viewport`. Insertion is deterministic, so the preview runs on a clone:
+    /// a failed `terminal.run` must leave no empty tab behind.
+    pub fn pending_attach_size(&self, request: &StartRequest, viewport: Rect) -> (u16, u16) {
+        let mut preview = self.clone();
+        preview.insert_terminal(request, String::new(), String::new());
+        geometry::compute(preview.active_tab(), viewport)
+            .pane(request.pane)
+            .map(geometry::attach_size)
+            .unwrap_or((1, 1))
+    }
+
     /// Inserts a successfully started terminal. Creates the requested space or
     /// tab when needed, makes it active, focuses the pane and clears zoom.
     /// The returned id is stable for the life of the workspace.

@@ -74,6 +74,10 @@ fn run_tests() {
     #[cfg(unix)]
     workspace_claims_a_new_document_and_labels_its_terminal();
     #[cfg(unix)]
+    workspace_sends_each_new_terminals_attach_size_to_run();
+    #[cfg(unix)]
+    workspace_an_explicit_program_gets_the_new_tab_attach_size();
+    #[cfg(unix)]
     workspace_reclaims_a_deleted_document_at_its_version();
     #[cfg(unix)]
     workspace_recovers_labeled_terminals_when_the_document_is_deleted();
@@ -115,6 +119,8 @@ fn run_tests() {
     screen_exits_when_the_terminal_is_removed();
     #[cfg(unix)]
     screen_reconnects_to_the_same_terminal();
+    #[cfg(unix)]
+    screen_sends_the_viewport_size_when_it_starts_and_replaces_a_terminal();
     #[cfg(unix)]
     workspace_marks_visible_turns_seen_and_alerts_for_hidden_finishes();
     #[cfg(unix)]
@@ -686,6 +692,11 @@ fn screen_detaches_without_killing_the_program() {
         json!("herdr-terminal"),
         "the terminal must carry the client label"
     );
+    assert_eq!(
+        run["params"]["size"],
+        json!({"cols": 80, "rows": 24}),
+        "the screen must start the program at the grid it attaches at"
+    );
 }
 
 /// A kept terminal is lost, stays unattachable until core restarts it, and
@@ -936,6 +947,54 @@ fn screen_reconnects_to_the_same_terminal() {
     let log = scratch.entries();
     assert!(!log.iter().any(|entry| entry["call"] == "terminal.kill"));
     assert!(!log.iter().any(|entry| entry["call"] == "terminal.rm"));
+}
+
+/// Both the first `ht screen` start and the terminal it starts after a
+/// reconnect finds none tell core the viewport they will attach at.
+#[cfg(unix)]
+fn screen_sends_the_viewport_size_when_it_starts_and_replaces_a_terminal() {
+    let scratch = Scratch::new("screen-reconnect-gone");
+    let mut screen = FakeScreen::spawn(&scratch, "screen-reconnect-gone", &[]);
+    assert!(
+        screen.wait_text("BEFORE", secs(10)),
+        "the first frame was not drawn; raw={:?} stderr={:?}",
+        screen.output.text(),
+        screen.stderr.text()
+    );
+
+    let runs = || {
+        scratch
+            .entries()
+            .into_iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .collect::<Vec<_>>()
+    };
+    let first = runs();
+    assert_eq!(first.len(), 1, "the screen must start one terminal");
+    assert_eq!(
+        first[0]["params"]["size"],
+        json!({"cols": 80, "rows": 24}),
+        "the first terminal must start at the viewport"
+    );
+
+    // Generation 1 drops the connection; generation 2 has no terminal, so the
+    // screen starts a replacement at the size it will attach at.
+    screen.send(b"g");
+    assert!(
+        common::wait_until(secs(15), || runs().len() == 2),
+        "the screen did not start a replacement; log={:?}",
+        scratch.entries()
+    );
+    let runs = runs();
+    assert_eq!(
+        runs[1]["params"]["size"],
+        json!({"cols": 80, "rows": 24}),
+        "the replacement terminal must start at the viewport"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(10)).expect("ht exits after Ctrl-]");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
 }
 
 /// Restores the shared document's spaces, tabs, split layout and panes, and
@@ -1395,6 +1454,100 @@ fn workspace_claims_a_new_document_and_labels_its_terminal() {
         doc_addresses(&scratch.doc_value()),
         vec!["t1".to_owned()],
         "detaching leaves the program and the document intact"
+    );
+}
+
+/// Every new workspace terminal tells core the grid it will attach at: the
+/// first shell fills the viewport's pane, and a split gets its half before
+/// its first attach. The fake core ignores the field, like older cores.
+#[cfg(unix)]
+fn workspace_sends_each_new_terminals_attach_size_to_run() {
+    let scratch = Scratch::new("workspace-run-size");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "m6-copy");
+    assert!(
+        wait_for_text(&workspace, "hello"),
+        "the first pane did not paint; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    let runs = || {
+        scratch
+            .entries()
+            .into_iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .collect::<Vec<_>>()
+    };
+    let initial = runs();
+    assert_eq!(initial.len(), 1, "only the initial shell has run");
+    assert_eq!(
+        initial[0]["params"]["size"],
+        json!({"cols": 78, "rows": 20}),
+        "the initial shell must fill the pane inside the 80x24 viewport"
+    );
+
+    workspace.command(b'v');
+    assert!(
+        common::wait_until(secs(10), || runs().len() == 2),
+        "the split did not start a terminal; log={:?}",
+        scratch.entries()
+    );
+    let runs = runs();
+    assert_eq!(
+        runs[1]["params"]["size"],
+        json!({"cols": 37, "rows": 20}),
+        "the split's right-hand pane is 37 cells wide"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// An explicit PROGRAM after a restore runs in a new tab and is told that
+/// tab's attach size before the tab is inserted.
+#[cfg(unix)]
+fn workspace_an_explicit_program_gets_the_new_tab_attach_size() {
+    let scratch = Scratch::new("workspace-program-size");
+    scratch.seed_doc(doc_same_tab(), 7);
+    let mut workspace = FakeScreen::spawn_parts(
+        &scratch,
+        "doc-program",
+        &[],
+        &["--", "sh", "-c", "sleep 30"],
+        None,
+    );
+    assert!(
+        wait_for_text(&workspace, "PAINT"),
+        "the explicit program's tab did not paint; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    let runs: Vec<_> = scratch
+        .entries()
+        .into_iter()
+        .filter(|entry| entry["call"] == "terminal.run")
+        .collect();
+    assert_eq!(runs.len(), 1, "the explicit program must start once");
+    assert_eq!(
+        runs[0]["params"]["size"],
+        json!({"cols": 78, "rows": 20}),
+        "the new tab must start at the pane it will attach at"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
     );
 }
 
@@ -2241,6 +2394,11 @@ fn a_program_that_exits_before_attach_is_still_shown_and_removed() {
         run["params"]["rm"],
         json!(false),
         "the run must keep the record until the probe reads it"
+    );
+    assert_eq!(
+        run["params"]["size"],
+        json!({"cols": 80, "rows": 24}),
+        "the probe must start the program at the grid it attaches at"
     );
 }
 
@@ -4469,7 +4627,9 @@ fn fake_connect() -> io::Result<()> {
                         b"\x1b[!p\x1b[?1004l\x1b[H\x1b[2JREPAINTED\n",
                     )?,
                     // Drop the connection: the client must make a new one.
-                    "screen-reconnect" if generation == 1 => return Ok(()),
+                    "screen-reconnect" | "screen-reconnect-gone" if generation == 1 => {
+                        return Ok(());
+                    }
                     // Another screen added a pane: the doc event carries no
                     // value, the client must refetch and adopt it.
                     "doc-event" | "doc-missed" | "doc-event-focus" => {
@@ -4614,11 +4774,12 @@ fn fake_connect() -> io::Result<()> {
                     record
                 } else if doc_scenario(&scenario) {
                     // A split's terminal, with the labels the client sent.
-                    let address = if scenario.starts_with("doc-conflict") {
-                        "t3"
-                    } else {
-                        "t1"
-                    };
+                    let address =
+                        if scenario.starts_with("doc-conflict") || scenario == "doc-program" {
+                            "t3"
+                        } else {
+                            "t1"
+                        };
                     let mut record = live_record(7000 + runs);
                     record["address"] = json!(address);
                     record["name"] = json!(name);
@@ -4942,7 +5103,7 @@ fn fake_connect() -> io::Result<()> {
                         "screen-repaint" => {
                             write_frame(&mut output, channel, DATA, b"BEFORE\n")?;
                         }
-                        "screen-reconnect" if generation == 1 => {
+                        "screen-reconnect" | "screen-reconnect-gone" if generation == 1 => {
                             write_frame(&mut output, channel, DATA, b"BEFORE\n")?;
                         }
                         "screen-reconnect" => {
@@ -5208,6 +5369,7 @@ fn doc_scenario(scenario: &str) -> bool {
             | "doc-event-focus"
             | "doc-orphan"
             | "doc-orphan-invalid"
+            | "doc-program"
     )
 }
 
@@ -5235,7 +5397,12 @@ fn snapshot_for(
         });
     }
     let terminals: Vec<Value> = match scenario {
-        "doc-restore" | "doc-remove" | "doc-deleted-recover" | "doc-focus" | "doc-event-focus" => {
+        "doc-restore"
+        | "doc-remove"
+        | "doc-deleted-recover"
+        | "doc-focus"
+        | "doc-event-focus"
+        | "doc-program" => {
             vec![
                 doc_record_for(scenario, "t1"),
                 doc_record_for(scenario, "t2"),

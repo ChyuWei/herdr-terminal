@@ -65,7 +65,7 @@ pub fn run(options: Options) -> Result<i32> {
     let events = client.subscribe()?;
     let model = Model::from_snapshot(events.snapshot());
     let core_id = client.hello().core.id.clone();
-    let mut session = prepare_target(&options, &client, &model, &core_id)?;
+    let mut session = prepare_target(&options, &client, &model, &core_id, (cols, rows))?;
     // The pointer lets the next client find this terminal even when it was
     // discovered by its label; it is not the M4 workspace document.
     pointer::pointer(&core_id, session.address()).save();
@@ -130,12 +130,14 @@ fn prepare_target(
     client: &Arc<CoreClient>,
     model: &Model,
     core_id: &str,
+    size: (u16, u16),
 ) -> Result<Session> {
     if !options.argv.is_empty() {
         let run = RunOptions {
             argv: options.argv.clone(),
             keep: true,
             rm: false,
+            size: Some(size),
             ..RunOptions::default()
         };
         return Session::start(client.clone(), &run);
@@ -148,6 +150,7 @@ fn prepare_target(
                 argv: Vec::new(),
                 keep: true,
                 rm: false,
+                size: Some(size),
                 ..RunOptions::default()
             };
             Session::start(client.clone(), &run)

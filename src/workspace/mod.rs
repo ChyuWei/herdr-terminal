@@ -71,7 +71,8 @@ pub fn run(options: Options) -> Result<i32> {
 
     // Restore or claim the shared document before the alternate screen, so a
     // failure is a plain error message rather than a broken TUI.
-    let mut opened = startup::open(&options)?;
+    let viewport = ratatui::layout::Rect::new(0, 0, size.0, size.1);
+    let mut opened = startup::open(&options, viewport)?;
     if !warnings.is_empty() {
         let text = warnings.join("; ");
         opened.boot.notice = Some(match opened.boot.notice.take() {

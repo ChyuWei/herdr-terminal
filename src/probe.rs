@@ -74,6 +74,7 @@ pub fn run(options: Options) -> Result<i32> {
         // Keep the finished record until this probe has read it: attach can
         // lose the race with a program that exits at once.
         rm: false,
+        size: Some((cols, rows)),
         ..RunOptions::default()
     };
     // From here on this probe owns a terminal, and every path cleans it up.

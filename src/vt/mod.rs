@@ -84,6 +84,11 @@ pub struct Vt {
     csi_len: usize,
 }
 
+/// DEC private mode 2027, grapheme clustering. The C header defines its
+/// packed value with a function-like macro, which bindgen cannot emit, so the
+/// DEC mode number is spelled out here. Bit 15 clear means a private mode.
+const GRAPHEME_CLUSTER_MODE: u16 = 2027;
+
 /// Bytes of memory allowed per configured scrollback line. Ghostty also
 /// enforces a byte limit; its default is tiny (10 KB) and would prune a large
 /// history long before the line limit. This estimate keeps the line limit in
@@ -124,6 +129,24 @@ impl Vt {
             if terminal.is_null() {
                 return Err(VtError {
                     what: "terminal_new",
+                });
+            }
+            // Grapheme clustering is the terminal's reset default, like core,
+            // Ghostty and the app: emoji variation sequences and combining
+            // marks form one cell cluster instead of splitting into cells.
+            let mode = sys::GhosttyTerminalModeConfig {
+                mode: GRAPHEME_CLUSTER_MODE,
+                value: true,
+            };
+            if sys::ghostty_terminal_set(
+                terminal,
+                sys::GHOSTTY_TERMINAL_OPT_MODE_DEFAULT,
+                &mode as *const _ as *const c_void,
+            ) != sys::GHOSTTY_SUCCESS
+            {
+                sys::ghostty_terminal_free(terminal);
+                return Err(VtError {
+                    what: "set_mode_default",
                 });
             }
             let lines = max_lines;
