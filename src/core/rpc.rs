@@ -75,6 +75,96 @@ pub struct CoreInfo {
     pub name: String,
 }
 
+/// A machine this core added, with the state of its line when the view has
+/// one. `machine.add` and `machine.rename` return the profile alone (empty
+/// `state`); `machine.list` and `machine.connect` return the view. Unknown
+/// fields are ignored and every field defaults, so a partial record never
+/// discards the whole answer.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct Machine {
+    /// What this core calls it: `rohan` in `rohan/t7`.
+    #[serde(default)]
+    pub name: String,
+    /// How it is reached: an ssh target, or (`via`) a command.
+    #[serde(default)]
+    pub target: String,
+    /// `target` is a command that runs a shell line there, not an ssh target.
+    #[serde(default)]
+    pub via: bool,
+    /// Short-lived, for a task; clients may show it apart.
+    #[serde(default)]
+    pub temporary: bool,
+    /// The hc session there; `None` is its default.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// The other core's permanent id.
+    #[serde(default)]
+    pub id: String,
+    /// What that core calls itself (its hostname).
+    #[serde(default)]
+    pub host: String,
+    /// Its hc version when last seen.
+    #[serde(default)]
+    pub version: String,
+    /// `connecting`, `connected`, `needs_login`, `needs_update` or
+    /// `unreachable`; empty on a profile reply.
+    #[serde(default)]
+    pub state: String,
+    /// Since when the line is not connected, in milliseconds since the epoch.
+    #[serde(default)]
+    pub since_ms: Option<u64>,
+    /// Why the line is not connected, when core knows.
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
+/// `machine.list`'s reply.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MachineListResult {
+    #[serde(default)]
+    pub machines: Vec<Machine>,
+}
+
+/// `machine.add` params. `target` is passed through unchanged (an ssh target
+/// such as `user@host:port`); `via` is a command instead. The client omits
+/// `install`: copying an hc is an interactive CLI concern, and the API reports
+/// `hc_missing`/`needs_update` instead.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct MachineAdd {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub temporary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+impl MachineAdd {
+    /// Add `target` unchanged; core derives the name and uses the default
+    /// session.
+    pub fn target(target: impl Into<String>) -> MachineAdd {
+        MachineAdd {
+            target: Some(target.into()),
+            ..MachineAdd::default()
+        }
+    }
+}
+
+/// The `machine.connect`/`machine.rm` params.
+pub fn machine_params(machine: &str) -> Value {
+    serde_json::json!({"machine": machine})
+}
+
+/// The `machine.rename` params. Only this core's name changes; addresses with
+/// the old prefix stop working.
+pub fn machine_rename_params(machine: &str, new_name: &str) -> Value {
+    serde_json::json!({"machine": machine, "new_name": new_name})
+}
+
 /// The `hello` reply: what this core is and what it can do.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Hello {
@@ -93,6 +183,12 @@ pub struct Hello {
 }
 
 impl Hello {
+    /// Whether this core advertises a method. Optional API such as the
+    /// machine manager is gated on the reply, never on a version number.
+    pub fn has_method(&self, method: &str) -> bool {
+        self.methods.iter().any(|have| have == method)
+    }
+
     /// Whether this core advertises a feature. Optional capabilities are
     /// gated on the reply, never on a version number.
     pub fn supports(&self, feature: &str) -> bool {
@@ -555,6 +651,102 @@ mod tests {
         }))
         .expect("reply");
         assert!(confirmed.resize_notifications);
+    }
+
+    #[test]
+    fn a_machine_view_keeps_every_documented_fact_and_ignores_new_ones() {
+        let machine: Machine = serde_json::from_value(serde_json::json!({
+            "name": "rohan",
+            "target": "can@10.0.0.7:2222",
+            "via": false,
+            "temporary": true,
+            "session": "work",
+            "id": "core-id",
+            "host": "rohan-host",
+            "version": "0.1.18",
+            "state": "needs_login",
+            "since_ms": 1234,
+            "why": "login required",
+            "future_field": {"anything": true},
+        }))
+        .expect("machine view");
+        assert_eq!(machine.name, "rohan");
+        assert_eq!(machine.target, "can@10.0.0.7:2222");
+        assert!(!machine.via);
+        assert!(machine.temporary);
+        assert_eq!(machine.session.as_deref(), Some("work"));
+        assert_eq!(machine.id, "core-id");
+        assert_eq!(machine.host, "rohan-host");
+        assert_eq!(machine.version, "0.1.18");
+        assert_eq!(machine.state, "needs_login");
+        assert_eq!(machine.since_ms, Some(1234));
+        assert_eq!(machine.why.as_deref(), Some("login required"));
+
+        let empty: Machine = serde_json::from_value(serde_json::json!({})).expect("partial");
+        assert_eq!(empty, Machine::default());
+
+        let list: MachineListResult = serde_json::from_value(serde_json::json!({
+            "machines": [{"name": "one"}, {"name": "two", "state": "connected"}],
+            "unknown": 1,
+        }))
+        .expect("list");
+        assert_eq!(list.machines.len(), 2);
+        assert_eq!(list.machines[1].state, "connected");
+    }
+
+    #[test]
+    fn machine_add_passes_the_target_through_unchanged() {
+        let target = "can@10.0.0.7:2222";
+        let params = serde_json::to_value(MachineAdd::target(target)).expect("params");
+        assert_eq!(
+            params,
+            serde_json::json!({"target": target}),
+            "the target is not parsed or rewritten and unset options are absent"
+        );
+        assert_eq!(params["target"], serde_json::json!(target));
+        assert!(params.get("via").is_none());
+        assert!(params.get("temporary").is_none());
+        assert!(params.get("name").is_none());
+        assert!(params.get("session").is_none());
+
+        let full = MachineAdd {
+            target: Some(target.into()),
+            via: None,
+            temporary: true,
+            name: Some("rohan".into()),
+            session: Some("work".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(full).expect("params"),
+            serde_json::json!({
+                "target": target,
+                "temporary": true,
+                "name": "rohan",
+                "session": "work",
+            })
+        );
+
+        let via = MachineAdd {
+            target: None,
+            via: Some("fly ssh console -a app --pty=false -C".into()),
+            ..MachineAdd::default()
+        };
+        assert_eq!(
+            serde_json::to_value(via).expect("params"),
+            serde_json::json!({"via": "fly ssh console -a app --pty=false -C"})
+        );
+    }
+
+    #[test]
+    fn machine_requests_name_the_machine_exactly() {
+        assert_eq!(
+            machine_params("rohan"),
+            serde_json::json!({"machine": "rohan"})
+        );
+        assert_eq!(
+            machine_rename_params("rohan", "vps"),
+            serde_json::json!({"machine": "rohan", "new_name": "vps"})
+        );
     }
 
     #[test]

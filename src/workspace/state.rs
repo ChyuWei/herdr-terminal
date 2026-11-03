@@ -90,6 +90,8 @@ pub struct UiState {
     pub sidebar: Sidebar,
     /// The Core-wide terminal manager and its local selection/filter.
     pub manager: ManagerState,
+    /// The machine manager and its local selection/filter/prompt.
+    pub machines: MachineState,
     /// The read-only observer preview, when open.
     pub preview: Option<PreviewState>,
     /// The agent being peeked, when the peek overlay is open.
@@ -111,6 +113,7 @@ impl Default for UiState {
             connection: Connection::Live,
             sidebar: Sidebar::default(),
             manager: ManagerState::default(),
+            machines: MachineState::default(),
             preview: None,
             peek: None,
             keymap: KeyMap::default(),
@@ -136,6 +139,8 @@ impl UiState {
             Overlay::Peek(pane)
         } else if self.manager.open {
             Overlay::Manager
+        } else if self.machines.open {
+            Overlay::Machines
         } else if self.sidebar.open {
             Overlay::Sidebar
         } else {
@@ -153,6 +158,7 @@ impl UiState {
             || self.search.is_some()
             || self.peek.is_some()
             || self.manager.open
+            || self.machines.open
             || self.preview.is_some()
             || self.sidebar.open
     }
@@ -237,6 +243,66 @@ pub struct ManagerState {
     pub filter: Line,
     pub filtering: bool,
     pub offset: usize,
+}
+
+/// The machine manager's local state. The selection is a core machine name,
+/// not a pane or an ssh target. A prompt edits a new target or a new name; a
+/// confirmation holds the machine a `d` key would remove. None of it is ever
+/// part of the shared document.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MachineState {
+    pub open: bool,
+    pub selected: Option<String>,
+    pub filter: Line,
+    pub filtering: bool,
+    pub offset: usize,
+    pub prompt: Option<MachinePrompt>,
+    /// The machine waiting for the second `d`/Enter of a removal.
+    pub confirm: Option<String>,
+    /// Core's refusal or a connection problem, shown inside the overlay.
+    pub error: Option<String>,
+}
+
+/// The one-line machine prompt: add a target, or rename the selected machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachinePrompt {
+    pub kind: MachinePromptKind,
+    pub line: Line,
+}
+
+/// What a machine prompt will call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MachinePromptKind {
+    /// `machine.add` with the typed target unchanged. Core chooses the name.
+    Add,
+    /// `machine.rename` for the captured machine name.
+    Rename { machine: String },
+}
+
+impl MachinePrompt {
+    pub fn add() -> MachinePrompt {
+        MachinePrompt {
+            kind: MachinePromptKind::Add,
+            line: Line::default(),
+        }
+    }
+
+    pub fn rename(machine: &str) -> MachinePrompt {
+        MachinePrompt {
+            kind: MachinePromptKind::Rename {
+                machine: machine.to_owned(),
+            },
+            line: Line::new(machine),
+        }
+    }
+
+    /// The status-bar label before the editable text.
+    pub fn label(&self) -> &'static str {
+        match self.kind {
+            MachinePromptKind::Add => "add machine target: ",
+            MachinePromptKind::Rename { .. } => "rename machine: ",
+        }
+    }
 }
 
 /// The address and title of the terminal being previewed. The stream and VT

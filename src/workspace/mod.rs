@@ -20,6 +20,7 @@ pub mod commands;
 pub mod geometry;
 pub mod keys;
 mod local;
+pub mod machines;
 pub mod manager;
 pub mod model;
 pub mod palette;

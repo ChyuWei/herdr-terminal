@@ -7,6 +7,11 @@
 
 use super::agents::{self, AgentRow};
 use super::geometry::{self, Rects};
+mod machine_ui;
+
+pub use machine_ui::machine_list_height;
+
+use super::machines::{self, MachineRow};
 use super::manager::{self, ManagerRow};
 use super::model::{PaneId, Workspace};
 use super::palette;
@@ -34,6 +39,8 @@ pub const HELP: &[&str] = &[
     "t terminal manager (all live terminals in core)",
     "manager: j/k move  g/G first/last  Enter show/hide",
     "/ filter  p preview (read-only)  Esc close manager",
+    "m machine manager · Enter connect · a add · r rename · d remove",
+    "machines: n new terminal there · / filter · Esc close · add takes target only",
     "sidebar: j/k move  g/G first/last  Enter jump",
     "p pin / unpin  u mark unread  i peek  Esc/a close  any key closes peek",
     "Ctrl-] detach      prefix twice sends Ctrl-b",
@@ -71,6 +78,8 @@ pub struct View<'a> {
     pub scroll_hint: Option<&'a str>,
     /// Every live terminal in core, while the manager is open.
     pub manager: &'a [ManagerRow],
+    /// Core's machines, while the machine manager is open.
+    pub machines: &'a [MachineRow],
     /// The read-only observer preview's local VT snapshot.
     pub preview: Option<&'a VtScreen>,
 }
@@ -81,6 +90,7 @@ impl Default for View<'_> {
             std::sync::OnceLock::new();
         static ROWS: [AgentRow; 0] = [];
         static MANAGER_ROWS: [ManagerRow; 0] = [];
+        static MACHINE_ROWS: [MachineRow; 0] = [];
         static SELECTIONS: std::sync::OnceLock<SelectionSpans> = std::sync::OnceLock::new();
         static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
         View {
@@ -90,6 +100,7 @@ impl Default for View<'_> {
             selections: SELECTIONS.get_or_init(BTreeMap::new),
             scroll_hint: None,
             manager: &MANAGER_ROWS,
+            machines: &MACHINE_ROWS,
             preview: None,
         }
     }
@@ -168,6 +179,10 @@ pub fn render_with(
     }
     if ui.manager.open {
         rendered.prompt_cursor = draw_manager(buffer, area, ui, view.manager, theme);
+        rendered.focused = None;
+    }
+    if ui.machines.open {
+        rendered.prompt_cursor = machine_ui::draw_machines(buffer, area, ui, view.machines, theme);
         rendered.focused = None;
     }
     if let Some(preview) = &ui.preview {
@@ -313,11 +328,14 @@ fn draw_panes(
         } else {
             Style::default().fg(theme.border)
         };
-        let mut label = if pane.title.is_empty() || pane.title == pane.name {
-            pane.name.clone()
-        } else {
-            format!("{}: {}", pane.name, pane.title)
-        };
+        let mut label = machines::qualified_name(
+            &pane.address,
+            &if pane.title.is_empty() || pane.title == pane.name {
+                pane.name.clone()
+            } else {
+                format!("{}: {}", pane.name, pane.title)
+            },
+        );
         if let Some(code) = pane.exit {
             label.push_str(&format!(" [exited {code}]"));
         }
@@ -418,7 +436,9 @@ fn draw_status(
     let tab = workspace.active_tab();
     let tab_name = tab.map(|tab| tab.name.as_str()).unwrap_or("tab");
     let focused = workspace.focused_pane().and_then(|id| workspace.pane(id));
-    let pane_name = focused.map(|pane| pane.name.as_str()).unwrap_or("empty");
+    let pane_name = focused
+        .map(|pane| machines::qualified_name(&pane.address, &pane.name))
+        .unwrap_or_else(|| "empty".to_owned());
     let row = focused.and_then(|pane| rows.iter().find(|row| row.pane == pane.id));
     let mut left = format!(" {} / {} / {}", space.name, tab_name, pane_name);
     if let Some(message) = &ui.message {
@@ -466,6 +486,9 @@ fn draw_status(
         }
         Connection::Live if ui.manager.open => {
             "terminals · Enter show/hide · p preview · Esc close".to_owned()
+        }
+        Connection::Live if ui.machines.open => {
+            "machines · Enter connect · a add · n terminal · Esc close".to_owned()
         }
         Connection::Live if ui.peek.is_some() => "peek · any key closes".to_owned(),
         Connection::Live if ui.sidebar.open => "agents · Esc closes".to_owned(),

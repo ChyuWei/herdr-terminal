@@ -7,7 +7,7 @@ use crate::screen::lifecycle::{self, Disposition};
 use crate::session;
 use crate::tui::vt_error;
 use crate::vt::Vt;
-use crate::workspace::model::{DOC_NAME, PaneId};
+use crate::workspace::model::{DOC_NAME, PANE_LABEL, PaneId};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::mpsc::TryRecvError;
@@ -101,13 +101,18 @@ impl Screen<'_> {
     }
 
     pub(super) fn apply_events(&mut self) -> Result<()> {
+        // A stream-less `removed` may be half of core's machine-rename pair,
+        // which ends with a `created` for the new address in the same batch.
+        // Its removal is decided after this batch, one loop step later.
+        let deferred = std::mem::take(&mut self.deferred_removals);
+        let mut disconnected = false;
         for _ in 0..EVENT_BATCH {
             let notification = match self.events.try_recv() {
                 Ok(notification) => notification,
-                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.begin_reconnect();
-                    return Ok(());
+                    disconnected = true;
+                    break;
                 }
             };
             if self.model.apply(&notification) {
@@ -115,12 +120,20 @@ impl Screen<'_> {
             }
             match &notification {
                 Notification::Missed { .. } => {
-                    // A document change may have been missed too; refetch it
-                    // before trusting the local layout.
+                    // A document change may have been missed too; read and
+                    // merge it before reconciling, as the reconnect path does.
+                    // The stored document may still name a machine's old
+                    // addresses, while the snapshot already has the new ones.
                     self.doc.stale = true;
                     self.agents.reset();
+                    self.fetch_document()?;
+                    if self.reconn.is_some() {
+                        // The reconnect path refetches and reconciles.
+                        return Ok(());
+                    }
                     self.reconcile_snapshot();
                     self.check_preview();
+                    self.refresh_machines_soon();
                 }
                 Notification::Event {
                     kind: EventKind::Doc,
@@ -145,6 +158,9 @@ impl Screen<'_> {
                         if kind == EventKind::Labels {
                             self.note_labels(&address);
                         }
+                        if kind == EventKind::Created {
+                            self.readdress_created(&address);
+                        }
                         self.apply_event(kind, &address);
                     }
                 }
@@ -152,7 +168,110 @@ impl Screen<'_> {
             }
             self.apply_display();
         }
+        if disconnected {
+            self.begin_reconnect();
+            return Ok(());
+        }
+        for (pane, address) in deferred {
+            self.process_deferred_removal(pane, &address);
+        }
         Ok(())
+    }
+
+    /// Moves a pane to the address of the terminal whose `herdr.terminal.pane`
+    /// label names it, when core has renamed that terminal's machine. Core
+    /// emits `removed` for the old qualified addresses and `created` for the
+    /// new ones; the pane, its stream and its final screen belong to the same
+    /// terminal. Never matches another screen's pane (its label carries that
+    /// screen's id) and never duplicates an address another pane holds.
+    fn readdress_pane_by_label(&mut self, pane: PaneId) -> bool {
+        let Some(current) = self.workspace.pane(pane).map(|pane| pane.address.clone()) else {
+            return false;
+        };
+        let candidates: Vec<String> = self
+            .model
+            .terminals()
+            .filter(|terminal| terminal.address != current)
+            .filter(|terminal| {
+                terminal
+                    .labels
+                    .get(PANE_LABEL)
+                    .and_then(|label| label.parse::<u64>().ok())
+                    == Some(pane.0)
+            })
+            .map(|terminal| terminal.address.clone())
+            .collect();
+        // A terminal another pane already shows is a collision, not a move.
+        let Some(address) = candidates.into_iter().find(|address| {
+            !self
+                .workspace
+                .panes()
+                .any(|other| other.id != pane && other.address == *address)
+        }) else {
+            return false;
+        };
+        if !self.workspace.rename_pane_address(pane, address.clone()) {
+            return false;
+        }
+        if let Some(link) = self.links.get_mut(&pane) {
+            link.session.set_address(address.clone());
+            link.removed = false;
+            // A pane that was waiting to attach (or had lost its stream)
+            // must attach under the new address now; a finished pane keeps
+            // its final screen. A live stream follows the same terminal.
+            link.retry_at = (!link.finalized && link.stream.is_none()).then(Instant::now);
+        }
+        self.ui.message = Some(format!(
+            "machine renamed: terminal {current} is now {address}"
+        ));
+        self.dirty = true;
+        true
+    }
+
+    /// A stream-less pane's `removed` is confirmed one batch later, after a
+    /// following `created` has had its chance to move the pane. It leaves only
+    /// when no new address names it and core no longer has the old one.
+    fn process_deferred_removal(&mut self, pane: PaneId, address: &str) {
+        let Some(link) = self.links.get(&pane) else {
+            return;
+        };
+        if !link.removed || link.session.address() != address {
+            return;
+        }
+        if self.workspace.pane(pane).is_none() {
+            return;
+        }
+        if self.readdress_pane_by_label(pane) {
+            return;
+        }
+        if self.model.terminal(address).is_some() {
+            return;
+        }
+        self.remove_gone(pane, address);
+    }
+
+    /// A `created` record whose pane label names a pane this screen already
+    /// shows under an address core no longer has is the same terminal after a
+    /// machine rename. Give the pane and its attach stream the new qualified
+    /// address instead of dropping them.
+    fn readdress_created(&mut self, address: &str) {
+        let Some(record) = self.model.terminal(address) else {
+            return;
+        };
+        let Some(label) = record.labels.get(PANE_LABEL) else {
+            return;
+        };
+        let Ok(id) = label.parse::<u64>() else {
+            return;
+        };
+        let pane = PaneId(id);
+        let Some(existing) = self.workspace.pane(pane) else {
+            return;
+        };
+        if existing.address == address || self.model.terminal(&existing.address).is_some() {
+            return;
+        }
+        self.readdress_pane_by_label(pane);
     }
 
     /// Applies a core event to the pane that owns the terminal. The pure model
@@ -243,7 +362,10 @@ impl Screen<'_> {
                     .get(&pane)
                     .is_some_and(|link| link.stream.is_none())
                 {
-                    self.remove_gone(pane, address);
+                    // Core sends `removed` for a machine's old addresses
+                    // before `created` for the new ones. Wait one batch so a
+                    // rename can move this pane instead of deleting it.
+                    self.deferred_removals.push((pane, address.to_owned()));
                 }
             }
             _ => {}
@@ -301,6 +423,13 @@ impl Screen<'_> {
                     }
                 }
                 None => {
+                    // A rename in the `missed` window leaves the snapshot at
+                    // the new address while the workspace still shows the old
+                    // one; follow the pane's own label before deciding it is
+                    // gone.
+                    if self.readdress_pane_by_label(pane) {
+                        continue;
+                    }
                     // A finished pane's screen is local now; a core restart
                     // that forgot the record must not silently discard it.
                     // An explicit `removed` event still does (above).

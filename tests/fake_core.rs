@@ -80,6 +80,28 @@ fn run_tests() {
     #[cfg(unix)]
     workspace_terminal_manager_never_clears_another_screens_labels();
     #[cfg(unix)]
+    machine_client_uses_one_connection_for_every_machine_method();
+    #[cfg(unix)]
+    workspace_machine_manager_lists_actions_and_starts_a_terminal_on_a_machine();
+    #[cfg(unix)]
+    workspace_machine_manager_shows_core_errors_without_leaving();
+    #[cfg(unix)]
+    workspace_remote_pane_is_restored_typed_into_renamed_and_removed();
+    #[cfg(unix)]
+    workspace_remote_pane_survives_missed_without_duplicates();
+    #[cfg(unix)]
+    workspace_remote_pane_survives_reconnect_without_duplicates();
+    #[cfg(unix)]
+    workspace_remote_pane_follows_a_created_rename_without_duplication();
+    #[cfg(unix)]
+    workspace_streamless_remote_pane_survives_a_rename();
+    #[cfg(unix)]
+    workspace_finished_remote_pane_keeps_its_screen_across_a_rename();
+    #[cfg(unix)]
+    workspace_streamless_remote_pane_leaves_when_it_is_removed();
+    #[cfg(unix)]
+    workspace_remote_pane_survives_a_rename_in_a_missed_snapshot();
+    #[cfg(unix)]
     workspace_claims_a_new_document_and_labels_its_terminal();
     #[cfg(unix)]
     workspace_sends_each_new_terminals_attach_size_to_run();
@@ -1910,6 +1932,860 @@ fn wire_attach_count(entries: &[Value], address: &str) -> usize {
         .iter()
         .filter(|entry| entry.get("attached").is_some() && entry["terminal"] == address)
         .count()
+}
+
+/// A failed connect is reported inside the overlay; the client stays in the
+/// TUI and never starts an ssh or reconnect loop of its own.
+#[cfg(unix)]
+fn workspace_machine_manager_shows_core_errors_without_leaving() {
+    let scratch = Scratch::new("m7-machine-error");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-connect-fail");
+    assert!(
+        common::wait_until(secs(10), || wire_attach_count(&scratch.entries(), "t1")
+            >= 1),
+        "the initial shell did not attach; log={:?}",
+        scratch.entries()
+    );
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("machine manager", secs(5)),
+        "the manager did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("could not connect:", secs(5)),
+        "core's refusal is not shown in the overlay: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("machine manager"),
+        "an error must not close the machine manager: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run" && entry["params"]["on"].is_string()),
+        "a failed connect never starts a remote terminal: {:?}",
+        scratch.entries()
+    );
+
+    screen.send(&[0x1b]);
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// The same long-lived connection carries every machine call; no `hc` is
+/// spawned per action. Core's lists, profiles and errors are used verbatim.
+#[cfg(unix)]
+fn machine_client_uses_one_connection_for_every_machine_method() {
+    let scratch = Scratch::new("m7-machine-client");
+    let client = observer_client(&scratch, "machines");
+
+    let listed = client.machine_list().expect("machine.list");
+    assert_eq!(listed.len(), 4);
+    let alpha = listed
+        .iter()
+        .find(|machine| machine.name == "alpha")
+        .expect("alpha");
+    assert_eq!(alpha.target, "can@alpha.example:2222");
+    assert_eq!(alpha.host, "alpha-host");
+    assert_eq!(alpha.state, "connected");
+    let beta = listed
+        .iter()
+        .find(|machine| machine.name == "beta")
+        .expect("beta");
+    assert_eq!(beta.state, "unreachable");
+    assert_eq!(beta.why.as_deref(), Some("connection refused"));
+    assert!(beta.since_ms.is_some());
+
+    let added = client
+        .machine_add(&herdr_terminal::core::MachineAdd::target(
+            "rohan@10.0.0.9:2200",
+        ))
+        .expect("machine.add");
+    assert_eq!(added.target, "rohan@10.0.0.9:2200");
+    assert!(!added.name.is_empty());
+
+    let connected = client.machine_connect("alpha").expect("machine.connect");
+    assert_eq!(connected.state, "connected");
+
+    let renamed = client
+        .machine_rename("alpha", "rohan")
+        .expect("machine.rename");
+    assert_eq!(renamed.name, "rohan");
+
+    let error = client.machine_rm("nope").expect_err("unknown machine");
+    match error {
+        Error::Rpc { error, .. } => assert_eq!(error.kind(), Some("machine_unknown")),
+        other => panic!("unexpected error {other:?}"),
+    }
+    let error = client
+        .machine_add(&herdr_terminal::core::MachineAdd::default())
+        .expect_err("an empty target");
+    match error {
+        Error::Rpc { error, .. } => assert_eq!(error.kind(), Some("invalid_params")),
+        other => panic!("unexpected error {other:?}"),
+    }
+    let error = client.machine_connect("nope").expect_err("unknown machine");
+    match error {
+        Error::Rpc { error, .. } => assert_eq!(error.kind(), Some("machine_unknown")),
+        other => panic!("unexpected error {other:?}"),
+    }
+    let error = client
+        .machine_rename("nope", "still-nope")
+        .expect_err("unknown machine");
+    match error {
+        Error::Rpc { error, .. } => assert_eq!(error.kind(), Some("machine_unknown")),
+        other => panic!("unexpected error {other:?}"),
+    }
+    client.machine_rm("rohan").expect("machine.rm");
+    let after = client.machine_list().expect("machine.list again");
+    assert!(!after.iter().any(|machine| machine.name == "rohan"));
+
+    let log = scratch.entries();
+    let calls: Vec<&str> = log
+        .iter()
+        .filter_map(|entry| entry["call"].as_str())
+        .collect();
+    for method in [
+        "machine.list",
+        "machine.add",
+        "machine.connect",
+        "machine.rename",
+        "machine.rm",
+    ] {
+        assert!(calls.contains(&method), "missing {method}: {calls:?}");
+    }
+    let add = log
+        .iter()
+        .find(|entry| entry["call"] == "machine.add")
+        .expect("machine.add logged");
+    assert_eq!(
+        add["params"]["target"], "rohan@10.0.0.9:2200",
+        "the target is passed through unchanged: {add}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.get("generation").is_some())
+            .count(),
+        1,
+        "every machine call uses the one connection: {log:?}"
+    );
+}
+
+/// Prefix `m` lists core's machines; connect, add, rename, remove and a new
+/// remote terminal all go through core's API, and the list is polled only
+/// while the overlay stays open.
+#[cfg(unix)]
+fn workspace_machine_manager_lists_actions_and_starts_a_terminal_on_a_machine() {
+    let scratch = Scratch::new("m7-machine-ui");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines");
+    assert!(
+        common::wait_until(secs(10), || wire_attach_count(&scratch.entries(), "t1")
+            >= 1),
+        "the initial shell did not attach; log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "machine.list"),
+        "the closed machine manager must not poll core: {:?}",
+        scratch.entries()
+    );
+
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("2/4 connected", secs(5)),
+        "the machine manager did not list core's machines: {:?}",
+        screen.rendered()
+    );
+    let listed = screen.rendered();
+    assert!(
+        listed.contains("alpha") && listed.contains("unreachable"),
+        "{listed:?}"
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry.get("attach_data").is_some()),
+        "a navigation key leaked to the program: {:?}",
+        scratch.entries()
+    );
+
+    // Enter asks core to dial the selected machine.
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || scratch.entries().iter().any(
+            |entry| entry["call"] == "machine.connect" && entry["params"]["machine"] == "alpha"
+        )),
+        "machine.connect was not called: {:?}",
+        scratch.entries()
+    );
+
+    // a: add the typed target unchanged; core picks the name.
+    screen.send(b"a");
+    assert!(
+        screen.wait_text("add machine target:", secs(5)),
+        "the add prompt did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"rohan@10.0.0.9:2200");
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "machine.add"
+                && entry["params"]["target"] == "rohan@10.0.0.9:2200")),
+        "machine.add did not receive the target: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        screen.wait_text("rohan@10.0.0.9:2200", secs(5)),
+        "the added machine did not appear after the refresh: {:?}",
+        screen.rendered()
+    );
+
+    // r: rename alpha, with the current name prefilled.
+    screen.send(b"g");
+    screen.send(b"r");
+    assert!(
+        screen.wait_text("rename machine: alpha", secs(5)),
+        "the rename prompt did not start at the current name: {:?}",
+        screen.rendered()
+    );
+    screen.send(&[0x7f, 0x7f, 0x7f, 0x7f, 0x7f]);
+    screen.send(b"rohan-alpha");
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || scratch.entries().iter().any(
+            |entry| entry["call"] == "machine.rename"
+                && entry["params"]["machine"] == "alpha"
+                && entry["params"]["new_name"] == "rohan-alpha"
+        )),
+        "machine.rename was not called: {:?}",
+        scratch.entries()
+    );
+
+    // n: start a terminal on the selected machine, with the normal labels and
+    // the one core connection; the returned address is stored qualified.
+    screen.send(b"j");
+    screen.send(b"n");
+    assert!(
+        common::wait_until(secs(10), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry.get("machine_run").is_some())),
+        "terminal.run with on was not called: {:?}",
+        scratch.entries()
+    );
+    let log = scratch.entries();
+    let run = log
+        .iter()
+        .find(|entry| entry["call"] == "terminal.run" && entry["params"]["on"] == "delta")
+        .expect("the remote run");
+    assert_eq!(
+        run["params"]["labels"]["herdr.client"], "herdr-terminal",
+        "the remote start keeps this client's labels: {run}"
+    );
+    assert!(
+        run["params"]["labels"]["herdr.terminal.pane"].is_string(),
+        "the remote start carries its pane label: {run}"
+    );
+    let remote = log
+        .iter()
+        .find(|entry| entry.get("machine_run").is_some())
+        .and_then(|entry| entry["machine_run"]["address"].as_str())
+        .expect("the mirrored remote address")
+        .to_owned();
+    assert!(remote.starts_with("delta/"), "{remote}");
+    assert!(
+        screen.wait_text(&remote, secs(10)),
+        "the remote pane is not shown: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            .contains(&remote)),
+        "the qualified address is not in the document: {:?}",
+        scratch.doc_value()
+    );
+
+    // The open manager polls on its bounded timer; a closed one does not.
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("machine manager", secs(5)),
+        "the manager did not reopen: {:?}",
+        screen.rendered()
+    );
+    let list_calls = |scratch: &Scratch| {
+        scratch
+            .entries()
+            .iter()
+            .filter(|entry| entry["call"] == "machine.list")
+            .count()
+    };
+    let opened = list_calls(&scratch);
+    assert!(
+        common::wait_until(secs(6), || list_calls(&scratch) > opened),
+        "the open manager did not refresh on its timer"
+    );
+
+    // d: removal needs the explicit confirmation. The selection survived the
+    // reopen on rohan-alpha; two rows down is gamma.
+    screen.send(b"j");
+    screen.send(b"j");
+    screen.send(b"d");
+    assert!(
+        screen.wait_text("remove gamma?", secs(5)),
+        "removal is not confirmed first: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"y");
+    assert!(
+        common::wait_until(secs(5), || scratch.entries().iter().any(
+            |entry| entry["call"] == "machine.rm" && entry["params"]["machine"] == "gamma"
+        )),
+        "machine.rm was not called: {:?}",
+        scratch.entries()
+    );
+    screen.send(b"/gamma");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("0/4 match", secs(5)),
+        "the removed machine is still listed: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(&[0x1b]);
+    let closed = list_calls(&scratch);
+    std::thread::sleep(std::time::Duration::from_millis(2300));
+    assert_eq!(
+        list_calls(&scratch),
+        closed,
+        "a closed machine manager must never poll core"
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry.get("attach_data").is_some()),
+        "a machine-manager key leaked to a program: {log:?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|entry| entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm"),
+        "the machine manager never kills or removes a program: {log:?}"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A mirrored remote terminal is a normal pane: restored at its qualified
+/// address, attached and typed into through local core, renamed without
+/// duplication, and removed when its machine is removed.
+#[cfg(unix)]
+fn workspace_remote_pane_is_restored_typed_into_renamed_and_removed() {
+    let scratch = Scratch::new("m7-remote");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-remote");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "restoring a remote pane never starts a terminal"
+    );
+
+    // Click the remote pane and type: input goes through the local core's
+    // attach stream for the qualified address.
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    let remote_channel = || {
+        scratch
+            .entries()
+            .iter()
+            .find(|entry| entry.get("attached").is_some() && entry["terminal"] == "alpha/t7")
+            .and_then(|entry| entry["attached"].as_u64())
+    };
+    assert!(
+        common::wait_until(secs(10), || {
+            let Some(channel) = remote_channel() else {
+                return false;
+            };
+            scratch.entries().iter().any(|entry| {
+                entry["attach_data"]["channel"] == json!(channel)
+                    && entry["attach_data"]["text"] == "k"
+            })
+        }),
+        "input did not reach the remote terminal: {:?}",
+        scratch.entries()
+    );
+
+    // Rename alpha: the pane and its stream keep running under the new
+    // qualifier, and the document stores the new full address.
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("machine manager", secs(5)),
+        "the manager did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"/alpha");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("1/4 match", secs(5)),
+        "the filter did not select alpha: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"r");
+    screen.send(&[0x7f, 0x7f, 0x7f, 0x7f, 0x7f]);
+    screen.send(b"rohan");
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(10), || scratch.entries().iter().any(
+            |entry| entry["call"] == "machine.rename"
+                && entry["params"]["machine"] == "alpha"
+                && entry["params"]["new_name"] == "rohan"
+        )),
+        "machine.rename was not called: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the remote pane did not move to the new qualifier: {:?}",
+        scratch.doc_value()
+    );
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("machine manager")),
+        "the manager did not close: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"m");
+    assert!(
+        common::wait_until(secs(10), || {
+            let channel = remote_channel();
+            scratch.entries().iter().any(|entry| {
+                entry["attach_data"]["text"] == "m"
+                    && entry["attach_data"]["channel"] == json!(channel)
+            })
+        }),
+        "the renamed remote stream stopped taking input: {:?}",
+        scratch.entries()
+    );
+
+    // Removing the machine removes its pane through core's events; the
+    // client never starts a replacement.
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("machine manager", secs(5)),
+        "the manager did not open for removal: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"d");
+    assert!(
+        screen.wait_text("remove rohan?", secs(5)),
+        "removal is not confirmed first: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"y");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "the removed machine's pane did not leave: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        screen.wait_text("0/3 match", secs(5)),
+        "the removed machine is still listed: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "no remote pane was ever started by a restore or rename"
+    );
+
+    screen.send(&[0x1b]);
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A `missed` snapshot reattaches the remote pane in place; no duplicate pane
+/// is created and no terminal is started.
+#[cfg(unix)]
+fn workspace_remote_pane_survives_missed_without_duplicates() {
+    let scratch = Scratch::new("m7-remote-missed");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-missed");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || {
+            wire_attach_count(&scratch.entries(), "alpha/t7") >= 2
+        }),
+        "the remote pane was not reattached after missed: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        generation_count(&scratch),
+        1,
+        "missed must not need a reconnect: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned(), "alpha/t7".to_owned()],
+        "missed did not duplicate or lose the remote pane: {:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a missed snapshot never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// Reconnecting with a remote pane re-reads the snapshot and reattaches the
+/// same qualified address; the local pane is neither lost nor duplicated.
+#[cfg(unix)]
+fn workspace_remote_pane_survives_reconnect_without_duplicates() {
+    let scratch = Scratch::new("m7-remote-reconnect");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-reconnect");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(15), || {
+            generation_count(&scratch) >= 2
+                && wire_attach_count(&scratch.entries(), "alpha/t7") >= 2
+        }),
+        "the remote pane was not reattached after reconnect: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned(), "alpha/t7".to_owned()],
+        "the reconnect duplicated or lost the remote pane: {:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a reconnect never starts a terminal"
+    );
+    assert!(
+        screen.wait_text("alpha/t7", secs(5)),
+        "the remote pane is no longer drawn after reconnect: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// Another client renamed the machine: core's `removed`/`created` pair moves
+/// this screen's pane by its own pane label, keeping the same attach stream.
+#[cfg(unix)]
+fn workspace_remote_pane_follows_a_created_rename_without_duplication() {
+    let scratch = Scratch::new("m7-remote-created");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-external-rename");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the created rename did not move the pane: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "alpha/t7"),
+        1,
+        "the rename reused the existing stream: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "rohan/t7"),
+        0,
+        "the created event must not attach a duplicate: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a rename event never starts a terminal"
+    );
+
+    // Input still reaches the same stream under the new qualified address.
+    let channel = scratch
+        .entries()
+        .iter()
+        .find(|entry| entry.get("attached").is_some() && entry["terminal"] == "alpha/t7")
+        .and_then(|entry| entry["attached"].as_u64());
+    screen.send(b"m");
+    assert!(
+        common::wait_until(secs(10), || scratch.entries().iter().any(|entry| {
+            entry["attach_data"]["channel"] == json!(channel) && entry["attach_data"]["text"] == "m"
+        })),
+        "input stopped reaching the renamed remote pane: {:?}",
+        scratch.entries()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A remote pane with no attach stream (it lost its program just before the
+/// rename) survives core's `removed`/`created` pair: it moves to the new
+/// address and attaches there instead of being deleted by the first event.
+#[cfg(unix)]
+fn workspace_streamless_remote_pane_survives_a_rename() {
+    let scratch = Scratch::new("m7-remote-streamless-rename");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-remote-streamless-rename");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+
+    // A key on the remote stream makes core lose the program (the pane now
+    // has no stream) and rename the machine, back to back.
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the stream-less pane did not follow the rename: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(10), || {
+            wire_attach_count(&scratch.entries(), "rohan/t7") >= 1
+        }),
+        "the renamed pane was not reattached under its new address: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "alpha/t7"),
+        1,
+        "the old address must not be attached again: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        screen.wait_text("rohan/t7", secs(5)),
+        "the renamed pane is not drawn: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "recovering a renamed pane never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A finished remote pane has no stream either, but its final screen is local.
+/// The same rename pair must move it to the new address and keep the screen,
+/// without attaching or starting anything.
+#[cfg(unix)]
+fn workspace_finished_remote_pane_keeps_its_screen_across_a_rename() {
+    let scratch = Scratch::new("m7-remote-finished-rename");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-remote-finished-rename");
+    assert!(
+        screen.wait_text("FAST", secs(10)),
+        "the finished remote pane's screen was not restored: {:?}",
+        screen.rendered()
+    );
+
+    // Any key on the local pane triggers core's rename pair; the finished
+    // pane's own stream is already gone.
+    screen.send(click(10, 5).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the finished pane did not follow the rename: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        screen.wait_text("rohan/t7", secs(5)),
+        "the finished pane does not show its new address: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.wait_text("FAST", secs(5)),
+        "the final screen was lost across the rename: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "rohan/t7"),
+        0,
+        "a finished pane is never reattached: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a rename never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A stream-less pane whose terminal core removes with no `created` event is
+/// still removed promptly, with its document entry gone.
+#[cfg(unix)]
+fn workspace_streamless_remote_pane_leaves_when_it_is_removed() {
+    let scratch = Scratch::new("m7-remote-streamless-gone");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-remote-gone");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "the stream-less removed pane lingered in the document: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "rohan/t7"),
+        0,
+        "a removal has no new address to attach: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a removal never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A machine renamed while this subscriber was behind: the `missed` snapshot
+/// already has `rohan/t7`, the stored document still names `alpha/t7`. The
+/// pane must be moved by its label, not removed with the old document entry.
+#[cfg(unix)]
+fn workspace_remote_pane_survives_a_rename_in_a_missed_snapshot() {
+    let scratch = Scratch::new("m7-remote-missed-rename");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-missed-rename");
+    assert!(
+        screen.wait_text("FAST", secs(10)),
+        "the finished remote pane's screen was not restored: {:?}",
+        screen.rendered()
+    );
+
+    // Any key on the local pane delivers the fresh snapshot whose terminal
+    // has the new machine prefix; the document is not updated.
+    screen.send(click(10, 5).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the missed rename lost the pane or its document entry: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        screen.wait_text("rohan/t7", secs(5)),
+        "the pane does not show the snapshot's new address: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.wait_text("FAST", secs(5)),
+        "the finished pane's screen was lost across `missed`: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "rohan/t7"),
+        0,
+        "the finished pane must not be attached under the new address: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "`missed` reconciliation never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
 }
 
 /// With no document, the first screen claims an empty one at version 0, starts
@@ -5576,7 +6452,9 @@ fn fake_connect() -> io::Result<()> {
         "methods": [
             "events.subscribe", "terminal.run", "terminal.attach",
             "terminal.get", "terminal.read", "terminal.rm", "terminal.kill",
-            "terminal.label", "doc.get", "doc.set"
+            "terminal.label", "doc.get", "doc.set",
+            "machine.list", "machine.add", "machine.connect", "machine.rename",
+            "machine.rm"
         ],
         "features": features,
     });
@@ -5628,6 +6506,33 @@ fn fake_connect() -> io::Result<()> {
     // scripted manager events while the manager underneath stays open.
     let mut preview_channel: Option<u32> = None;
     let mut manager_events_sent = false;
+    // Core's machine profiles and line states for the machine manager.
+    let mut machines = seeded_machines(&scenario);
+    // Remote terminals mirrored under a machine prefix, so a rename or
+    // removal can emit the same address changes a real core emits.
+    let mut remote_terminals: Vec<String> = if scenario.starts_with("machines-remote") {
+        vec!["alpha/t7".to_owned()]
+    } else {
+        Vec::new()
+    };
+    // The terminal each attach channel shows, for finishing streams when a
+    // machine is removed.
+    let mut channel_targets: BTreeMap<u32, String> = BTreeMap::new();
+    // `machines-missed`: send a fresh snapshot with the remote terminal once.
+    let mut machines_missed_sent = false;
+    // `machines-external-rename`: another client renamed the machine.
+    let mut external_rename_sent = false;
+    // `machines-remote-streamless-rename`: a stream-less pane must survive
+    // core's `removed` + `created` rename pair.
+    let mut streamless_rename_sent = false;
+    // `machines-remote-finished-rename`: a finished remote pane keeps its
+    // final screen across the same pair.
+    let mut finished_rename_sent = false;
+    // `machines-remote-gone`: a stream-less terminal removed with no rename.
+    let mut remote_gone_sent = false;
+    // `machines-missed-rename`: the fresh `missed` snapshot has the machine's
+    // new prefix while the stored document still names the old one.
+    let mut missed_rename_sent = false;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         let mut frame = json!({"channel": channel, "kind": kind, "len": payload.len()});
@@ -5650,6 +6555,7 @@ fn fake_connect() -> io::Result<()> {
         // attach is treated as a fresh paint.
         if kind == CLOSE {
             attached_channels.remove(&channel);
+            channel_targets.remove(&channel);
             if scenario == "manager-events"
                 && preview_channel == Some(channel)
                 && !manager_events_sent
@@ -5747,6 +6653,131 @@ fn fake_connect() -> io::Result<()> {
                 agent_key_script(&scenario, agent_step, &mut output, &mut event_seq)?;
                 continue;
             }
+            if scenario == "machines-reconnect" {
+                // The connection drops with the remote pane still attached.
+                return Ok(());
+            }
+            if scenario == "machines-external-rename" && !external_rename_sent {
+                external_rename_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "alpha/t7", json!({})),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "created",
+                        "rohan/t7",
+                        doc_terminal("rohan/t7", 1, 2, 4),
+                    ),
+                )?;
+                continue;
+            }
+            if scenario == "machines-remote-streamless-rename" && !streamless_rename_sent {
+                // Any key proves the pane is attached. The pane then loses
+                // its stream (a `lost` event), and the rename pair follows
+                // back to back in the same batch.
+                streamless_rename_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "lost",
+                        "alpha/t7",
+                        json!({"reason": "server_stop"}),
+                    ),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "alpha/t7", json!({})),
+                )?;
+                let mut record = live_record(5500);
+                record["address"] = json!("rohan/t7");
+                record["labels"] = client_labels(1, 2, 4);
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "created", "rohan/t7", record),
+                )?;
+                continue;
+            }
+            if scenario == "machines-remote-finished-rename" && !finished_rename_sent {
+                // The pane finished without a stream; its final screen is
+                // local. Core renames the machine: removed then created.
+                finished_rename_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "alpha/t7", json!({})),
+                )?;
+                let mut record = finished_doc_terminal("rohan/t7", 1, 2, 4);
+                record["labels"] = client_labels(1, 2, 4);
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "created", "rohan/t7", record),
+                )?;
+                continue;
+            }
+            if scenario == "machines-remote-gone" && !remote_gone_sent {
+                // A stream-less terminal is removed with no created event:
+                // this pane must leave.
+                remote_gone_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "lost",
+                        "alpha/t7",
+                        json!({"reason": "server_stop"}),
+                    ),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "alpha/t7", json!({})),
+                )?;
+                continue;
+            }
+            if scenario == "machines-missed-rename" && !missed_rename_sent {
+                // Another client renamed the machine while this subscriber
+                // was behind: the fresh snapshot carries only the new
+                // address, but the stored document still names the old one.
+                missed_rename_sent = true;
+                notify(
+                    &mut output,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "missed",
+                        "params": {"seq": 9, "terminals": [
+                            doc_terminal("t1", 1, 2, 3),
+                            finished_doc_terminal("rohan/t7", 1, 2, 4),
+                        ]},
+                    }),
+                )?;
+                continue;
+            }
+            if scenario == "machines-missed" && !machines_missed_sent {
+                machines_missed_sent = true;
+                notify(
+                    &mut output,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "missed",
+                        "params": {"seq": 9, "terminals": [
+                            doc_terminal("t1", 1, 2, 3),
+                            doc_terminal("alpha/t7", 1, 2, 4),
+                        ]},
+                    }),
+                )?;
+                continue;
+            }
             if !triggered {
                 triggered = true;
                 match scenario.as_str() {
@@ -5829,6 +6860,218 @@ fn fake_connect() -> io::Result<()> {
                     snapshot_for(&scenario, generation, pending_name.as_deref(), &started);
                 reply(&mut output, &id, snapshot)?;
             }
+            "machine.list" => {
+                let listed: Vec<Value> = machines.to_vec();
+                reply(&mut output, &id, json!({"machines": listed}))?;
+            }
+            "machine.add" => {
+                let target = message["params"]["target"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if target.is_empty() || target == "refused" {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "invalid_params",
+                        "a machine needs a target",
+                        "hc machine add TARGET",
+                    )?;
+                    continue;
+                }
+                let requested = message["params"]["name"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| machine_name_for(&target));
+                let mut name = requested.clone();
+                let mut suffix = 2;
+                while machines
+                    .iter()
+                    .any(|machine| machine["name"] == json!(name))
+                {
+                    name = format!("{requested}-{suffix}");
+                    suffix += 1;
+                }
+                let entry = machine_entry(MachineSeed {
+                    name: &name,
+                    target: &target,
+                    state: "connecting",
+                    why: None,
+                    temporary: message["params"]["temporary"].as_bool().unwrap_or(false),
+                    via: false,
+                    session: message["params"]["session"].as_str(),
+                    host: "",
+                });
+                machines.push(entry.clone());
+                reply(&mut output, &id, machine_profile(&entry))?;
+            }
+            "machine.connect" => {
+                let name = message["params"]["machine"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let Some(index) = machines
+                    .iter()
+                    .position(|machine| machine["name"] == json!(name))
+                else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "machine_unknown",
+                        &format!("no machine named {name}"),
+                        "machine.list names them",
+                    )?;
+                    continue;
+                };
+                if scenario == "machines-connect-fail" {
+                    machines[index]["state"] = json!("unreachable");
+                    machines[index]["why"] = json!("connection refused");
+                    machines[index]["since_ms"] = json!(fake_now_ms() - 60_000);
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "unreachable",
+                        &format!("could not reach {name}: connection refused"),
+                        "check the target and ssh login",
+                    )?;
+                    continue;
+                }
+                machines[index]["state"] = json!("connected");
+                machines[index]["why"] = Value::Null;
+                let view = machines[index].clone();
+                reply(&mut output, &id, view)?;
+            }
+            "machine.rename" => {
+                let old = message["params"]["machine"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let new = message["params"]["new_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let Some(index) = machines
+                    .iter()
+                    .position(|machine| machine["name"] == json!(old))
+                else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "machine_unknown",
+                        &format!("no machine named {old}"),
+                        "machine.list names them",
+                    )?;
+                    continue;
+                };
+                let valid = !new.is_empty()
+                    && new.len() <= 32
+                    && new
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+                if !valid {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "invalid_params",
+                        "a machine name is 1-32 characters from a-z, 0-9, '-' '_' '.'",
+                        "pick another name",
+                    )?;
+                    continue;
+                }
+                if machines
+                    .iter()
+                    .enumerate()
+                    .any(|(other, machine)| other != index && machine["name"] == json!(new))
+                {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "name_taken",
+                        &format!("a machine named {new} already exists"),
+                        "pick another name",
+                    )?;
+                    continue;
+                }
+                machines[index]["name"] = json!(new);
+                // Rename mirrored terminals exactly as core does: removed for
+                // the old address, created for the new, streams left open.
+                let renamed: Vec<(String, String)> = remote_terminals
+                    .iter()
+                    .filter_map(|address| {
+                        address
+                            .strip_prefix(&format!("{old}/"))
+                            .map(|rest| (address.clone(), format!("{new}/{rest}")))
+                    })
+                    .collect();
+                for (from, to) in &renamed {
+                    if let Some(slot) = remote_terminals.iter_mut().find(|a| *a == from) {
+                        slot.clone_from(to);
+                    }
+                    for target in channel_targets.values_mut() {
+                        if target == from {
+                            target.clone_from(to);
+                        }
+                    }
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(event_seq, "removed", from, json!({})),
+                    )?;
+                    let mut record = live_record(5400);
+                    record["address"] = json!(to);
+                    event_seq += 1;
+                    notify(&mut output, agent_event(event_seq, "created", to, record))?;
+                }
+                let renamed = machines[index].clone();
+                reply(&mut output, &id, machine_profile(&renamed))?;
+            }
+            "machine.rm" => {
+                let name = message["params"]["machine"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let Some(index) = machines
+                    .iter()
+                    .position(|machine| machine["name"] == json!(name))
+                else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "machine_unknown",
+                        &format!("no machine named {name}"),
+                        "machine.list names them",
+                    )?;
+                    continue;
+                };
+                machines.remove(index);
+                reply(&mut output, &id, json!({"removed": true}))?;
+                let gone: Vec<String> = remote_terminals
+                    .iter()
+                    .filter(|address| address.starts_with(&format!("{name}/")))
+                    .cloned()
+                    .collect();
+                remote_terminals.retain(|address| !gone.contains(address));
+                for address in &gone {
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(event_seq, "removed", address, json!({})),
+                    )?;
+                }
+                // Core forgets the line and finishes its relayed streams.
+                let channels: Vec<u32> = channel_targets
+                    .iter()
+                    .filter(|(_, target)| gone.contains(target))
+                    .map(|(channel, _)| *channel)
+                    .collect();
+                for channel in channels {
+                    write_frame(&mut output, channel, CLOSE, b"")?;
+                    attached_channels.remove(&channel);
+                    channel_targets.remove(&channel);
+                }
+            }
             "terminal.run" => {
                 runs += 1;
                 if scenario == "workspace-pending" && generation == 1 && runs == 2 {
@@ -5837,11 +7080,39 @@ fn fake_connect() -> io::Result<()> {
                     return Ok(());
                 }
                 let name = message["params"]["name"].as_str().unwrap_or_default();
+                let machine_on = message["params"]["on"].as_str().map(str::to_owned);
+                if let Some(on) = &machine_on
+                    && !machines.iter().any(|machine| machine["name"] == json!(on))
+                {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "machine_unknown",
+                        &format!("no machine named {on}"),
+                        "ht machine manager lists machines",
+                    )?;
+                    continue;
+                }
                 last_run_labels = message["params"]["labels"]
                     .as_object()
                     .cloned()
                     .unwrap_or_default();
-                let record = if scenario == "workspace-pending" {
+                let record = if let Some(on) = &machine_on {
+                    // A machine run is mirrored under the machine's prefix;
+                    // the labels and every other run field are the client's
+                    // own. Tests read `machine_run` to see what core mapped.
+                    let address = format!("{on}/t{}", 8 + runs);
+                    remote_terminals.push(address.clone());
+                    log(
+                        log_path,
+                        json!({"machine_run": {"on": on, "address": address}}),
+                    );
+                    let mut record = live_record(5200 + runs);
+                    record["address"] = json!(address);
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    record
+                } else if scenario == "workspace-pending" {
                     if runs == 1 {
                         named_record("t1", name, 4242)
                     } else {
@@ -5967,6 +7238,20 @@ fn fake_connect() -> io::Result<()> {
                         "t1 has finished",
                         "read what it left: hc read t1",
                     )?;
+                } else if matches!(
+                    scenario.as_str(),
+                    "machines-remote-finished-rename" | "machines-missed-rename"
+                ) && target == "alpha/t7"
+                {
+                    // The remote pane finished before this screen attached;
+                    // its final screen is recovered and kept without a stream.
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "finished",
+                        "alpha/t7 has finished",
+                        "read what it left: hc read alpha/t7",
+                    )?;
                 } else if parked {
                     // The kept terminal has no program until core restarts
                     // it; the `restarted` event follows immediately.
@@ -5989,6 +7274,7 @@ fn fake_connect() -> io::Result<()> {
                     let channel = next_channel;
                     next_channel += 1;
                     attached_channels.insert(channel);
+                    channel_targets.insert(channel, target.clone());
                     log(log_path, json!({"attached": channel, "terminal": target}));
                     let second_pane = target == "t2"
                         && matches!(scenario.as_str(), "workspace-pending" | "workspace-missed");
@@ -6012,6 +7298,12 @@ fn fake_connect() -> io::Result<()> {
                         } else {
                             doc_record_for(&scenario, &target)
                         }
+                    } else if target.contains('/') {
+                        // A mirrored remote terminal keeps its qualified
+                        // address; the client stores it verbatim.
+                        let mut record = live_record(5300);
+                        record["address"] = json!(target);
+                        record
                     } else if doc_scenario(&scenario)
                         && target == last_run_address
                         && target != "t1"
@@ -6672,6 +7964,19 @@ fn snapshot_for(
             cross_screen_worker_record("t9"),
             same_screen_stale_worker_record("t10"),
         ],
+        "machines-remote"
+        | "machines-missed"
+        | "machines-reconnect"
+        | "machines-external-rename"
+        | "machines-remote-streamless-rename"
+        | "machines-remote-gone" => vec![
+            doc_terminal("t1", 1, 2, 3),
+            doc_terminal("alpha/t7", 1, 2, 4),
+        ],
+        "machines-remote-finished-rename" | "machines-missed-rename" => vec![
+            doc_terminal("t1", 1, 2, 3),
+            finished_doc_terminal("alpha/t7", 1, 2, 4),
+        ],
         "doc-restore"
         | "doc-remove"
         | "doc-deleted-recover"
@@ -6711,6 +8016,135 @@ fn snapshot_for(
         _ => Vec::new(),
     };
     json!({"seq": 1, "terminals": terminals, "channel": EVENTS_CHANNEL})
+}
+
+/// Core's machine profiles for a machine-manager scenario. Lines carry the
+/// state, age and reason core reports; profiles do not.
+fn seeded_machines(scenario: &str) -> Vec<Value> {
+    if !scenario.starts_with("machines") {
+        return Vec::new();
+    }
+    vec![
+        machine_entry(MachineSeed {
+            name: "alpha",
+            target: "can@alpha.example:2222",
+            state: "connected",
+            why: None,
+            temporary: false,
+            via: false,
+            session: None,
+            host: "alpha-host",
+        }),
+        machine_entry(MachineSeed {
+            name: "delta",
+            target: "ssh -J jump.example delta.example",
+            state: "connected",
+            why: None,
+            temporary: true,
+            via: true,
+            session: Some("work"),
+            host: "delta-host",
+        }),
+        machine_entry(MachineSeed {
+            name: "gamma",
+            target: "gamma.example",
+            state: "needs_login",
+            why: Some("password required"),
+            temporary: false,
+            via: false,
+            session: None,
+            host: "",
+        }),
+        machine_entry(MachineSeed {
+            name: "beta",
+            target: "beta.example",
+            state: "unreachable",
+            why: Some("connection refused"),
+            temporary: false,
+            via: false,
+            session: None,
+            host: "",
+        }),
+    ]
+}
+
+struct MachineSeed<'a> {
+    name: &'a str,
+    target: &'a str,
+    state: &'a str,
+    why: Option<&'a str>,
+    temporary: bool,
+    via: bool,
+    session: Option<&'a str>,
+    host: &'a str,
+}
+
+fn machine_entry(seed: MachineSeed<'_>) -> Value {
+    let MachineSeed {
+        name,
+        target,
+        state,
+        why,
+        temporary,
+        via,
+        session,
+        host,
+    } = seed;
+    let since = matches!(state, "unreachable" | "needs_login" | "needs_update")
+        .then(|| json!(fake_now_ms() - 60_000));
+    json!({
+        "name": name,
+        "target": target,
+        "via": via,
+        "temporary": temporary,
+        "session": session,
+        "id": format!("id-{name}"),
+        "host": host,
+        "version": "0.1.18",
+        "state": state,
+        "since_ms": since,
+        "why": why,
+    })
+}
+
+fn machine_profile(entry: &Value) -> Value {
+    let mut profile = entry.clone();
+    if let Some(object) = profile.as_object_mut() {
+        for field in ["state", "since_ms", "why"] {
+            object.remove(field);
+        }
+    }
+    profile
+}
+
+/// Core's default name for a target: the host part, cleaned to the name
+/// alphabet. The client never derives this itself; it reads the reply.
+fn machine_name_for(target: &str) -> String {
+    let host = target.rsplit('@').next().unwrap_or(target);
+    let host = host.split(':').next().unwrap_or(host);
+    let name: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = name.trim_matches('-').to_owned();
+    if name.is_empty() {
+        "machine".to_owned()
+    } else {
+        name
+    }
+}
+
+fn fake_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn client_labels(space: u64, tab: u64, pane: u64) -> Value {
@@ -6780,6 +8214,16 @@ fn doc_terminal(address: &str, space: u64, tab: u64, pane: u64) -> Value {
     let mut record = live_record(9000 + pane as u32);
     record["address"] = json!(address);
     record["labels"] = client_labels(space, tab, pane);
+    record
+}
+
+/// The same pane's record after its program exited normally.
+fn finished_doc_terminal(address: &str, space: u64, tab: u64, pane: u64) -> Value {
+    let mut record = doc_terminal(address, space, tab, pane);
+    record["state"] = json!("finished");
+    record["pid"] = Value::Null;
+    record["reason"] = json!("exited");
+    record["exit_code"] = json!(7);
     record
 }
 

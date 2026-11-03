@@ -27,6 +27,8 @@ impl Screen<'_> {
             link.needs_facts = false;
             link.last_facts = None;
         }
+        // A queued removal belongs to the dead connection's event stream.
+        self.deferred_removals.clear();
         self.reconn = Some(Reconnect {
             attempt: 0,
             next: Instant::now(),

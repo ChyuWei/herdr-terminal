@@ -509,6 +509,32 @@ impl Workspace {
         self.pane_by_address(address).map(|pane| pane.id)
     }
 
+    /// Points one pane at the same terminal under a new address, used when
+    /// core renames a machine and mirrored addresses change prefix. A name
+    /// that was just the old address follows it; a user-visible title or an
+    /// unrelated name does not. Returns false for an unknown pane, an empty
+    /// address, or one already shown by another pane.
+    pub fn rename_pane_address(&mut self, pane: PaneId, address: String) -> bool {
+        if address.is_empty() {
+            return false;
+        }
+        if self
+            .panes
+            .values()
+            .any(|other| other.id != pane && other.address == address)
+        {
+            return false;
+        }
+        let Some(pane) = self.panes.get_mut(&pane) else {
+            return false;
+        };
+        if pane.name == pane.address {
+            pane.name.clone_from(&address);
+        }
+        pane.address = address;
+        true
+    }
+
     /// The space/tab that owns a pane, if it is in a layout.
     pub fn location(&self, pane: PaneId) -> Option<(SpaceId, TabId)> {
         for space in &self.spaces {

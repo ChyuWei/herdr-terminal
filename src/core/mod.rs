@@ -7,12 +7,15 @@ pub mod events;
 pub mod frames;
 pub mod rpc;
 
-pub use connection::{Attached, CoreClient, LABEL_TIMEOUT, RunOptions, StreamItem};
+pub use connection::{
+    Attached, CoreClient, LABEL_TIMEOUT, MACHINE_LIST_TIMEOUT, RunOptions, StreamItem,
+};
 pub use events::{EventKind, EventStream, LineBuffer, Notification, parse_notification};
 pub use frames::{Frame, FrameDecoder, FrameError, Kind};
 pub use rpc::{
     AttachResult, CoreInfo, CoreVersion, Display, DocGetResult, DocSetResult, Foreground, Hello,
-    MINIMUM_CORE, Mismatch, ReadResult, RpcError, Snapshot, Status, Terminal,
+    MINIMUM_CORE, Machine, MachineAdd, MachineListResult, Mismatch, ReadResult, RpcError, Snapshot,
+    Status, Terminal,
 };
 
 use std::fmt;

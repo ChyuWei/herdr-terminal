@@ -131,6 +131,7 @@ fn render_agents(
         selections: &empty,
         scroll_hint: None,
         manager: &[],
+        machines: &[],
         preview: None,
     };
     let rendered = render_with(&mut buffer, area, workspace, ui, &view);
@@ -530,6 +531,7 @@ fn a_local_selection_paints_its_cells_with_the_theme_selection_color() {
         selections: &selections,
         scroll_hint: None,
         manager: &[],
+        machines: &[],
         preview: None,
     };
     let mut buffer = Buffer::empty(area);
@@ -560,6 +562,7 @@ fn the_scroll_hint_replaces_the_idle_status_hint() {
         selections: &BTreeMap::new(),
         scroll_hint: Some("scroll 2/18 · Shift-PgDn live"),
         manager: &[],
+        machines: &[],
         preview: None,
     };
     let mut buffer = Buffer::empty(area);
@@ -589,6 +592,7 @@ fn explicit_themes_style_the_chrome_consistently() {
             selections: &BTreeMap::new(),
             scroll_hint: None,
             manager: &[],
+            machines: &[],
             preview: None,
         };
         let mut buffer = Buffer::empty(area);
@@ -626,6 +630,7 @@ fn the_terminal_grid_is_not_painted_by_the_theme() {
         selections: &BTreeMap::new(),
         scroll_hint: None,
         manager: &[],
+        machines: &[],
         preview: None,
     };
     let mut buffer = Buffer::empty(area);
@@ -658,6 +663,7 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
         selections: &BTreeMap::new(),
         scroll_hint: Some("scroll 20/60 · Shift-PgDn live"),
         manager: &[],
+        machines: &[],
         preview: None,
     };
     let mut buffer = Buffer::empty(area);
@@ -688,6 +694,7 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
         selections: &BTreeMap::new(),
         scroll_hint: None,
         manager: &[],
+        machines: &[],
         preview: None,
     };
     let mut buffer = Buffer::empty(area);
@@ -725,6 +732,7 @@ fn render_manager(ui: &UiState, rows: &[ManagerRow], width: u16, height: u16) ->
         selections: &selections,
         scroll_hint: None,
         manager: rows,
+        machines: &[],
         preview: None,
     };
     let mut buffer = Buffer::empty(area);
@@ -840,6 +848,7 @@ fn the_preview_draws_a_read_only_border_title_and_terminal() {
         selections: &selections,
         scroll_hint: None,
         manager: &[],
+        machines: &[],
         preview: Some(&screen),
     };
     let mut buffer = Buffer::empty(area);

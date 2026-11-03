@@ -79,6 +79,13 @@ impl Session {
         &self.address
     }
 
+    /// Points the session at the same terminal under a new address, used when
+    /// core renames a machine and every mirrored address changes prefix. The
+    /// attach channel and ownership are unchanged.
+    pub fn set_address(&mut self, address: String) {
+        self.address = address;
+    }
+
     /// Whether this process ran the terminal (as opposed to adopting it).
     pub fn owned(&self) -> bool {
         self.owned

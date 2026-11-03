@@ -331,8 +331,9 @@ fn compact_facts(row: &ManagerRow) -> Vec<String> {
 
 /// The marker, status word and address. The address is shortened with `…` when
 /// the base would exceed `width`; at widths too small for even the head, the
-/// head itself is clipped as the only alternative to wrapping.
-fn fit_base(head: &str, address: &str, width: usize) -> String {
+/// head itself is clipped as the only alternative to wrapping. Shared with the
+/// machine manager, whose rows follow the same width rule.
+pub(super) fn fit_base(head: &str, address: &str, width: usize) -> String {
     let head_len = head.chars().count();
     if head_len + address.chars().count() <= width {
         return format!("{head}{address}");
@@ -351,8 +352,9 @@ fn fit_base(head: &str, address: &str, width: usize) -> String {
     text
 }
 
-/// Appends ` · fact` when it fits; false when it does not.
-fn push_fact(text: &mut String, fact: &str, width: usize) -> bool {
+/// Appends ` · fact` when it fits; false when it does not. Shared with the
+/// machine manager.
+pub(super) fn push_fact(text: &mut String, fact: &str, width: usize) -> bool {
     let extra = format!(" · {fact}");
     if text.chars().count() + extra.chars().count() > width {
         return false;

@@ -19,6 +19,7 @@
 mod agents;
 mod events;
 mod input;
+mod machines;
 mod manager;
 mod mouse;
 mod overlays;
@@ -26,6 +27,7 @@ mod panes;
 mod reconnect;
 mod sync;
 
+use super::machines::MachineRow;
 use agents::AgentRuntime;
 use manager::ManagerPreview;
 
@@ -158,6 +160,8 @@ pub(super) struct Settings {
 struct PendingStart {
     request: StartRequest,
     name: String,
+    /// The machine the start was for, so a retry never falls back to local.
+    on: Option<String>,
 }
 
 pub(super) struct Screen<'a> {
@@ -169,6 +173,9 @@ pub(super) struct Screen<'a> {
     model: Model,
     workspace: Workspace,
     links: BTreeMap<PaneId, Link>,
+    /// Stream-less panes whose `removed` waits one event batch for a
+    /// same-rename `created` to move them first.
+    deferred_removals: Vec<(PaneId, String)>,
     /// The shared document's base, version and CAS state.
     doc: DocState,
     /// The per-screen focus/zoom file.
@@ -183,6 +190,11 @@ pub(super) struct Screen<'a> {
     agents: AgentRuntime,
     /// The Core-wide manager's inventory, refreshed once per frame while open.
     manager_rows: Vec<ManagerRow>,
+    /// Core's machines, refreshed on open, after each action and on a timer
+    /// while the machine manager stays open.
+    machine_rows: Vec<MachineRow>,
+    /// When the open machine manager should ask core again.
+    machine_next_refresh: Option<Instant>,
     /// The read-only observer preview, when one is open.
     preview: Option<ManagerPreview>,
     terminal: ScreenTerminal,
@@ -243,6 +255,7 @@ impl<'a> Screen<'a> {
             model,
             workspace,
             links: BTreeMap::new(),
+            deferred_removals: Vec::new(),
             doc,
             view,
             seen,
@@ -250,6 +263,8 @@ impl<'a> Screen<'a> {
             ui,
             agents: AgentRuntime::default(),
             manager_rows: Vec::new(),
+            machine_rows: Vec::new(),
+            machine_next_refresh: None,
             preview: None,
             terminal,
             guard,
@@ -351,6 +366,7 @@ impl<'a> Screen<'a> {
         if self.reconn.is_some() {
             return Ok(());
         }
+        self.refresh_machines_if_due();
         self.poll_input(had_data || preview_data)?;
         self.drive_search();
         self.sync_mouse()?;
@@ -479,6 +495,7 @@ impl<'a> Screen<'a> {
         let visible = &screens;
         let rows = &self.agents.rows;
         let manager_rows = &self.manager_rows;
+        let machine_rows = &self.machine_rows;
         let theme = &self.theme;
         let scroll_hint = self.scroll_hint();
         // A finished pane has no prompt to type into; its final cursor would
@@ -505,6 +522,7 @@ impl<'a> Screen<'a> {
                     selections: &selections,
                     scroll_hint: scroll_hint.as_deref(),
                     manager: manager_rows,
+                    machines: machine_rows,
                     preview: preview_screen.as_ref(),
                 };
                 let rendered =

@@ -55,6 +55,9 @@ impl Screen<'_> {
         self.ui.selecting = None;
         self.ui.peek = None;
         self.ui.sidebar.open = false;
+        self.ui.machines.open = false;
+        self.ui.machines.prompt = None;
+        self.ui.machines.confirm = None;
         self.ui.manager.open = true;
         self.ui.manager.filtering = false;
         self.ui.manager.selected = focused;

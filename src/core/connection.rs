@@ -9,8 +9,9 @@ use super::discovery;
 use super::events::{self, EventStream, Notification};
 use super::frames::{Frame, FrameDecoder, FrameError, parse_resize};
 use super::rpc::{
-    AttachResult, DocGetResult, DocSetResult, Hello, RESIZE_NOTIFICATIONS, ReadResult, RpcError,
-    Snapshot, Terminal,
+    AttachResult, DocGetResult, DocSetResult, Hello, Machine, MachineAdd, MachineListResult,
+    RESIZE_NOTIFICATIONS, ReadResult, RpcError, Snapshot, Terminal, machine_params,
+    machine_rename_params,
 };
 use super::{Error, Result};
 use serde_json::{Value, json};
@@ -31,6 +32,10 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared label writes must not block the UI for the 10 s call default.
 pub const LABEL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The machine manager refreshes its inventory while open; a slow or wedged
+/// core must not hold the UI for the full call default.
+pub const MACHINE_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 
 const READ_CHUNK: usize = 64 * 1024;
 const MAX_HELLO_LINE: usize = 1 << 20;
@@ -82,6 +87,9 @@ pub struct RunOptions {
     /// it will attach with. Older cores ignore the field; a core that applies
     /// it starts the program at this size before the first attach.
     pub size: Option<(u16, u16)>,
+    /// Start the program on another machine this core added. The terminal's
+    /// address is then `machine/t7`; core relays attach, input and resize.
+    pub on: Option<String>,
 }
 
 impl Default for RunOptions {
@@ -95,6 +103,7 @@ impl Default for RunOptions {
             keep: false,
             no_parent: true,
             size: None,
+            on: None,
         }
     }
 }
@@ -115,7 +124,9 @@ pub fn client_labels() -> BTreeMap<String, String> {
 
 /// The `terminal.run` params. `size` is included only when the caller knows
 /// the grid the terminal will attach at; cores that predate the field ignore
-/// it, and a core that applies it starts the program at that size.
+/// it, and a core that applies it starts the program at that size. `on` is
+/// included only when the terminal runs on another machine; every local start
+/// keeps exactly the params it sent before.
 fn run_params(options: &RunOptions) -> Value {
     let mut params = json!({
         "argv": &options.argv,
@@ -130,6 +141,9 @@ fn run_params(options: &RunOptions) -> Value {
     }
     if let Some((cols, rows)) = options.size {
         params["size"] = json!({"cols": cols, "rows": rows});
+    }
+    if let Some(machine) = &options.on {
+        params["on"] = json!(machine);
     }
     params
 }
@@ -503,6 +517,43 @@ impl CoreClient {
             routes.retired.insert(channel);
         }
         let _ = self.write(Frame::close(channel, None));
+    }
+
+    /// The machines this core added, with the state of each line. A bounded
+    /// timeout: the machine manager polls this while open, and a slow core
+    /// must not stall the UI for the full call default.
+    pub fn machine_list(&self) -> Result<Vec<Machine>> {
+        let value = self.call_timeout("machine.list", json!({}), MACHINE_LIST_TIMEOUT)?;
+        let result: MachineListResult = serde_json::from_value(value)?;
+        Ok(result.machines)
+    }
+
+    /// Adds another machine. `params.target` is sent unchanged; core dials it,
+    /// checks that hc answers there and derives the name. A failure
+    /// (`invalid_params`, `name_taken`, `already_added`, `unreachable`,
+    /// `hc_missing`, `incompatible`) is reported to the caller.
+    pub fn machine_add(&self, params: &MachineAdd) -> Result<Machine> {
+        let value = self.call("machine.add", serde_json::to_value(params)?)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Dials a machine now instead of at its next retry and reports its line.
+    pub fn machine_connect(&self, machine: &str) -> Result<Machine> {
+        let value = self.call("machine.connect", machine_params(machine))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Gives a machine a new name here. Only this core's name changes.
+    pub fn machine_rename(&self, machine: &str, new_name: &str) -> Result<Machine> {
+        let value = self.call("machine.rename", machine_rename_params(machine, new_name))?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Forgets a machine here. Its terminals keep running there; core emits
+    /// `removed` for the mirrored records.
+    pub fn machine_rm(&self, machine: &str) -> Result<()> {
+        self.call("machine.rm", machine_params(machine))?;
+        Ok(())
     }
 
     /// Reads a versioned opaque document. An absent document is
@@ -913,6 +964,23 @@ mod tests {
         assert_eq!(
             run_params(&options)["size"],
             json!({"cols": 78, "rows": 20})
+        );
+    }
+
+    #[test]
+    fn run_params_send_on_only_for_a_machine_start() {
+        let mut options = RunOptions::default();
+        let local = run_params(&options);
+        assert!(
+            local.get("on").is_none(),
+            "a local start must not grow an on field: {local}"
+        );
+        options.on = Some("rohan".into());
+        assert_eq!(run_params(&options)["on"], json!("rohan"));
+        assert_eq!(
+            run_params(&options)["labels"],
+            json!(options.labels),
+            "labels are unchanged by a machine start"
         );
     }
 
