@@ -8,7 +8,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 
 **状态：** 已实现，还未发布。客户端连接 Herdr Core，用本地 VT 渲染终端，提供带恢复和 agent 感知的 spaces/tabs/panes 工作区，并具备日常使用的输入能力：鼠标、有上限的 scrollback 和搜索、选择与复制/粘贴、命令面板，以及带 default/dark/light 主题的启动配置。后续功能见下方计划。
 
-**兼容性：** 支持 Herdr Core 0.1.16 及更新版本，协议 generation 1。可选能力根据 Core 在 `hello` 中声明的 features 启用，而不检查版本字符串。测试使用 Core 0.1.17；0.1.16 通过源码和缺少该 feature 时的路径核对，并未运行真实的 0.1.16 二进制。
+**兼容性：** 支持 Herdr Core 0.1.17 及更新版本，协议 generation 1。连接时若 Core 更旧或版本无法解析，客户端会给出更新提示并拒绝连接；缺少必需方法或 feature 的 Core 也会被拒绝。`resize_notifications` 是连接必需的能力，并非可选（observer attach 没有回退路径）；其余能力根据 Core 在 `hello` 中声明的 features 启用，而不是检查版本字符串。
 
 ## 功能
 
@@ -17,7 +17,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 - **连接**：发现 Core、单条长连接、`hello` 检查、断线重连，运行中的程序不丢。
 - **终端**：运行、attach、本地 VT 渲染、键盘和鼠标输入、resize、focus、display facts、基于 credit 的流控，以及 `lost`/`restarted`/`finished` 生命周期。
 - **文本渲染**：默认开启 grapheme clustering，与 Core 和 Herdr App 一致，因此 `✍️`、`❤️` 等带 variation selector 的 emoji 是一个宽两格的 cluster，后面紧跟一个零宽占位格，不会拆成不同单元格。
-- **初始终端尺寸**：启动新终端时会带上 attach 时将使用的网格（初始 shell、split/tab/space、显式程序、`ht screen`、重连后的替换终端和 `ht probe`），因此只读取一次尺寸的程序也能以正确的布局启动。早于该字段的 Core 会忽略它并继续工作。
+- **初始终端尺寸**：启动新终端时会带上 attach 时将使用的网格（初始 shell、split/tab/space、显式程序、`ht screen`、重连后的替换终端和 `ht probe`），因此只读取一次尺寸的程序也能以正确的布局启动。所有受支持的 Core 都会应用该字段，因此不需要版本判断。
 - **工作区**：创建 spaces、tabs、panes；split/close/move；focus、zoom；重命名 tab 和 space。
 - **终端管理**：labels、keep、kill/rm、shell 或命令。
 - **Agent**：status、turn、title、foreground、agent 侧栏、本地 VT peek、跳转、seen/pinned、blocked/finished 提醒。
@@ -31,6 +31,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 - **设置**：启动时读取 `$XDG_CONFIG_HOME/herdr-terminal/config.json`（HOME 回退），支持 theme、scrollback、mouse、clipboard 和前缀键位；坏值会警告并回退。设置只在启动时读取，没有设置 UI 或热重载。
 - **性能**：每帧的处理量、scrollback 和搜索都有上限，大输出时输入仍保持响应。
 - **CLI**：`ht` 打开工作区，`ht screen` 运行或重新 attach 单个终端，`ht probe` 输出原始 attach 字节；`--version`、`--help`、`--hc`、`--cols`、`--rows`、`-v`。
+- **发布**：macOS Apple Silicon 发布包，包含 `ht`、许可证和生成的第三方 notices；GitHub Actions CI 和由 tag 触发的 GitHub release 工作流。发布包要求 Herdr Core 0.1.17 或更新版本，且不包含 Core。
 
 **计划中**
 
@@ -38,7 +39,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 - **工作区打磨**：tab 重排、自定义布局、无障碍（accessibility）。
 - **多机器**：add/connect/list/rename/rm、远程终端和事件。
 - **文件**：read/write/edit、diff、外部编辑器、简单文件选择器。
-- **发布**：打包、安装、`--skill`、CLI 文档、`ht status` 和 Core/日志诊断。
+- **发布**：安装脚本、`--skill`、CLI 文档、`ht status` 和 Core/日志诊断。
 - **Mods/plugins（postponed）**：后续走 manifest + 外部命令模型，不用 JS/GPUI。
 - **Kitty 图片（postponed）**：有需求时再支持。
 

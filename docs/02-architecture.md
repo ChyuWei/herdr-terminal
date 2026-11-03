@@ -291,9 +291,11 @@ must never dirty the layout document.
 
 **Supported Core**
 
-Core 0.1.16 or newer at protocol generation 1. Optional capabilities are gated
-on `hello.features`, never a version string. Testing uses 0.1.17; 0.1.16 is
-checked by source and the no-feature path, not by running a 0.1.16 binary.
+Core 0.1.17 or newer at protocol generation 1, with the required methods and
+features (including `resize_notifications`). Older or unreadable versions are
+refused at connect with a message naming the reported and minimum versions and
+the update path. There is no reduced-capability mode. Other optional
+capabilities are gated on `hello.features`, never a version string.
 
 **Shared Core**
 
@@ -310,7 +312,7 @@ and reattaches. `ht` has no update command.
 
 1. Discover the core binary (configured path, `PATH`, login shell `PATH`, usual install dirs; accept it only if `--version` prints `hc …`).
 2. Connect to the socket or `hc connect`; send `hello {"framed": true}`.
-3. Check generation, version, methods and features; fail with a clear message if a required method is missing.
+3. Check generation, minimum version, methods and features; fail with a clear message if a required method or feature is missing, or the core is older than 0.1.17 or its version is unreadable.
 4. `events.subscribe`; keep the snapshot.
 5. Read the `herdr-terminal` document. If it is absent (version 0), claim an
    empty one at version 0; a lost claim race re-reads the winner. If it was
@@ -336,24 +338,22 @@ explicit PROGRAM after restore, `ht screen`, a replacement after reconnect, and
 `ht probe`. Workspace starts use the pending pane's exact inner grid, previewed
 on a clone of the deterministic insertion so a failed run leaves no empty tab.
 A path that cannot know the size omits the field and core's default applies.
-Older cores ignore the unknown field; no version gate is used. This matters
-because a program that reads its size once at startup, before a viewer
+The minimum supported Core applies the field, so no version gate is used. This
+matters because a program that reads its size once at startup, before a viewer
 attaches, would otherwise draw its first frame at core's default size.
 
 **Observer attach**
 
 The client library can attach a terminal as a read-only observer for a future
 peek view; no peek UI uses it yet. `terminal.attach` takes `observe` and
-`resize_notifications`; the client requests them only when `hello.features`
-advertises `resize_notifications`, and no Core version string is consulted. The
-reply must confirm the feature, or the client abandons the channel and fails
-instead of falling back to a normal attach that would take over the grid. A
-confirmed observer receives RESIZE (kind 3, four little-endian bytes) before
-each paint that uses a new grid, applies it to the local VT before the following
-DATA, and pays no stream credit for it. It sends no keys, mouse reports, RESIZE,
-FOCUS or FACTS. Normal attaches are unchanged; on a core without the feature,
-the `size` event updates the terminal record, while the pane VT follows the
-client layout and its own RESIZE.
+`resize_notifications`; the connection requires the feature, so the client
+requests both unconditionally and consults no Core version string. The reply
+must confirm the feature, or the client abandons the channel and fails instead
+of falling back to a normal attach that would take over the grid. A confirmed
+observer receives RESIZE (kind 3, four little-endian bytes) before each paint
+that uses a new grid, applies it to the local VT before the following DATA, and
+pays no stream credit for it. It sends no keys, mouse reports, RESIZE, FOCUS or
+FACTS. Normal attaches are unchanged.
 
 **Reconnect**
 
@@ -440,6 +440,7 @@ Statuses:
 | Themes | 16/256/truecolor, default palette, basic theme config |
 | Recovery | `lost`/`restarted`/`finished`, `missed`, heartbeat, reattach |
 | Diagnostics | Version, core status, logs, `ht status` |
+| Distribution | macOS Apple Silicon package with notices, GitHub Actions CI and a tag-triggered GitHub release workflow |
 
 ### 5.2 Expected later
 
@@ -450,7 +451,8 @@ Statuses:
 | Files: read/write/edit, diff, external editor | Core `file.*`; no embedded editor |
 | File picker | Simple list; use `machine.exec`/`file.*` |
 | Custom layouts, accessibility | Settings and config |
-| Packaging, install, `--skill`, CLI docs | Distribution |
+| Install, `--skill`, CLI docs | Distribution |
+| Non-macOS packaging | When those platforms become release targets |
 | Mods/plugins (manifest + external commands) | See §6.3 |
 | Kitty graphics/images | See §6.3 |
 
@@ -511,12 +513,13 @@ currently implements.
   (DEC mode 2027) by default like Core and Herdr App, so variation-selector
   emoji form one cluster two cells wide, followed by a zero-width spacer cell,
   and RIS keeps it on. Every spawn path sends the optional `terminal.run` size
-  when the attach grid is known; older cores ignore the field and still work.
-- **Observer attach (foundation):** the library can attach a read-only
-  observer when the core advertises and confirms resize notifications; it
-  applies RESIZE before the following DATA, pays no credit for it, and sends no
-  input or control frames. No peek UI uses it yet; normal attaches are
-  unchanged.
+  when the attach grid is known; the minimum supported Core applies it, so no
+  version gate is needed.
+- **Observer attach (foundation):** the connection requires
+  `resize_notifications`, and the attach reply must confirm it; the library can
+  then attach a read-only observer. It applies RESIZE before the following
+  DATA, pays no credit for it, and sends no input or control frames. No peek UI
+  uses it yet; normal attaches are unchanged.
 - **Mouse and history:** clicks focus panes and select tabs, split gaps drag,
   and chrome never reaches a program. Programs that track the mouse receive
   pane-local events; otherwise the wheel scrolls local history, requested
@@ -541,16 +544,16 @@ The implemented set covers the connection and terminal foundation, the
 workspace and its persistence, agent awareness, the daily-driver input layer
 (mouse, history, search, selection, clipboard, palette, settings and themes),
 the local VT's grapheme clustering, initial terminal sizes and the
-observer-attach foundation. Still planned: tab reorder, custom layouts,
-accessibility, general confirm/toast prompts, machines, files,
-packaging/install, `ht status` and mods. Scrollback, search,
-selection and theme stay in memory and are never written to the shared
-document or the per-screen view. Settings are read at startup; there is no
-settings UI and no live reload.
+observer-attach foundation. Packaging, notices, CI and versioning are also
+implemented; the package is macOS Apple Silicon. Still planned: tab reorder,
+custom layouts, accessibility, general confirm/toast prompts, machines, files,
+install scripts, `ht status` and mods. Scrollback, search, selection and theme
+stay in memory and are never written to the shared document or the per-screen
+view. Settings are read at startup; there is no settings UI and no live reload.
 
-The implementation is unreleased: there is no release, packaging or install
-procedure yet. See §3 for the boundary rules, §7 for conventions, and
-[AGENTS.md](../AGENTS.md) for the traps and the source layout.
+The implementation is unreleased: the macOS package and CI exist, but no
+version has been tagged yet. See §3 for the boundary rules, §7 for conventions,
+and [AGENTS.md](../AGENTS.md) for the traps and the source layout.
 
 ## 6. Planned work
 
@@ -573,8 +576,8 @@ Current status is §5.5. The remaining work, grouped by capability:
 
 ### Distribution and testing
 
-- Packaging and install.
-- `--skill`, CLI docs and CI.
+- Install script and non-macOS packaging.
+- `--skill` and CLI docs.
 - `ht status` and core/log diagnostics.
 - End-to-end tests and golden buffers.
 

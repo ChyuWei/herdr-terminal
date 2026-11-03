@@ -15,7 +15,7 @@ with OSC 52/native copy and bracketed paste, the command palette, and startup
 settings with default/dark/light themes. The local VT enables grapheme clustering
 as Core does, and new terminals start at the grid they will attach at. Settings
 are read at startup only: there is no settings UI or live reload. The tests
-exist and pass. Machines, files, packaging and accessibility remain planned.
+exist and pass. Machines, files, install scripts and accessibility remain planned.
 The design intent is in the
 [core reference](docs/01-core-and-app-reference.md) and the
 [architecture](docs/02-architecture.md). Read both before proposing code; do
@@ -36,12 +36,14 @@ records, raw output, attach, events, status, documents and machines.
   vendor-specific logic. This is the rule most likely to be broken "helpfully".
 - **One long-lived framed connection.** Do not spawn `hc` per user action.
   Reconnect; the programs keep running.
-- **Feature-gate on `hello`.** Check generation, version, methods and features;
-  protocol generation 1 only grows. Do not assume a version.
-- **Supported Core range.** Core 0.1.16 or newer at protocol generation 1;
-  optional capabilities are gated on `hello.features`, never a version string.
-  Testing uses 0.1.17; 0.1.16 is checked by source and the no-feature path, not
-  by running a 0.1.16 binary.
+- **Feature-gate on `hello`.** Check generation, the minimum version, methods
+  and features; protocol generation 1 only grows. The minimum floor is the only
+  version check; optional capabilities use features, never version strings.
+- **Supported Core range.** Core 0.1.17 or newer at protocol generation 1,
+  with the required methods and features (including `resize_notifications`).
+  Older or unreadable versions are refused at connect with an update hint.
+  Other optional capabilities are gated on `hello.features`, never a version
+  string.
 - **Own state.** The workspace document is `herdr-terminal`; labels are
   `herdr.terminal.*`. Do not read or write Herdr App's `herdr-app` document,
   `herdr.space` or `herdr.tab`. Share only the cross-client `herdr.seen` and
@@ -62,14 +64,14 @@ records, raw output, attach, events, status, documents and machines.
   optional `size` when it knows the grid the terminal will attach at, so a
   program that reads its size once starts with the right layout. Use the exact
   grid the terminal will attach at, not a guess, and omit the field when it is
-  unknown. Older cores ignore it; do not add a version gate.
-- **Observer attaches are read-only.** `terminal.attach` takes `observe` and
-  `resize_notifications`; request them only when `hello.features` advertises
-  `resize_notifications` (no version gate), and require the reply to confirm.
+  unknown. The supported Core floor applies it, so no version gate is needed.
+- **Observer attaches are read-only.** The connection requires
+  `resize_notifications`, so an observer attach always carries `observe` and
+  `resize_notifications`; the attach reply must still confirm it.
   An observer applies each RESIZE before the DATA that follows it and pays no
   credit for it; it sends no keys, mouse reports, RESIZE, FOCUS or FACTS. If
-  the feature or confirmation is absent, fail clearly; never fall back to a
-  normal attach, which would take over the grid. Normal attaches are unchanged.
+  confirmation is absent, fail clearly; never fall back to a normal attach,
+  which would take over the grid. Normal attaches are unchanged.
   This is attach-layer plumbing for a future peek; no peek UI uses it yet.
 - **Reconnect semantics.** A dropped connection is not a dead program. On
   `missed`, resnapshot; on `lost`/`restarted`, reattach; on `finished`, drop
@@ -104,14 +106,26 @@ cargo check --locked
 cargo test --locked <filter>
 ```
 
-Planned `just` recipes (not created yet):
+`just` wraps the same commands:
 
 ```sh
 just build
 just test
 just check
 just fmt
+just notices
+just package
+just release-prepare <version>
+just release-publish <version>
 ```
+
+`just check` runs `cargo fmt --check`, clippy with `-D warnings` and the test
+suite. `just notices` regenerates `THIRD-PARTY-NOTICES` after a dependency
+change; `just package` builds the macOS release archive in `dist/`. The release
+helpers are maintainer-only: `release-prepare` bumps the package version and
+re-runs the checks without committing; `release-publish` pushes the branch,
+waits for its CI run, then tags and pushes the tag. Normal work does not run
+them.
 
 Toolchain: Rust 1.95.0 (MSRV), `just`; Zig 0.16.0 only when building the
 libghostty-vt binding. Stack: ratatui 0.30, crossterm 0.29,
@@ -173,7 +187,8 @@ tests/                  # probe, screen, workspace, fake-core
 - Do not run a bare Core/App against a real home; tests are isolated.
 - Do not add mods, an embedded editor, Markdown or images in v1; see the
   architecture's non-goals.
-- Do not assume a `just` file exists; use the `cargo` commands above.
+- The checked-in `justfile` wraps the `cargo` commands above; CI runs them
+  directly rather than through `just`.
 
 ## Contributing
 
@@ -186,6 +201,6 @@ edit it.
 ## Next step
 
 Pick up the remaining planned features in `docs/02-architecture.md` §5:
-machines, files, distribution, accessibility, mods, and a settings UI or live
-reload if one is designed. Keep the same rule: prove protocol, VT, input and
-recovery behavior with tests before UI chrome.
+machines, files, install scripts and CLI docs, accessibility, mods, and a
+settings UI or live reload if one is designed. Keep the same rule: prove
+protocol, VT, input and recovery behavior with tests before UI chrome.

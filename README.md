@@ -8,7 +8,7 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 
 **Status:** implemented and unreleased. The client connects to Herdr Core, renders terminals through a local VT, runs a spaces/tabs/panes workspace with restore and agent awareness, and adds daily-driver input: mouse, bounded scrollback and search, selection with copy/paste, a command palette, and startup settings with default/dark/light themes. Later features remain planned.
 
-**Compatibility:** Herdr Core 0.1.16 or newer, protocol generation 1. Optional capabilities are gated on the `hello` features a core advertises, not a version string. Testing used Core 0.1.17; 0.1.16 support is checked by source and the no-feature path, not by running a 0.1.16 binary.
+**Compatibility:** Herdr Core 0.1.17 or newer, protocol generation 1. Older or unreadable versions are refused at connect with an update hint; a core missing a required method or feature is also refused. `resize_notifications` is required by the connection, not optional (observer attach has no fallback); other capabilities are gated on the `hello` features a core advertises, not a version string.
 
 ## Features
 
@@ -17,7 +17,7 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 - **Connection:** Core discovery, one long-lived framed connection, `hello` check, reconnect without losing running programs.
 - **Terminals:** Run, attach, local VT rendering, keyboard and mouse input, resize, focus, display facts, credit-based flow control, and the `lost`/`restarted`/`finished` lifecycle.
 - **Text rendering:** Grapheme clustering is on by default, matching Core and Herdr App, so variation-selector emoji such as `✍️` and `❤️` form one cluster two cells wide, followed by a zero-width spacer cell, instead of splitting across cells.
-- **Terminal sizing:** New terminals are spawned with the grid they will attach at — the initial shell, splits/tabs/spaces, explicit programs, `ht screen`, reconnect replacements and `ht probe` — so a program that reads its size once starts with the right layout. Cores that predate the field ignore it and still work.
+- **Terminal sizing:** New terminals are spawned with the grid they will attach at — the initial shell, splits/tabs/spaces, explicit programs, `ht screen`, reconnect replacements and `ht probe` — so a program that reads its size once starts with the right layout. Every supported Core applies it, so no version gate is needed.
 - **Workspace:** Create spaces, tabs and panes; split/close/move; focus, zoom; rename tabs and spaces.
 - **Terminal management:** Labels, keep, kill/rm, shell or command.
 - **Agents:** Status, turn, title, foreground, agent sidebar, local-VT peek, jump, seen/pinned, blocked/finished alerts.
@@ -31,6 +31,7 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 - **Settings:** Startup config at `$XDG_CONFIG_HOME/herdr-terminal/config.json` (HOME fallback) for theme, scrollback, mouse, clipboard and prefix keys; bad values warn and fall back. Settings are read once at startup; there is no settings UI or live reload.
 - **Performance:** Bounded per-frame work and bounded scrollback/search keep input responsive during large output.
 - **CLI:** `ht` opens the workspace, `ht screen` runs or reattaches to one terminal, `ht probe` copies raw attach bytes; `--version`, `--help`, `--hc`, `--cols`, `--rows`, `-v`.
+- **Distribution:** macOS Apple Silicon package with `ht`, license and generated third-party notices; GitHub Actions CI and a tag-triggered GitHub release workflow. The package requires Herdr Core 0.1.17 or newer and does not include a Core.
 
 **Planned**
 
@@ -38,7 +39,7 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 - **Workspace polish:** Tab reorder, custom layouts, accessibility.
 - **Machines:** Add/connect/list/rename/rm, remote terminals and events.
 - **Files:** Read/write/edit, diff, external editor, simple file picker.
-- **Distribution:** Packaging, install, `--skill`, CLI docs, `ht status` and core/log diagnostics.
+- **Distribution:** Install script, `--skill`, CLI docs, `ht status` and core/log diagnostics.
 - **Mods/plugins (postponed):** Later via the manifest + external-command model, not JS/GPUI.
 - **Kitty images (postponed):** Later if there is demand.
 
