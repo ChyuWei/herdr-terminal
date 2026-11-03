@@ -1,0 +1,107 @@
+#!/bin/sh
+# Regenerate THIRD-PARTY-NOTICES from the locked dependency set.
+#
+# Every non-workspace crate's license text is included, plus explicit notices
+# for Ghostty's libghostty-vt, the components bundled into it (simdutf, highway,
+# wuffs, uucode and its data/decoder) and the Zig compiler_rt and Rust runtime
+# that are statically linked into ht. Cargo metadata is JSON; Python 3 reads it
+# without adding a Rust dependency or requiring jq.
+set -eu
+cd "$(dirname "$0")/.."
+
+out=THIRD-PARTY-NOTICES
+work=$(mktemp -d "${TMPDIR:-/var/tmp}/ht-notices.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+
+[ -s vendor/ghostty/LICENSE ] || {
+    echo "notices: vendor/ghostty/LICENSE is missing; run 'git submodule update --init --depth 1'" >&2
+    exit 1
+}
+command -v python3 >/dev/null 2>&1 || {
+    echo "notices: python3 is needed to read cargo metadata" >&2
+    exit 1
+}
+
+cargo metadata --format-version 1 --locked >"$work/metadata.json"
+python3 - "$work/metadata.json" "$work/crates" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    packages = json.load(source)["packages"]
+
+rows = []
+for package in packages:
+    # Workspace members have no source; their license is the root LICENSE.
+    if package.get("source") is None:
+        continue
+    rows.append(
+        (
+            package["name"],
+            package["version"],
+            package.get("license") or "unspecified",
+            package["manifest_path"],
+        )
+    )
+
+rows.sort()
+with open(sys.argv[2], "w", encoding="utf-8", newline="\n") as out:
+    for row in rows:
+        out.write("\t".join(row) + "\n")
+PY
+
+{
+    echo "HerdR Terminal is Apache-2.0. It includes the software below."
+    echo
+    echo "Ghostty's libghostty-vt, its bundled components, the Zig compiler_rt"
+    echo "and the Rust standard library runtime are statically linked into ht."
+    echo "Not all components are used on every platform."
+    echo
+    printf '==== Ghostty (MIT)\n\n'
+    cat vendor/ghostty/LICENSE
+    for part in \
+        "simdutf:simdutf, in libghostty-vt (MIT, or Apache-2.0)" \
+        "highway:Highway, in libghostty-vt (BSD-3-Clause, or Apache-2.0)" \
+        "wuffs:Wuffs, in libghostty-vt (MIT, or Apache-2.0)" \
+        "uucode:uucode (MIT)" \
+        "uucode-unicode:uucode Unicode data (Unicode-3.0)" \
+        "uucode-utf8:uucode UTF-8 decoder (MIT)" \
+        "zig:Zig's compiler_rt (MIT)" \
+        "rust:Rust standard library and compiler runtime notices"; do
+        file="distribution/notices/${part%%:*}.txt"
+        [ -s "$file" ] || {
+            echo "notices: $file is missing" >&2
+            exit 1
+        }
+        printf '\n==== %s\n\n' "${part#*:}"
+        cat "$file"
+    done
+    while IFS="$(printf '\t')" read -r crate version license manifest; do
+        dir=$(dirname "$manifest")
+        printf '\n==== %s %s (%s)\n\n' "$crate" "$version" "$license"
+        find "$dir" -maxdepth 1 -type f \
+            \( -iname 'license*' -o -iname 'notice*' -o -iname 'copying*' \) \
+            | LC_ALL=C sort >"$work/licenses"
+        if [ ! -s "$work/licenses" ]; then
+            # A few published crates omit the license files. Keep their text
+            # under distribution/notices/ so a new dependency without one still
+            # fails loudly.
+            override="distribution/notices/$crate.txt"
+            if [ -s "$override" ]; then
+                printf '\n--- %s (explicit notice; the crate ships no license file)\n\n' \
+                    "$(basename "$override")"
+                cat "$override"
+                continue
+            fi
+            echo "notices: $crate $version has no license text; add distribution/notices/$crate.txt" >&2
+            exit 1
+        fi
+        while IFS= read -r file; do
+            printf '\n--- %s\n\n' "$(basename "$file")"
+            cat "$file"
+        done <"$work/licenses"
+    done <"$work/crates"
+} >"$work/notices"
+
+cp "$work/notices" "$out"
+echo "wrote $out ($(wc -c <"$out") bytes)"

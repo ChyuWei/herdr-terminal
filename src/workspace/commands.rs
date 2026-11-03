@@ -32,6 +32,12 @@ pub enum Command {
     RenameSpace,
     /// Toggle the modal agent sidebar.
     Agents,
+    /// Open the Core-wide terminal manager.
+    Terminals,
+    /// Open the machine manager.
+    Machines,
+    /// Open the Core-backed file viewer.
+    Files,
     /// Peek the focused (or sidebar-selected) agent.
     Peek,
     /// Jump to the next or previous agent in sidebar order.
@@ -71,6 +77,12 @@ pub enum Effect {
     Help,
     /// Toggle the agent sidebar; the runtime selects a row.
     Agents,
+    /// Open the terminal manager; the runtime selects a row.
+    Terminals,
+    /// Open the machine manager; the runtime lists core's machines.
+    Machines,
+    /// Open the file overlay for the focused pane's machine and cwd.
+    Files,
     /// Open the peek overlay for the focused or selected agent.
     Peek,
     /// Jump to the next or previous agent.
@@ -113,6 +125,9 @@ impl Workspace {
             }
             Command::RenameSpace => Effect::Rename(RenameTarget::Space(self.active_space_id())),
             Command::Agents => Effect::Agents,
+            Command::Terminals => Effect::Terminals,
+            Command::Machines => Effect::Machines,
+            Command::Files => Effect::Files,
             Command::Peek => Effect::Peek,
             Command::JumpAgent(jump) => Effect::JumpAgent(jump),
             Command::Palette => Effect::Palette,

@@ -26,7 +26,7 @@ mod common;
 
 use common::{Capture, HT, Probe, secs};
 #[cfg(unix)]
-use herdr_terminal::core::{Attached, CoreClient, Error, StreamItem};
+use herdr_terminal::core::{Attached, CoreClient, Error, Mismatch, StreamItem};
 
 const DATA: u8 = 0;
 const CLOSE: u8 = 2;
@@ -72,7 +72,55 @@ fn run_tests() {
     #[cfg(unix)]
     workspace_keeps_a_pane_missing_from_the_snapshot();
     #[cfg(unix)]
-    workspace_never_adopts_a_terminal_it_did_not_label();
+    workspace_adopts_a_documented_address_without_claiming_its_labels();
+    #[cfg(unix)]
+    workspace_terminal_manager_shows_and_hides_without_running_or_killing();
+    #[cfg(unix)]
+    workspace_terminal_manager_previews_read_only_and_follows_events();
+    #[cfg(unix)]
+    workspace_terminal_manager_never_clears_another_screens_labels();
+    #[cfg(unix)]
+    machine_client_uses_one_connection_for_every_machine_method();
+    #[cfg(unix)]
+    workspace_machine_manager_lists_actions_and_starts_a_terminal_on_a_machine();
+    #[cfg(unix)]
+    workspace_machine_manager_shows_core_errors_without_leaving();
+    #[cfg(unix)]
+    workspace_remote_pane_is_restored_typed_into_renamed_and_removed();
+    #[cfg(unix)]
+    workspace_remote_pane_survives_missed_without_duplicates();
+    #[cfg(unix)]
+    workspace_remote_pane_survives_reconnect_without_duplicates();
+    #[cfg(unix)]
+    workspace_remote_pane_follows_a_created_rename_without_duplication();
+    #[cfg(unix)]
+    workspace_streamless_remote_pane_survives_a_rename();
+    #[cfg(unix)]
+    workspace_finished_remote_pane_keeps_its_screen_across_a_rename();
+    #[cfg(unix)]
+    workspace_streamless_remote_pane_leaves_when_it_is_removed();
+    #[cfg(unix)]
+    workspace_remote_pane_survives_a_rename_in_a_missed_snapshot();
+    #[cfg(unix)]
+    workspace_views_a_local_file_through_core_and_scrolls();
+    #[cfg(unix)]
+    workspace_opens_a_remote_file_with_machine_and_remote_cwd();
+    #[cfg(unix)]
+    workspace_editor_edits_diffs_and_writes_through_core();
+    #[cfg(unix)]
+    workspace_discarded_editor_changes_are_never_written();
+    #[cfg(unix)]
+    workspace_conflict_requires_an_explicit_overwrite();
+    #[cfg(unix)]
+    workspace_write_failure_keeps_the_diff_and_buffer();
+    #[cfg(unix)]
+    workspace_editor_failure_restores_the_terminal_and_keeps_the_viewer();
+    #[cfg(unix)]
+    workspace_refuses_to_edit_a_truncated_whole_read();
+    #[cfg(unix)]
+    workspace_refuses_to_write_a_truncated_recheck();
+    #[cfg(unix)]
+    workspace_force_overwrite_refuses_a_truncated_read();
     #[cfg(unix)]
     workspace_claims_a_new_document_and_labels_its_terminal();
     #[cfg(unix)]
@@ -196,7 +244,9 @@ fn run_tests() {
     #[cfg(unix)]
     observer_attach_negotiates_resize_notifications_and_applies_them_in_order();
     #[cfg(unix)]
-    observer_attach_is_unavailable_without_the_feature_and_normal_attach_is_unchanged();
+    an_older_core_is_refused_at_connect();
+    #[cfg(unix)]
+    a_core_without_resize_notifications_is_refused_at_connect();
     #[cfg(unix)]
     observer_attach_requires_a_confirmed_reply_and_leaves_no_channel();
     #[cfg(unix)]
@@ -269,6 +319,25 @@ impl FakeScreen {
         cols: u16,
         rows: u16,
     ) -> FakeScreen {
+        Self::spawn_parts_size_env(scratch, scenario, leading, args, screen, cols, rows, &[])
+    }
+
+    /// The default workspace with extra environment (an editor, a temp cwd).
+    fn spawn_workspace_env(scratch: &Scratch, scenario: &str, env: &[(&str, &str)]) -> FakeScreen {
+        Self::spawn_parts_size_env(scratch, scenario, &[], &[], None, 100, 30, env)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_parts_size_env(
+        scratch: &Scratch,
+        scenario: &str,
+        leading: &[&str],
+        args: &[&str],
+        screen: Option<&str>,
+        cols: u16,
+        rows: u16,
+        env: &[(&str, &str)],
+    ) -> FakeScreen {
         let exe = std::env::current_exe().expect("test executable");
         let pty = common::pty::Pty::open(cols, rows);
         let (stdin, stdout) = pty.stdio();
@@ -286,7 +355,13 @@ impl FakeScreen {
             .env("XDG_CONFIG_HOME", scratch.config_root())
             // Deterministic chrome colors in the captured frames.
             .env("COLORTERM", "truecolor")
-            .env("TERM", "xterm-256color");
+            .env("TERM", "xterm-256color")
+            // Never let a real editor from this environment leak into a test.
+            .env_remove("VISUAL")
+            .env_remove("EDITOR");
+        for (key, value) in env {
+            command.env(key, value);
+        }
         if let Some(screen) = screen {
             command.env("HERDR_TERMINAL_SCREEN", screen);
         }
@@ -331,6 +406,11 @@ impl FakeScreen {
     fn send(&mut self, bytes: &[u8]) {
         self.input.write_all(bytes).expect("write to the screen");
         self.input.flush().expect("flush the screen");
+    }
+
+    /// Types printable ASCII into the client as separate key events.
+    fn type_text(&mut self, text: &str) {
+        self.send(text.as_bytes());
     }
 
     /// The workspace prefix (Ctrl-b) followed by one command key.
@@ -1374,32 +1454,63 @@ fn workspace_keeps_a_pane_missing_from_the_snapshot() {
     );
 }
 
-/// A terminal at the same address but without this client's pane label is not
-/// adopted; the pane is pruned rather than claiming a stranger's program.
+/// A terminal named by this client's document but carrying another client's
+/// labels is restored by address and adopted: close only detaches it and its
+/// labels are never overwritten.
 #[cfg(unix)]
-fn workspace_never_adopts_a_terminal_it_did_not_label() {
+fn workspace_adopts_a_documented_address_without_claiming_its_labels() {
     let scratch = Scratch::new("doc-foreign");
     scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
     let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-foreign");
 
     assert!(
-        workspace.wait_text("no terminals in this tab", secs(10)),
-        "the foreign terminal was not adopted; screen={:?} stderr={:?}",
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the documented address was not adopted; screen={:?} stderr={:?}",
         workspace.rendered(),
         workspace.stderr.text()
     );
     assert!(
         common::wait_until(secs(5), || {
-            scratch.doc_value()["spaces"][0]["tabs"][0]["layout"] == json!(null)
+            scratch.doc_value()["spaces"][0]["tabs"][0]["layout"]
+                .get("leaf")
+                .is_some()
         }),
-        "the pruned pane must leave the document; doc={:?}",
+        "the adopted pane stays in the document; doc={:?}",
         scratch.doc_value()
     );
+    assert_eq!(doc_addresses(&scratch.doc_value()), vec!["t1".to_owned()]);
     let log = scratch.entries();
-    assert!(!log.iter().any(|entry| entry["call"] == "terminal.run"));
     assert!(
-        !log.iter().any(|entry| entry.get("attached").is_some()),
-        "a foreign terminal must not be attached; log={log:?}"
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "adopting a documented address never starts a program; log={log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|entry| entry.get("attached").is_some() && entry["terminal"] == "t1"),
+        "the adopted terminal is attached; log={log:?}"
+    );
+    let captured = scratch.doc_value().to_string();
+    assert!(
+        captured.contains("someone-else"),
+        "another client's labels are kept verbatim: {captured}"
+    );
+
+    // Closing an adopted pane only detaches: no kill, no rm.
+    workspace.command(b'x');
+    assert!(
+        common::wait_until(secs(5), || {
+            scratch.doc_value()["spaces"][0]["tabs"][0]["layout"] == json!(null)
+        }),
+        "closing the adopted pane removes it from the document; doc={:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm"),
+        "an adopted pane is never killed or removed; log={:?}",
+        scratch.entries()
     );
 
     workspace.send(&[0x1d]);
@@ -1410,6 +1521,1321 @@ fn workspace_never_adopts_a_terminal_it_did_not_label() {
         "stderr={:?}",
         workspace.stderr.text()
     );
+}
+
+/// The manager lists a background Core terminal, shows it as an adopted pane
+/// without `terminal.run`, hides it by detaching only, and shows it again
+/// without a duplicate.
+#[cfg(unix)]
+fn workspace_terminal_manager_shows_and_hides_without_running_or_killing() {
+    let scratch = Scratch::new("m8-manager");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "manager");
+    assert!(
+        screen.wait_text("PANE-ONE", secs(10)),
+        "the documented pane was not restored; screen={:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+
+    // The manager lists a background terminal from the event snapshot.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 2 live", secs(5)),
+        "the manager did not list core's terminals: {:?}",
+        screen.rendered()
+    );
+    let listed = screen.rendered();
+    assert!(
+        listed.contains("working") && listed.contains("t9") && listed.contains("worker"),
+        "the background terminal's own facts are shown: {listed:?}"
+    );
+
+    // Filter to t9, leave filter editing, and show it.
+    screen.send(b"/t9");
+    assert!(
+        screen.wait_text("filter: t9 · 1/2 match", secs(5)),
+        "the filter did not narrow the rows: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("WORKER-PANE", secs(10)),
+        "Enter did not show the terminal: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("terminal manager"),
+        "the manager closes after a show: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "t9".to_owned()]),
+        "the shown terminal is in the document; doc={:?}",
+        scratch.doc_value()
+    );
+    let doc = scratch.doc_value();
+    let leaf = doc_leaf(&doc, "t9").expect("t9's leaf in the document");
+    assert_eq!(
+        leaf["labels"],
+        json!({"herdr.client": "someone-else"}),
+        "the adopted terminal keeps its own labels verbatim: {doc}"
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "showing an existing terminal never starts a program; log={log:?}"
+    );
+    assert_eq!(
+        wire_attach_count(&log, "t9"),
+        1,
+        "the shown terminal is attached once; log={log:?}"
+    );
+
+    // Hide it: detach and drop the pane, never kill or remove the program.
+    // The manager keeps its local filter across openings.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 2 shown · 2 live", secs(5)),
+        "the shown terminal is marked: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "hiding removes only the pane reference; doc={:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("WORKER-PANE")),
+        "the hidden terminal is no longer drawn: {:?}",
+        screen.rendered()
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter()
+            .any(|entry| entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm"),
+        "hiding never kills or removes the program; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| {
+            entry["call"] == "terminal.label"
+                && entry["params"]["labels"]
+                    .as_object()
+                    .is_some_and(|labels| labels.values().any(|value| value == ""))
+        }),
+        "hiding never clears another client's labels; log={log:?}"
+    );
+    for entry in log
+        .iter()
+        .filter(|entry| entry["call"] == "terminal.label" && entry["params"]["terminal"] == "t9")
+    {
+        let labels = entry["params"]["labels"].as_object().expect("a label map");
+        assert!(
+            labels.keys().all(|key| key == "herdr.seen"),
+            "this client writes only its shared seen label on an adopted terminal: {entry:?}"
+        );
+    }
+    let channel = log
+        .iter()
+        .find(|entry| entry.get("attached").is_some() && entry["terminal"] == "t9")
+        .and_then(|entry| entry["attached"].as_u64())
+        .expect("t9's attach channel");
+    assert!(
+        log.iter()
+            .any(|entry| entry["frame"]["channel"] == channel && entry["frame"]["kind"] == 2),
+        "hiding closes the attach stream; log={log:?}"
+    );
+
+    // Show it again: the same address, still no run and no duplicate pane.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 2 live", secs(5)),
+        "the hidden terminal is listed again: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("WORKER-PANE", secs(10)),
+        "Enter did not show the terminal again: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            let addresses = doc_addresses(&scratch.doc_value());
+            addresses.iter().filter(|address| *address == "t9").count() == 1 && addresses.len() == 2
+        }),
+        "showing again never duplicates the pane; doc={:?}",
+        scratch.doc_value()
+    );
+    let log = scratch.entries();
+    assert_eq!(
+        wire_attach_count(&log, "t9"),
+        2,
+        "the second show attaches the same terminal again; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| entry["call"] == "terminal.run"),
+        "showing again never starts a program; log={log:?}"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// Preview is a read-only observer: the wire carries only credit and the
+/// closing detach, never input, RESIZE, FOCUS or FACTS; events refresh the
+/// manager's rows underneath it.
+#[cfg(unix)]
+fn workspace_terminal_manager_previews_read_only_and_follows_events() {
+    let scratch = Scratch::new("m8-manager-events");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "manager-events");
+    assert!(
+        screen.wait_text("PANE-ONE", secs(10)),
+        "the documented pane was not restored; screen={:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+    let writes = doc_set_calls(&scratch);
+
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 4 live", secs(5)),
+        "the manager did not list core's terminals: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"/t9");
+    assert!(
+        screen.wait_text("filter: t9 · 1/4 match", secs(5)),
+        "the filter did not narrow the rows: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    screen.send(b"p");
+    assert!(
+        screen.wait_text("preview · Worker · t9", secs(5)),
+        "p did not open the preview: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.wait_text("PREVIEW-WORKER", secs(10)),
+        "the observer stream was not rendered: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("read-only observer"),
+        "the preview says it is read-only: {:?}",
+        screen.rendered()
+    );
+    let log = scratch.entries();
+    let attach = log
+        .iter()
+        .find(|entry| entry["call"] == "terminal.attach" && entry["params"]["terminal"] == "t9")
+        .expect("the preview attached t9");
+    assert_eq!(
+        attach["params"]["observe"],
+        json!(true),
+        "the preview attaches as an observer: {attach:?}"
+    );
+    assert_eq!(
+        attach["params"]["resize_notifications"],
+        json!(true),
+        "the preview asks for grid-before-paint: {attach:?}"
+    );
+    let channel = log
+        .iter()
+        .find(|entry| entry.get("attached").is_some() && entry["terminal"] == "t9")
+        .and_then(|entry| entry["attached"].as_u64())
+        .expect("the preview's attach channel");
+    let sent_before_close: Vec<u64> = log
+        .iter()
+        .filter(|entry| entry["frame"]["channel"] == channel)
+        .filter_map(|entry| entry["frame"]["kind"].as_u64())
+        .collect();
+    assert!(
+        !sent_before_close.is_empty() && sent_before_close.iter().all(|kind| *kind == 1),
+        "an open preview sends only credit; frames={sent_before_close:?}"
+    );
+
+    // Any key closes the preview; the manager stays open underneath and then
+    // receives the scripted status/created/finished/removed events.
+    screen.send(&[0x1b]);
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 3 live", secs(10)),
+        "the manager did not follow the events: {:?}",
+        screen.rendered()
+    );
+    let listed = screen.rendered();
+    assert!(
+        listed.contains("done") && listed.contains("t9"),
+        "the status event rewrote the row: {listed:?}"
+    );
+
+    // Clear the manager's persisted filter to see every updated row.
+    screen.send(b"/");
+    screen.send(&[0x7f, 0x7f]);
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("t10", secs(5)),
+        "the labels event added the new terminal: {:?}",
+        screen.rendered()
+    );
+    let listed = screen.rendered();
+    assert!(
+        listed.contains("done") && listed.contains("builder"),
+        "status and labels events update the rows: {listed:?}"
+    );
+    assert!(
+        !listed.contains("t7") && !listed.contains("t8"),
+        "finished and removed terminals leave the rows: {listed:?}"
+    );
+
+    let log = scratch.entries();
+    let sent: Vec<u64> = log
+        .iter()
+        .filter(|entry| entry["frame"]["channel"] == channel)
+        .filter_map(|entry| entry["frame"]["kind"].as_u64())
+        .collect();
+    assert!(
+        sent.iter().all(|kind| *kind == 1 || *kind == 2),
+        "the preview sends only credit and a closing detach; frames={sent:?}"
+    );
+    assert!(
+        sent.contains(&2),
+        "closing the preview detaches its stream; frames={sent:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| matches!(
+            entry["call"].as_str(),
+            Some("terminal.run" | "terminal.kill" | "terminal.rm" | "terminal.read")
+        )),
+        "a preview never runs, kills, removes or reads a terminal; log={log:?}"
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned()],
+        "a preview adds no pane to the document"
+    );
+    assert_eq!(
+        doc_set_calls(&scratch),
+        writes,
+        "a preview writes no document"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// Hide only clears labels this screen wrote: a terminal whose pane label
+/// lives in another screen's id namespace keeps its labels (and is never
+/// killed or removed), while a same-screen stale label is still cleared.
+#[cfg(unix)]
+fn workspace_terminal_manager_never_clears_another_screens_labels() {
+    let scratch = Scratch::new("m8-manager-labels");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    // The workspace screen runs in the default namespace (1). The cross
+    // screen wrote namespace 2; t10's label is stale but from this screen.
+    let cross = cross_screen_labels();
+    scratch.seed_labels(json!({
+        "t9": cross_screen_labels(),
+        "t10": same_screen_stale_labels(),
+    }));
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "manager-cross-screen");
+    assert!(
+        screen.wait_text("PANE-ONE", secs(10)),
+        "the documented pane was not restored; screen={:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+
+    // A stale label from this screen's own namespace is cleared on Hide.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 3 live", secs(5)),
+        "the manager did not list core's terminals: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"/t10");
+    assert!(
+        screen.wait_text("filter: t10 · 1/3 match", secs(5)),
+        "the filter did not narrow the rows: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("STALE-PANE", secs(10)),
+        "Enter did not show the same-screen terminal: {:?}",
+        screen.rendered()
+    );
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 2 shown · 3 live", secs(5)),
+        "the shown terminal is marked: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "hiding removes the pane reference; doc={:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        common::wait_until(secs(5), || scratch.labels_value()["t10"] == json!({})),
+        "a same-screen hide clears the four identity labels: {:?}",
+        scratch.labels_value()
+    );
+    let log = scratch.entries();
+    let clears: Vec<&Value> = log
+        .iter()
+        .filter(|entry| entry["call"] == "terminal.label" && entry["params"]["terminal"] == "t10")
+        .collect();
+    assert_eq!(clears.len(), 1, "the four labels are cleared once: {log:?}");
+    let labels = clears[0]["params"]["labels"]
+        .as_object()
+        .expect("a label map");
+    assert_eq!(labels.len(), 4, "{:?}", clears[0]);
+    for label in [
+        "herdr.client",
+        "herdr.terminal.space",
+        "herdr.terminal.tab",
+        "herdr.terminal.pane",
+    ] {
+        assert_eq!(
+            labels.get(label).and_then(Value::as_str),
+            Some(""),
+            "{label}: {:?}",
+            clears[0]
+        );
+    }
+
+    // Another screen's terminal: Show then Hide must leave its labels alone.
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 1 shown · 3 live", secs(5)),
+        "the hidden terminal is listed again: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"/");
+    screen.send(&[0x7f, 0x7f, 0x7f]);
+    screen.send(b"t9");
+    assert!(
+        screen.wait_text("filter: t9 · 1/3 match", secs(5)),
+        "the filter did not move to the other screen's terminal: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("FOREIGN-PANE", secs(10)),
+        "Enter did not show the other screen's terminal: {:?}",
+        screen.rendered()
+    );
+    screen.command(b't');
+    assert!(
+        screen.wait_text("terminal manager · 2 shown · 3 live", secs(5)),
+        "the shown terminal is marked: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "hiding removes the pane reference; doc={:?}",
+        scratch.doc_value()
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter()
+            .any(|entry| entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm"),
+        "hiding never kills or removes the program; log={log:?}"
+    );
+    assert!(
+        !log.iter().any(|entry| {
+            entry["call"] == "terminal.label" && entry["params"]["terminal"] == "t9"
+        }),
+        "another screen's labels are never written; log={log:?}"
+    );
+    assert_eq!(
+        scratch.labels_value()["t9"],
+        cross,
+        "the other screen's labels are unchanged: {:?}",
+        scratch.labels_value()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+#[cfg(unix)]
+fn wire_attach_count(entries: &[Value], address: &str) -> usize {
+    entries
+        .iter()
+        .filter(|entry| entry.get("attached").is_some() && entry["terminal"] == address)
+        .count()
+}
+
+/// A failed connect is reported inside the overlay; the client stays in the
+/// TUI and never starts an ssh or reconnect loop of its own.
+#[cfg(unix)]
+fn workspace_machine_manager_shows_core_errors_without_leaving() {
+    let scratch = Scratch::new("m7-machine-error");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-connect-fail");
+    assert!(
+        common::wait_until(secs(10), || wire_attach_count(&scratch.entries(), "t1")
+            >= 1),
+        "the initial shell did not attach; log={:?}",
+        scratch.entries()
+    );
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("machine manager", secs(5)),
+        "the manager did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("could not connect:", secs(5)),
+        "core's refusal is not shown in the overlay: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("machine manager"),
+        "an error must not close the machine manager: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run" && entry["params"]["on"].is_string()),
+        "a failed connect never starts a remote terminal: {:?}",
+        scratch.entries()
+    );
+
+    screen.send(&[0x1b]);
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// The same long-lived connection carries every machine call; no `hc` is
+/// spawned per action. Core's lists, profiles and errors are used verbatim.
+#[cfg(unix)]
+fn machine_client_uses_one_connection_for_every_machine_method() {
+    let scratch = Scratch::new("m7-machine-client");
+    let client = observer_client(&scratch, "machines");
+
+    let listed = client.machine_list().expect("machine.list");
+    assert_eq!(listed.len(), 4);
+    let alpha = listed
+        .iter()
+        .find(|machine| machine.name == "alpha")
+        .expect("alpha");
+    assert_eq!(alpha.target, "can@alpha.example:2222");
+    assert_eq!(alpha.host, "alpha-host");
+    assert_eq!(alpha.state, "connected");
+    let beta = listed
+        .iter()
+        .find(|machine| machine.name == "beta")
+        .expect("beta");
+    assert_eq!(beta.state, "unreachable");
+    assert_eq!(beta.why.as_deref(), Some("connection refused"));
+    assert!(beta.since_ms.is_some());
+
+    let added = client
+        .machine_add(&herdr_terminal::core::MachineAdd::target(
+            "rohan@10.0.0.9:2200",
+        ))
+        .expect("machine.add");
+    assert_eq!(added.target, "rohan@10.0.0.9:2200");
+    assert!(!added.name.is_empty());
+
+    let connected = client.machine_connect("alpha").expect("machine.connect");
+    assert_eq!(connected.state, "connected");
+
+    let renamed = client
+        .machine_rename("alpha", "rohan")
+        .expect("machine.rename");
+    assert_eq!(renamed.name, "rohan");
+
+    let error = client.machine_rm("nope").expect_err("unknown machine");
+    match error {
+        Error::Rpc { error, .. } => assert_eq!(error.kind(), Some("machine_unknown")),
+        other => panic!("unexpected error {other:?}"),
+    }
+    let error = client
+        .machine_add(&herdr_terminal::core::MachineAdd::default())
+        .expect_err("an empty target");
+    match error {
+        Error::Rpc { error, .. } => assert_eq!(error.kind(), Some("invalid_params")),
+        other => panic!("unexpected error {other:?}"),
+    }
+    let error = client.machine_connect("nope").expect_err("unknown machine");
+    match error {
+        Error::Rpc { error, .. } => assert_eq!(error.kind(), Some("machine_unknown")),
+        other => panic!("unexpected error {other:?}"),
+    }
+    let error = client
+        .machine_rename("nope", "still-nope")
+        .expect_err("unknown machine");
+    match error {
+        Error::Rpc { error, .. } => assert_eq!(error.kind(), Some("machine_unknown")),
+        other => panic!("unexpected error {other:?}"),
+    }
+    client.machine_rm("rohan").expect("machine.rm");
+    let after = client.machine_list().expect("machine.list again");
+    assert!(!after.iter().any(|machine| machine.name == "rohan"));
+
+    let log = scratch.entries();
+    let calls: Vec<&str> = log
+        .iter()
+        .filter_map(|entry| entry["call"].as_str())
+        .collect();
+    for method in [
+        "machine.list",
+        "machine.add",
+        "machine.connect",
+        "machine.rename",
+        "machine.rm",
+    ] {
+        assert!(calls.contains(&method), "missing {method}: {calls:?}");
+    }
+    let add = log
+        .iter()
+        .find(|entry| entry["call"] == "machine.add")
+        .expect("machine.add logged");
+    assert_eq!(
+        add["params"]["target"], "rohan@10.0.0.9:2200",
+        "the target is passed through unchanged: {add}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.get("generation").is_some())
+            .count(),
+        1,
+        "every machine call uses the one connection: {log:?}"
+    );
+}
+
+/// Prefix `m` lists core's machines; connect, add, rename, remove and a new
+/// remote terminal all go through core's API, and the list is polled only
+/// while the overlay stays open.
+#[cfg(unix)]
+fn workspace_machine_manager_lists_actions_and_starts_a_terminal_on_a_machine() {
+    let scratch = Scratch::new("m7-machine-ui");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines");
+    assert!(
+        common::wait_until(secs(10), || wire_attach_count(&scratch.entries(), "t1")
+            >= 1),
+        "the initial shell did not attach; log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "machine.list"),
+        "the closed machine manager must not poll core: {:?}",
+        scratch.entries()
+    );
+
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("2/4 connected", secs(5)),
+        "the machine manager did not list core's machines: {:?}",
+        screen.rendered()
+    );
+    let listed = screen.rendered();
+    assert!(
+        listed.contains("alpha") && listed.contains("unreachable"),
+        "{listed:?}"
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry.get("attach_data").is_some()),
+        "a navigation key leaked to the program: {:?}",
+        scratch.entries()
+    );
+
+    // Enter asks core to dial the selected machine.
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || scratch.entries().iter().any(
+            |entry| entry["call"] == "machine.connect" && entry["params"]["machine"] == "alpha"
+        )),
+        "machine.connect was not called: {:?}",
+        scratch.entries()
+    );
+
+    // a: add the typed target unchanged; core picks the name.
+    screen.send(b"a");
+    assert!(
+        screen.wait_text("add machine target:", secs(5)),
+        "the add prompt did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"rohan@10.0.0.9:2200");
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "machine.add"
+                && entry["params"]["target"] == "rohan@10.0.0.9:2200")),
+        "machine.add did not receive the target: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        screen.wait_text("rohan@10.0.0.9:2200", secs(5)),
+        "the added machine did not appear after the refresh: {:?}",
+        screen.rendered()
+    );
+
+    // r: rename alpha, with the current name prefilled.
+    screen.send(b"g");
+    screen.send(b"r");
+    assert!(
+        screen.wait_text("rename machine: alpha", secs(5)),
+        "the rename prompt did not start at the current name: {:?}",
+        screen.rendered()
+    );
+    screen.send(&[0x7f, 0x7f, 0x7f, 0x7f, 0x7f]);
+    screen.send(b"rohan-alpha");
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(5), || scratch.entries().iter().any(
+            |entry| entry["call"] == "machine.rename"
+                && entry["params"]["machine"] == "alpha"
+                && entry["params"]["new_name"] == "rohan-alpha"
+        )),
+        "machine.rename was not called: {:?}",
+        scratch.entries()
+    );
+
+    // n: start a terminal on the selected machine, with the normal labels and
+    // the one core connection; the returned address is stored qualified.
+    screen.send(b"j");
+    screen.send(b"n");
+    assert!(
+        common::wait_until(secs(10), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry.get("machine_run").is_some())),
+        "terminal.run with on was not called: {:?}",
+        scratch.entries()
+    );
+    let log = scratch.entries();
+    let run = log
+        .iter()
+        .find(|entry| entry["call"] == "terminal.run" && entry["params"]["on"] == "delta")
+        .expect("the remote run");
+    assert_eq!(
+        run["params"]["labels"]["herdr.client"], "herdr-terminal",
+        "the remote start keeps this client's labels: {run}"
+    );
+    assert!(
+        run["params"]["labels"]["herdr.terminal.pane"].is_string(),
+        "the remote start carries its pane label: {run}"
+    );
+    let remote = log
+        .iter()
+        .find(|entry| entry.get("machine_run").is_some())
+        .and_then(|entry| entry["machine_run"]["address"].as_str())
+        .expect("the mirrored remote address")
+        .to_owned();
+    assert!(remote.starts_with("delta/"), "{remote}");
+    assert!(
+        screen.wait_text(&remote, secs(10)),
+        "the remote pane is not shown: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || doc_addresses(&scratch.doc_value())
+            .contains(&remote)),
+        "the qualified address is not in the document: {:?}",
+        scratch.doc_value()
+    );
+
+    // The open manager polls on its bounded timer; a closed one does not.
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("machine manager", secs(5)),
+        "the manager did not reopen: {:?}",
+        screen.rendered()
+    );
+    let list_calls = |scratch: &Scratch| {
+        scratch
+            .entries()
+            .iter()
+            .filter(|entry| entry["call"] == "machine.list")
+            .count()
+    };
+    let opened = list_calls(&scratch);
+    assert!(
+        common::wait_until(secs(6), || list_calls(&scratch) > opened),
+        "the open manager did not refresh on its timer"
+    );
+
+    // d: removal needs the explicit confirmation. The selection survived the
+    // reopen on rohan-alpha; two rows down is gamma.
+    screen.send(b"j");
+    screen.send(b"j");
+    screen.send(b"d");
+    assert!(
+        screen.wait_text("remove gamma?", secs(5)),
+        "removal is not confirmed first: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"y");
+    assert!(
+        common::wait_until(secs(5), || scratch.entries().iter().any(
+            |entry| entry["call"] == "machine.rm" && entry["params"]["machine"] == "gamma"
+        )),
+        "machine.rm was not called: {:?}",
+        scratch.entries()
+    );
+    screen.send(b"/gamma");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("0/4 match", secs(5)),
+        "the removed machine is still listed: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(&[0x1b]);
+    let closed = list_calls(&scratch);
+    std::thread::sleep(std::time::Duration::from_millis(2300));
+    assert_eq!(
+        list_calls(&scratch),
+        closed,
+        "a closed machine manager must never poll core"
+    );
+    let log = scratch.entries();
+    assert!(
+        !log.iter().any(|entry| entry.get("attach_data").is_some()),
+        "a machine-manager key leaked to a program: {log:?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|entry| entry["call"] == "terminal.kill" || entry["call"] == "terminal.rm"),
+        "the machine manager never kills or removes a program: {log:?}"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A mirrored remote terminal is a normal pane: restored at its qualified
+/// address, attached and typed into through local core, renamed without
+/// duplication, and removed when its machine is removed.
+#[cfg(unix)]
+fn workspace_remote_pane_is_restored_typed_into_renamed_and_removed() {
+    let scratch = Scratch::new("m7-remote");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-remote");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "restoring a remote pane never starts a terminal"
+    );
+
+    // Click the remote pane and type: input goes through the local core's
+    // attach stream for the qualified address.
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    let remote_channel = || {
+        scratch
+            .entries()
+            .iter()
+            .find(|entry| entry.get("attached").is_some() && entry["terminal"] == "alpha/t7")
+            .and_then(|entry| entry["attached"].as_u64())
+    };
+    assert!(
+        common::wait_until(secs(10), || {
+            let Some(channel) = remote_channel() else {
+                return false;
+            };
+            scratch.entries().iter().any(|entry| {
+                entry["attach_data"]["channel"] == json!(channel)
+                    && entry["attach_data"]["text"] == "k"
+            })
+        }),
+        "input did not reach the remote terminal: {:?}",
+        scratch.entries()
+    );
+
+    // Rename alpha: the pane and its stream keep running under the new
+    // qualifier, and the document stores the new full address.
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("machine manager", secs(5)),
+        "the manager did not open: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"/alpha");
+    screen.send(b"\r");
+    assert!(
+        screen.wait_text("1/4 match", secs(5)),
+        "the filter did not select alpha: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"r");
+    screen.send(&[0x7f, 0x7f, 0x7f, 0x7f, 0x7f]);
+    screen.send(b"rohan");
+    screen.send(b"\r");
+    assert!(
+        common::wait_until(secs(10), || scratch.entries().iter().any(
+            |entry| entry["call"] == "machine.rename"
+                && entry["params"]["machine"] == "alpha"
+                && entry["params"]["new_name"] == "rohan"
+        )),
+        "machine.rename was not called: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the remote pane did not move to the new qualifier: {:?}",
+        scratch.doc_value()
+    );
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(5), || !screen.rendered().contains("machine manager")),
+        "the manager did not close: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"m");
+    assert!(
+        common::wait_until(secs(10), || {
+            let channel = remote_channel();
+            scratch.entries().iter().any(|entry| {
+                entry["attach_data"]["text"] == "m"
+                    && entry["attach_data"]["channel"] == json!(channel)
+            })
+        }),
+        "the renamed remote stream stopped taking input: {:?}",
+        scratch.entries()
+    );
+
+    // Removing the machine removes its pane through core's events; the
+    // client never starts a replacement.
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("machine manager", secs(5)),
+        "the manager did not open for removal: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"d");
+    assert!(
+        screen.wait_text("remove rohan?", secs(5)),
+        "removal is not confirmed first: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"y");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "the removed machine's pane did not leave: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        screen.wait_text("0/3 match", secs(5)),
+        "the removed machine is still listed: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "no remote pane was ever started by a restore or rename"
+    );
+
+    screen.send(&[0x1b]);
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A `missed` snapshot reattaches the remote pane in place; no duplicate pane
+/// is created and no terminal is started.
+#[cfg(unix)]
+fn workspace_remote_pane_survives_missed_without_duplicates() {
+    let scratch = Scratch::new("m7-remote-missed");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-missed");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || {
+            wire_attach_count(&scratch.entries(), "alpha/t7") >= 2
+        }),
+        "the remote pane was not reattached after missed: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        generation_count(&scratch),
+        1,
+        "missed must not need a reconnect: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned(), "alpha/t7".to_owned()],
+        "missed did not duplicate or lose the remote pane: {:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a missed snapshot never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// Reconnecting with a remote pane re-reads the snapshot and reattaches the
+/// same qualified address; the local pane is neither lost nor duplicated.
+#[cfg(unix)]
+fn workspace_remote_pane_survives_reconnect_without_duplicates() {
+    let scratch = Scratch::new("m7-remote-reconnect");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-reconnect");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(15), || {
+            generation_count(&scratch) >= 2
+                && wire_attach_count(&scratch.entries(), "alpha/t7") >= 2
+        }),
+        "the remote pane was not reattached after reconnect: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        doc_addresses(&scratch.doc_value()),
+        vec!["t1".to_owned(), "alpha/t7".to_owned()],
+        "the reconnect duplicated or lost the remote pane: {:?}",
+        scratch.doc_value()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a reconnect never starts a terminal"
+    );
+    assert!(
+        screen.wait_text("alpha/t7", secs(5)),
+        "the remote pane is no longer drawn after reconnect: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// Another client renamed the machine: core's `removed`/`created` pair moves
+/// this screen's pane by its own pane label, keeping the same attach stream.
+#[cfg(unix)]
+fn workspace_remote_pane_follows_a_created_rename_without_duplication() {
+    let scratch = Scratch::new("m7-remote-created");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-external-rename");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the created rename did not move the pane: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "alpha/t7"),
+        1,
+        "the rename reused the existing stream: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "rohan/t7"),
+        0,
+        "the created event must not attach a duplicate: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a rename event never starts a terminal"
+    );
+
+    // Input still reaches the same stream under the new qualified address.
+    let channel = scratch
+        .entries()
+        .iter()
+        .find(|entry| entry.get("attached").is_some() && entry["terminal"] == "alpha/t7")
+        .and_then(|entry| entry["attached"].as_u64());
+    screen.send(b"m");
+    assert!(
+        common::wait_until(secs(10), || scratch.entries().iter().any(|entry| {
+            entry["attach_data"]["channel"] == json!(channel) && entry["attach_data"]["text"] == "m"
+        })),
+        "input stopped reaching the renamed remote pane: {:?}",
+        scratch.entries()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A remote pane with no attach stream (it lost its program just before the
+/// rename) survives core's `removed`/`created` pair: it moves to the new
+/// address and attaches there instead of being deleted by the first event.
+#[cfg(unix)]
+fn workspace_streamless_remote_pane_survives_a_rename() {
+    let scratch = Scratch::new("m7-remote-streamless-rename");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-remote-streamless-rename");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+
+    // A key on the remote stream makes core lose the program (the pane now
+    // has no stream) and rename the machine, back to back.
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the stream-less pane did not follow the rename: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        common::wait_until(secs(10), || {
+            wire_attach_count(&scratch.entries(), "rohan/t7") >= 1
+        }),
+        "the renamed pane was not reattached under its new address: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "alpha/t7"),
+        1,
+        "the old address must not be attached again: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        screen.wait_text("rohan/t7", secs(5)),
+        "the renamed pane is not drawn: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "recovering a renamed pane never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A finished remote pane has no stream either, but its final screen is local.
+/// The same rename pair must move it to the new address and keep the screen,
+/// without attaching or starting anything.
+#[cfg(unix)]
+fn workspace_finished_remote_pane_keeps_its_screen_across_a_rename() {
+    let scratch = Scratch::new("m7-remote-finished-rename");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-remote-finished-rename");
+    assert!(
+        screen.wait_text("FAST", secs(10)),
+        "the finished remote pane's screen was not restored: {:?}",
+        screen.rendered()
+    );
+
+    // Any key on the local pane triggers core's rename pair; the finished
+    // pane's own stream is already gone.
+    screen.send(click(10, 5).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the finished pane did not follow the rename: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        screen.wait_text("rohan/t7", secs(5)),
+        "the finished pane does not show its new address: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.wait_text("FAST", secs(5)),
+        "the final screen was lost across the rename: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "rohan/t7"),
+        0,
+        "a finished pane is never reattached: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a rename never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A stream-less pane whose terminal core removes with no `created` event is
+/// still removed promptly, with its document entry gone.
+#[cfg(unix)]
+fn workspace_streamless_remote_pane_leaves_when_it_is_removed() {
+    let scratch = Scratch::new("m7-remote-streamless-gone");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-remote-gone");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(click(60, 12).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned()]),
+        "the stream-less removed pane lingered in the document: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "rohan/t7"),
+        0,
+        "a removal has no new address to attach: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a removal never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A machine renamed while this subscriber was behind: the `missed` snapshot
+/// already has `rohan/t7`, the stored document still names `alpha/t7`. The
+/// pane must be moved by its label, not removed with the old document entry.
+#[cfg(unix)]
+fn workspace_remote_pane_survives_a_rename_in_a_missed_snapshot() {
+    let scratch = Scratch::new("m7-remote-missed-rename");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-missed-rename");
+    assert!(
+        screen.wait_text("FAST", secs(10)),
+        "the finished remote pane's screen was not restored: {:?}",
+        screen.rendered()
+    );
+
+    // Any key on the local pane delivers the fresh snapshot whose terminal
+    // has the new machine prefix; the document is not updated.
+    screen.send(click(10, 5).as_bytes());
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || doc_addresses(&scratch.doc_value())
+            == vec!["t1".to_owned(), "rohan/t7".to_owned()]),
+        "the missed rename lost the pane or its document entry: {:?} stderr={:?}",
+        scratch.doc_value(),
+        screen.stderr.text()
+    );
+    assert!(
+        screen.wait_text("rohan/t7", secs(5)),
+        "the pane does not show the snapshot's new address: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.wait_text("FAST", secs(5)),
+        "the finished pane's screen was lost across `missed`: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        wire_attach_count(&scratch.entries(), "rohan/t7"),
+        0,
+        "the finished pane must not be attached under the new address: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "`missed` reconciliation never starts a terminal"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
 }
 
 /// With no document, the first screen claims an empty one at version 0, starts
@@ -2327,6 +3753,22 @@ fn workspace_flushes_a_merged_change_on_detach_after_conflicts() {
         10,
         "the flush conflict is re-read, merged and retried at version 10"
     );
+}
+
+/// The document leaf for an address, wherever the layout holds it.
+#[cfg(unix)]
+fn doc_leaf<'a>(value: &'a serde_json::Value, address: &str) -> Option<&'a serde_json::Value> {
+    if let Some(leaf) = value.get("leaf") {
+        return (leaf.get("address").and_then(serde_json::Value::as_str) == Some(address))
+            .then_some(leaf);
+    }
+    if let Some(items) = value.as_array() {
+        return items.iter().find_map(|item| doc_leaf(item, address));
+    }
+    if let Some(object) = value.as_object() {
+        return object.values().find_map(|item| doc_leaf(item, address));
+    }
+    None
 }
 
 /// Every document pane address, in document order.
@@ -4398,7 +5840,7 @@ fn workspace_paste_frames_only_when_the_program_enabled_it() {
 #[cfg(unix)]
 fn workspace_config_sets_theme_and_keys_and_malformed_config_warns() {
     let scratch = Scratch::new("m6-config");
-    scratch.seed_config(r#"{"theme":"light","keys":{"new_tab":"t"}}"#);
+    scratch.seed_config(r#"{"theme":"light","keys":{"new_tab":"b"}}"#);
     let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
     assert!(
         wait_for_text(&screen, "PANE-ONE"),
@@ -4420,7 +5862,7 @@ fn workspace_config_sets_theme_and_keys_and_malformed_config_warns() {
         screen.errors()
     );
 
-    screen.command(b't');
+    screen.command(b'b');
     assert!(
         wait_for_text(&screen, "PANE-TWO"),
         "the rebound new-tab key did not run: {:?}",
@@ -4433,7 +5875,7 @@ fn workspace_config_sets_theme_and_keys_and_malformed_config_warns() {
         screen.rendered()
     );
     assert!(
-        wait_for_text(&screen, "^b t"),
+        wait_for_text(&screen, "^b b"),
         "the palette did not show the configured key hint: {:?}",
         screen.rendered()
     );
@@ -4510,13 +5952,777 @@ fn workspace_processes_a_large_output_burst() {
     );
 }
 
+// --- file viewer and editor ------------------------------------------------
+
+/// A POSIX shell editor for the fake `$VISUAL`: it runs `body`, records the
+/// temp path it was given, and prints a marker on the outer screen.
+#[cfg(unix)]
+fn editor_script(scratch: &Scratch, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = scratch.dir.join("editor.sh");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' \"$1\" > \"$FAKE_EDITOR_LOG\"\n{body}\nprintf 'EDITOR-RAN\\n'\n"
+    );
+    std::fs::write(&path, script).expect("write editor script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make editor executable");
+    path
+}
+
+#[cfg(unix)]
+fn file_calls(scratch: &Scratch, method: &str) -> Vec<Value> {
+    scratch
+        .entries()
+        .into_iter()
+        .filter(|entry| entry["call"] == json!(method))
+        .collect()
+}
+
+/// Opens the overlay, types the path after the prefilled cwd and reads it.
+#[cfg(unix)]
+fn open_file(workspace: &mut FakeScreen, name: &str) {
+    workspace.command(b'o');
+    assert!(
+        workspace.wait_text("file · Enter read · Esc close", secs(5)),
+        "the file prompt did not open; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    workspace.type_text(name);
+    workspace.send(b"\r");
+}
+
+#[cfg(unix)]
+fn workspace_views_a_local_file_through_core_and_scrolls() {
+    let scratch = Scratch::new("files-view");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    let text: String = (0..500).map(|line| format!("line-{line:03}\n")).collect();
+    scratch.seed_file(None, &path_text, &text);
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let mut workspace =
+        FakeScreen::spawn_workspace_env(&scratch, "files", &[("FAKE_FILES_CWD", &cwd)]);
+    assert!(
+        workspace.wait_text("shared / main / t1", secs(10)),
+        "the restored pane did not appear; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    open_file(&mut workspace, "notes.txt");
+    assert!(
+        workspace.wait_text("lines 1-400 of 500", secs(5))
+            && workspace.wait_text("line-000", secs(5)),
+        "the first window was not drawn; screen={:?}",
+        workspace.rendered()
+    );
+    let reads = file_calls(&scratch, "file.read");
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!(reads[0]["params"]["path"], json!(path_text));
+    assert_eq!(reads[0]["params"]["cwd"], json!(cwd));
+    assert_eq!(reads[0]["params"]["offset"], json!(1));
+    assert_eq!(
+        reads[0]["params"]["limit"],
+        json!(herdr_terminal::workspace::file::PAGE)
+    );
+    assert!(
+        reads[0]["params"].get("on").is_none(),
+        "a local read sends no on: {:?}",
+        reads[0]["params"]
+    );
+
+    // G is End: it fetches the last page instead of loading the whole file.
+    workspace.type_text("G");
+    assert!(
+        workspace.wait_text("lines 101-500 of 500", secs(5))
+            && workspace.wait_text("line-499", secs(5)),
+        "the last page was not drawn; screen={:?}",
+        workspace.rendered()
+    );
+    let reads = file_calls(&scratch, "file.read");
+    assert_eq!(reads.len(), 2, "{reads:?}");
+    assert_eq!(reads[1]["params"]["offset"], json!(101));
+    assert_eq!(
+        reads[1]["params"]["limit"],
+        json!(herdr_terminal::workspace::file::PAGE)
+    );
+
+    workspace.type_text("g");
+    assert!(
+        workspace.wait_text("lines 1-400 of 500", secs(5)),
+        "Home did not return to the first page; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(file_calls(&scratch, "file.read").len(), 3);
+
+    workspace.send(&[0x1b]);
+    assert!(
+        workspace.wait_text("^b ? help", secs(5)),
+        "Esc did not close the viewer; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !file_calls(&scratch, "doc.set")
+            .iter()
+            .any(|call| call["params"]["value"].to_string().contains("line-")),
+        "file contents must stay out of the workspace document"
+    );
+    assert!(
+        file_calls(&scratch, "terminal.read").is_empty(),
+        "the viewer never reads a screen"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_opens_a_remote_file_with_machine_and_remote_cwd() {
+    let scratch = Scratch::new("files-remote");
+    scratch.seed_file(Some("alpha"), "/srv/app/notes.txt", "REMOTE-FILE\n");
+    scratch.seed_doc(one_tab_doc(&[(4, "alpha/t7")]), 2);
+    let mut workspace = FakeScreen::spawn_workspace_env(&scratch, "files-remote", &[]);
+    assert!(
+        workspace.wait_text("alpha/t7", secs(10)),
+        "the remote pane did not appear; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.command(b'o');
+    assert!(
+        workspace.wait_text("alpha · cwd /srv/app", secs(5)),
+        "the prompt must show the remote machine and cwd; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.type_text("notes.txt");
+    workspace.send(b"\r");
+    assert!(
+        workspace.wait_text("file · alpha · /srv/app/notes.txt", secs(5))
+            && workspace.wait_text("REMOTE-FILE", secs(5)),
+        "the remote file was not read through core; screen={:?}",
+        workspace.rendered()
+    );
+    let reads = file_calls(&scratch, "file.read");
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!(reads[0]["params"]["on"], json!("alpha"));
+    assert_eq!(reads[0]["params"]["cwd"], json!("/srv/app"));
+    assert_eq!(reads[0]["params"]["path"], json!("/srv/app/notes.txt"));
+
+    workspace.send(&[0x1b]);
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_editor_edits_diffs_and_writes_through_core() {
+    let scratch = Scratch::new("files-edit");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\nTITLE=old\nomega\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(
+        &scratch,
+        "tmp=\"$1.ht\"\nwhile IFS= read -r line || [ -n \"$line\" ]; do\n\
+         case \"$line\" in TITLE=old) printf '%s\\n' 'TITLE=new' ;; \
+         *) printf '%s\\n' \"$line\" ;; esac\ndone < \"$1\" > \"$tmp\"\nmv \"$tmp\" \"$1\"",
+    );
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(
+        workspace.wait_text("shared / main / t1", secs(10)),
+        "screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    open_file(&mut workspace, "notes.txt");
+    assert!(workspace.wait_text("TITLE=old", secs(5)));
+
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("file diff · w write · q discard · Esc close", secs(10))
+            && workspace.wait_text("-     2 TITLE=old", secs(10))
+            && workspace.wait_text("+     2 TITLE=new", secs(10))
+            && workspace.wait_text("1 added, 1 removed", secs(10)),
+        "the editor diff was not shown; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        workspace.raw().contains("EDITOR-RAN"),
+        "the editor did not run on the outer terminal: {:?}",
+        workspace.raw()
+    );
+    let temp = std::fs::read_to_string(&editor_log).expect("editor temp path");
+    assert!(
+        temp.contains("-notes.txt") && temp.ends_with("notes.txt"),
+        "the temp file keeps the source extension: {temp:?}"
+    );
+
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text(&format!("wrote {path_text}"), secs(10)),
+        "the write was not reported; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\nTITLE=new\nomega\n"),
+        "core received the edited content"
+    );
+    let edits = file_calls(&scratch, "file.edit");
+    assert_eq!(
+        edits.len(),
+        1,
+        "one exact replacement fits file.edit: {edits:?}"
+    );
+    assert_eq!(edits[0]["params"]["edits"][0]["old"], json!("old"));
+    assert_eq!(edits[0]["params"]["edits"][0]["new"], json!("new"));
+    assert!(
+        edits[0]["params"].get("on").is_none(),
+        "a local edit sends no on"
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty(),
+        "a single exact replacement is an edit"
+    );
+    assert!(
+        !scratch.doc_value().to_string().contains("TITLE=new"),
+        "file contents must stay out of the workspace document"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_discarded_editor_changes_are_never_written() {
+    let scratch = Scratch::new("files-discard");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\nbeta\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'discarded\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    assert!(workspace.wait_text("alpha", secs(5)));
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("file diff · w write · q discard · Esc close", secs(10))
+            && workspace.wait_text("+     3 discarded", secs(10)),
+        "the diff was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.type_text("q");
+    assert!(
+        workspace.wait_text("file changes discarded", secs(5)),
+        "q did not discard; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "a discard must never write: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\nbeta\n")
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_conflict_requires_an_explicit_overwrite() {
+    let scratch = Scratch::new("files-conflict");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\nbeta\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'gamma\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-conflict",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    assert!(workspace.wait_text("alpha", secs(5)));
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("+     3 gamma", secs(10)),
+        "the diff was not shown; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text("changed since it was read", secs(10)),
+        "the conflict was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.rendered().contains("changed on disk"),
+        "the conflict title is missing; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "a changed file must not be written silently: {:?}",
+        scratch.entries()
+    );
+
+    workspace.type_text("o");
+    assert!(
+        workspace.wait_text(&format!("wrote {path_text}"), secs(10)),
+        "the explicit overwrite was not reported; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\nbeta\ngamma\n"),
+        "the explicit overwrite writes the edited buffer"
+    );
+    let writes = file_calls(&scratch, "file.write");
+    assert_eq!(writes.len(), 1, "{writes:?}");
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_write_failure_keeps_the_diff_and_buffer() {
+    let scratch = Scratch::new("files-write-fail");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'beta\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-write-fail",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    workspace.type_text("e");
+    assert!(workspace.wait_text("+     2 beta", secs(10)));
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text("disk is full", secs(10)),
+        "the write refusal was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.rendered().contains("file diff") && workspace.rendered().contains("+     2 beta"),
+        "the diff and buffer must survive a failed write; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\n"),
+        "a failed write changes nothing"
+    );
+    workspace.type_text("q");
+    assert!(workspace.wait_text("file changes discarded", secs(5)));
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_editor_failure_restores_the_terminal_and_keeps_the_viewer() {
+    let scratch = Scratch::new("files-editor-fail");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'EDITOR-FAIL\\n'\nexit 3");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    assert!(workspace.wait_text("alpha", secs(5)));
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("exited (exit status: 3)", secs(10)),
+        "the editor failure was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(workspace.raw().contains("EDITOR-FAIL"));
+    assert!(
+        workspace.rendered().contains("file · local ·"),
+        "the viewer stays after a failed editor; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty()
+    );
+
+    // The TUI was restored, not only drawn once: a normal command works.
+    workspace.send(&[0x1b]);
+    assert!(
+        workspace.wait_text("^b ? help", secs(5)),
+        "Esc did not close the viewer; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.command(b':');
+    assert!(
+        workspace.wait_text("palette · Enter run · Esc close", secs(5)),
+        "the TUI did not recover after the editor; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.send(&[0x1b]);
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\n"),
+        "a failed editor changes nothing"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// Editor temp files this client left in the scratch temp directory.
+#[cfg(unix)]
+fn temp_files(scratch: &Scratch) -> Vec<String> {
+    std::fs::read_dir(&scratch.dir)
+        .expect("scratch dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("ht-"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn workspace_refuses_to_edit_a_truncated_whole_read() {
+    let scratch = Scratch::new("files-truncated-edit");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "one\ntwo\nthree\nfour\nfive\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'ran\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-truncated",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("TMPDIR", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(
+        workspace.wait_text("shared / main / t1", secs(10)),
+        "screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    open_file(&mut workspace, "notes.txt");
+    assert!(
+        workspace.wait_text("lines 1-5 of 5", secs(5)),
+        "the bounded viewer page is unaffected by the cap; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("too large to edit through Core's inline read", secs(5)),
+        "the truncated whole read was not refused; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !editor_log.exists(),
+        "no editor may run for a truncated read"
+    );
+    assert!(
+        !workspace.raw().contains("EDITOR-RAN"),
+        "the editor process never ran"
+    );
+    assert!(
+        temp_files(&scratch).is_empty(),
+        "no temp file may be left behind: {:?}",
+        temp_files(&scratch)
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "a refused edit writes nothing: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        workspace.rendered().contains("file · local ·") && workspace.rendered().contains("five"),
+        "the viewer stays usable; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.send(&[0x1b]);
+    assert!(
+        workspace.wait_text("^b ? help", secs(5)),
+        "Esc did not close the viewer; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_refuses_to_write_a_truncated_recheck() {
+    let scratch = Scratch::new("files-truncated-recheck");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "one\ntwo\nthree\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'four\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-truncated-recheck",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("TMPDIR", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("+     4 four", secs(10)),
+        "the complete first whole read still edits; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text("too large to edit through Core's inline read", secs(10)),
+        "a truncated re-read must refuse `w`; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "a truncated re-read writes nothing: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        workspace.rendered().contains("file diff") && workspace.rendered().contains("+     4 four"),
+        "the diff and buffer stay; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.send(b"\r");
+    assert!(
+        workspace.wait_text("too large to edit through Core's inline read", secs(5)),
+        "Enter is the same write path; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "Enter writes nothing either: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch.doc_value().to_string().contains("four"),
+        "file contents must stay out of the workspace document"
+    );
+
+    workspace.type_text("q");
+    assert!(workspace.wait_text("file changes discarded", secs(5)));
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_force_overwrite_refuses_a_truncated_read() {
+    let scratch = Scratch::new("files-truncated-overwrite");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "one\ntwo\nthree\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'four\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-truncated-overwrite",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("TMPDIR", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    workspace.type_text("e");
+    assert!(workspace.wait_text("+     4 four", secs(10)));
+
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text("changed since it was read", secs(10)),
+        "the complete changed re-read is a conflict; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.rendered().contains("changed on disk"),
+        "the conflict state is visible; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty()
+    );
+
+    workspace.type_text("o");
+    assert!(
+        workspace.wait_text("too large to edit through Core's inline read", secs(10)),
+        "the explicit overwrite must refuse a truncated re-read; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "the overwrite wrote nothing: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        workspace.rendered().contains("file diff")
+            && workspace.rendered().contains("+     4 four")
+            && workspace.rendered().contains("changed on disk"),
+        "the diff and conflict state stay; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !scratch.doc_value().to_string().contains("four"),
+        "file contents must stay out of the workspace document"
+    );
+
+    workspace.type_text("q");
+    assert!(workspace.wait_text("file changes discarded", secs(5)));
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
 // --- observer attach -------------------------------------------------------
 
 /// A client connected straight to the scripted core, without `ht` in the way.
 /// The wrapper is a small shell script so the scenario reaches the child
 /// `hc connect` without touching this process's environment.
 #[cfg(unix)]
-fn observer_client(scratch: &Scratch, scenario: &str) -> CoreClient {
+fn observer_connect(scratch: &Scratch, scenario: &str) -> herdr_terminal::core::Result<CoreClient> {
     use std::os::unix::fs::PermissionsExt;
     let exe = std::env::current_exe().expect("test executable");
     let wrapper = scratch.dir.join("hc");
@@ -4528,7 +6734,12 @@ fn observer_client(scratch: &Scratch, scenario: &str) -> CoreClient {
     std::fs::write(&wrapper, script).expect("write hc wrapper");
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
         .expect("make wrapper executable");
-    CoreClient::connect(Some(&wrapper)).expect("connect to the scripted core")
+    CoreClient::connect(Some(&wrapper))
+}
+
+#[cfg(unix)]
+fn observer_client(scratch: &Scratch, scenario: &str) -> CoreClient {
+    observer_connect(scratch, scenario).expect("connect to the scripted core")
 }
 
 #[cfg(unix)]
@@ -4661,53 +6872,46 @@ fn observer_attach_negotiates_resize_notifications_and_applies_them_in_order() {
     );
 }
 
-/// Without the feature there is no observer path, and a normal attach still
-/// carries no observer fields.
+/// A core older than the supported minimum is refused during `hello`, before
+/// any call, with a message that names the versions and the update path.
 #[cfg(unix)]
-fn observer_attach_is_unavailable_without_the_feature_and_normal_attach_is_unchanged() {
-    let scratch = Scratch::new("observe-missing");
-    let client = observer_client(&scratch, "observe-missing");
-    assert!(!client.hello().supports("resize_notifications"));
-    let Err(error) = client.attach_observer("t1", 80, 24, 0) else {
-        panic!("an observer attach needs the feature");
+fn an_older_core_is_refused_at_connect() {
+    let scratch = Scratch::new("old-core-version");
+    let Err(error) = observer_connect(&scratch, "old-core-version") else {
+        panic!("an older core must be refused");
     };
     assert!(
-        matches!(error, Error::Protocol(_)),
-        "clear protocol error, got {error:?}"
+        matches!(error, Error::Mismatch(Mismatch::VersionTooOld { .. })),
+        "clear version mismatch, got {error:?}"
     );
+    let message = error.to_string();
+    assert!(message.contains("0.1.16"), "{message}");
+    assert!(message.contains("0.1.17"), "{message}");
+    assert!(message.contains("hc update"), "{message}");
     assert!(
-        error.to_string().contains("resize_notifications"),
-        "the error names the missing feature: {error}"
+        !log_records(&scratch)
+            .iter()
+            .any(|record| record["call"].is_string()),
+        "no call follows the refused hello: {:?}",
+        log_records(&scratch)
     );
+}
+
+/// The required `resize_notifications` feature is checked at `hello` too:
+/// there is no normal-attach or `size`-event fallback.
+#[cfg(unix)]
+fn a_core_without_resize_notifications_is_refused_at_connect() {
+    let scratch = Scratch::new("old-core-feature");
+    let Err(error) = observer_connect(&scratch, "old-core-feature") else {
+        panic!("a core without the required feature must be refused");
+    };
+    let message = error.to_string();
+    assert!(message.contains("resize_notifications"), "{message}");
     assert!(
         !log_records(&scratch)
             .iter()
             .any(|record| record["call"] == "terminal.attach"),
         "the client must not attach as a normal viewer instead"
-    );
-
-    let attached = client
-        .attach("t1", 80, 24, 0)
-        .expect("a normal attach still works");
-    assert!(!attached.resize_notifications);
-    assert!(
-        matches!(next_item(&attached), StreamItem::Data(bytes) if bytes.as_slice() == b"NORMAL\n")
-    );
-    assert!(matches!(next_item(&attached), StreamItem::Closed(_)));
-
-    let records = log_records(&scratch);
-    let attach = records
-        .iter()
-        .find(|record| record["call"] == "terminal.attach")
-        .expect("terminal.attach was called");
-    let params = attach["params"].as_object().expect("params");
-    assert!(
-        !params.contains_key("observe"),
-        "normal attach params are unchanged: {params:?}"
-    );
-    assert!(
-        !params.contains_key("resize_notifications"),
-        "normal attach params are unchanged: {params:?}"
     );
 }
 
@@ -5023,6 +7227,8 @@ fn fake_connect() -> io::Result<()> {
     let doc_path = doc_path.as_deref();
     let label_path = log_path.map(|path| path.with_file_name("labels.json"));
     let label_path = label_path.as_deref();
+    let file_path = log_path.map(|path| path.with_file_name("files.json"));
+    let file_path = file_path.as_deref();
     let generation = bump_generation(log_path);
     log(log_path, json!({"generation": generation}));
     // The name of the start whose reply will be dropped, so the next
@@ -5043,20 +7249,29 @@ fn fake_connect() -> io::Result<()> {
     let hello: serde_json::Value =
         serde_json::from_str(line.trim()).map_err(|error| invalid(error.to_string()))?;
     assert_eq!(hello["method"], "hello");
-    let mut features = vec!["framed", "attach", "events"];
-    if scenario.starts_with("observe") && scenario != "observe-missing" {
-        // A relay path can lose support; an old core simply never had it.
-        features.push("resize_notifications");
+    let mut features = vec!["framed", "attach", "events", "resize_notifications"];
+    // Two scripted old cores: one predates the minimum version, one lacks the
+    // now-required resize feature. Everything else is a current core.
+    let version = if scenario == "old-core-version" {
+        "0.1.16"
+    } else {
+        "9.9.9-fake"
+    };
+    if scenario == "old-core-feature" {
+        features.retain(|feature| *feature != "resize_notifications");
     }
     let result = json!({
         "generation": 1,
-        "version": "9.9.9-fake",
+        "version": version,
         "core": {"id": "fake", "name": "fake"},
         "framed": true,
         "methods": [
             "events.subscribe", "terminal.run", "terminal.attach",
             "terminal.get", "terminal.read", "terminal.rm", "terminal.kill",
-            "terminal.label", "doc.get", "doc.set"
+            "terminal.label", "doc.get", "doc.set",
+            "file.read", "file.write", "file.edit",
+            "machine.list", "machine.add", "machine.connect", "machine.rename",
+            "machine.rm"
         ],
         "features": features,
     });
@@ -5104,6 +7319,44 @@ fn fake_connect() -> io::Result<()> {
     // `observe-early-frames`: the later pair is sent only after the client
     // credits the early paint, which proves the live route was registered.
     let mut late_frames_sent = false;
+    // The terminal-manager preview's channel, so its close can drive the
+    // scripted manager events while the manager underneath stays open.
+    let mut preview_channel: Option<u32> = None;
+    let mut manager_events_sent = false;
+    // Core's machine profiles and line states for the machine manager.
+    let mut machines = seeded_machines(&scenario);
+    // Remote terminals mirrored under a machine prefix, so a rename or
+    // removal can emit the same address changes a real core emits.
+    let mut remote_terminals: Vec<String> = if scenario.starts_with("machines-remote") {
+        vec!["alpha/t7".to_owned()]
+    } else {
+        Vec::new()
+    };
+    // The terminal each attach channel shows, for finishing streams when a
+    // machine is removed.
+    let mut channel_targets: BTreeMap<u32, String> = BTreeMap::new();
+    // `machines-missed`: send a fresh snapshot with the remote terminal once.
+    let mut machines_missed_sent = false;
+    // `machines-external-rename`: another client renamed the machine.
+    let mut external_rename_sent = false;
+    // `machines-remote-streamless-rename`: a stream-less pane must survive
+    // core's `removed` + `created` rename pair.
+    let mut streamless_rename_sent = false;
+    // `machines-remote-finished-rename`: a finished remote pane keeps its
+    // final screen across the same pair.
+    let mut finished_rename_sent = false;
+    // `machines-remote-gone`: a stream-less terminal removed with no rename.
+    let mut remote_gone_sent = false;
+    // `machines-missed-rename`: the fresh `missed` snapshot has the machine's
+    // new prefix while the stored document still names the old one.
+    let mut missed_rename_sent = false;
+    // `files-conflict`: every read after the first two returns text another
+    // writer produced. The first read opens the viewer, the second is the
+    // editor's full read, the third is the write-time conflict check.
+    let mut file_reads = 0u32;
+    // Whole (unbounded) reads drive the truncation modes below; paged reads
+    // stay complete because the viewer asks by offset and limit.
+    let mut whole_reads = 0u32;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         let mut frame = json!({"channel": channel, "kind": kind, "len": payload.len()});
@@ -5126,6 +7379,56 @@ fn fake_connect() -> io::Result<()> {
         // attach is treated as a fresh paint.
         if kind == CLOSE {
             attached_channels.remove(&channel);
+            channel_targets.remove(&channel);
+            if scenario == "manager-events"
+                && preview_channel == Some(channel)
+                && !manager_events_sent
+            {
+                manager_events_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "status",
+                        "t9",
+                        json!({
+                            "status": agent_status("done", "claude", "Worker", None, None, ""),
+                            "records": {},
+                            "reported": true,
+                        }),
+                    ),
+                )?;
+                let mut builder = manager_worker_record("t10", "idle");
+                builder["name"] = json!("builder");
+                builder["title"] = json!("New worker");
+                let labels = builder["labels"].clone();
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "labels",
+                        "t10",
+                        json!({"labels": labels, "record": builder}),
+                    ),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "finished",
+                        "t8",
+                        json!({"reason": "exited", "exit_code": 0}),
+                    ),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "t7", json!({})),
+                )?;
+            }
             continue;
         }
 
@@ -5172,6 +7475,131 @@ fn fake_connect() -> io::Result<()> {
             if scenario.starts_with("agents") {
                 agent_step += 1;
                 agent_key_script(&scenario, agent_step, &mut output, &mut event_seq)?;
+                continue;
+            }
+            if scenario == "machines-reconnect" {
+                // The connection drops with the remote pane still attached.
+                return Ok(());
+            }
+            if scenario == "machines-external-rename" && !external_rename_sent {
+                external_rename_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "alpha/t7", json!({})),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "created",
+                        "rohan/t7",
+                        doc_terminal("rohan/t7", 1, 2, 4),
+                    ),
+                )?;
+                continue;
+            }
+            if scenario == "machines-remote-streamless-rename" && !streamless_rename_sent {
+                // Any key proves the pane is attached. The pane then loses
+                // its stream (a `lost` event), and the rename pair follows
+                // back to back in the same batch.
+                streamless_rename_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "lost",
+                        "alpha/t7",
+                        json!({"reason": "server_stop"}),
+                    ),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "alpha/t7", json!({})),
+                )?;
+                let mut record = live_record(5500);
+                record["address"] = json!("rohan/t7");
+                record["labels"] = client_labels(1, 2, 4);
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "created", "rohan/t7", record),
+                )?;
+                continue;
+            }
+            if scenario == "machines-remote-finished-rename" && !finished_rename_sent {
+                // The pane finished without a stream; its final screen is
+                // local. Core renames the machine: removed then created.
+                finished_rename_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "alpha/t7", json!({})),
+                )?;
+                let mut record = finished_doc_terminal("rohan/t7", 1, 2, 4);
+                record["labels"] = client_labels(1, 2, 4);
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "created", "rohan/t7", record),
+                )?;
+                continue;
+            }
+            if scenario == "machines-remote-gone" && !remote_gone_sent {
+                // A stream-less terminal is removed with no created event:
+                // this pane must leave.
+                remote_gone_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "lost",
+                        "alpha/t7",
+                        json!({"reason": "server_stop"}),
+                    ),
+                )?;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(event_seq, "removed", "alpha/t7", json!({})),
+                )?;
+                continue;
+            }
+            if scenario == "machines-missed-rename" && !missed_rename_sent {
+                // Another client renamed the machine while this subscriber
+                // was behind: the fresh snapshot carries only the new
+                // address, but the stored document still names the old one.
+                missed_rename_sent = true;
+                notify(
+                    &mut output,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "missed",
+                        "params": {"seq": 9, "terminals": [
+                            doc_terminal("t1", 1, 2, 3),
+                            finished_doc_terminal("rohan/t7", 1, 2, 4),
+                        ]},
+                    }),
+                )?;
+                continue;
+            }
+            if scenario == "machines-missed" && !machines_missed_sent {
+                machines_missed_sent = true;
+                notify(
+                    &mut output,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "missed",
+                        "params": {"seq": 9, "terminals": [
+                            doc_terminal("t1", 1, 2, 3),
+                            doc_terminal("alpha/t7", 1, 2, 4),
+                        ]},
+                    }),
+                )?;
                 continue;
             }
             if !triggered {
@@ -5256,6 +7684,218 @@ fn fake_connect() -> io::Result<()> {
                     snapshot_for(&scenario, generation, pending_name.as_deref(), &started);
                 reply(&mut output, &id, snapshot)?;
             }
+            "machine.list" => {
+                let listed: Vec<Value> = machines.to_vec();
+                reply(&mut output, &id, json!({"machines": listed}))?;
+            }
+            "machine.add" => {
+                let target = message["params"]["target"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if target.is_empty() || target == "refused" {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "invalid_params",
+                        "a machine needs a target",
+                        "hc machine add TARGET",
+                    )?;
+                    continue;
+                }
+                let requested = message["params"]["name"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| machine_name_for(&target));
+                let mut name = requested.clone();
+                let mut suffix = 2;
+                while machines
+                    .iter()
+                    .any(|machine| machine["name"] == json!(name))
+                {
+                    name = format!("{requested}-{suffix}");
+                    suffix += 1;
+                }
+                let entry = machine_entry(MachineSeed {
+                    name: &name,
+                    target: &target,
+                    state: "connecting",
+                    why: None,
+                    temporary: message["params"]["temporary"].as_bool().unwrap_or(false),
+                    via: false,
+                    session: message["params"]["session"].as_str(),
+                    host: "",
+                });
+                machines.push(entry.clone());
+                reply(&mut output, &id, machine_profile(&entry))?;
+            }
+            "machine.connect" => {
+                let name = message["params"]["machine"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let Some(index) = machines
+                    .iter()
+                    .position(|machine| machine["name"] == json!(name))
+                else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "machine_unknown",
+                        &format!("no machine named {name}"),
+                        "machine.list names them",
+                    )?;
+                    continue;
+                };
+                if scenario == "machines-connect-fail" {
+                    machines[index]["state"] = json!("unreachable");
+                    machines[index]["why"] = json!("connection refused");
+                    machines[index]["since_ms"] = json!(fake_now_ms() - 60_000);
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "unreachable",
+                        &format!("could not reach {name}: connection refused"),
+                        "check the target and ssh login",
+                    )?;
+                    continue;
+                }
+                machines[index]["state"] = json!("connected");
+                machines[index]["why"] = Value::Null;
+                let view = machines[index].clone();
+                reply(&mut output, &id, view)?;
+            }
+            "machine.rename" => {
+                let old = message["params"]["machine"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let new = message["params"]["new_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let Some(index) = machines
+                    .iter()
+                    .position(|machine| machine["name"] == json!(old))
+                else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "machine_unknown",
+                        &format!("no machine named {old}"),
+                        "machine.list names them",
+                    )?;
+                    continue;
+                };
+                let valid = !new.is_empty()
+                    && new.len() <= 32
+                    && new
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+                if !valid {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "invalid_params",
+                        "a machine name is 1-32 characters from a-z, 0-9, '-' '_' '.'",
+                        "pick another name",
+                    )?;
+                    continue;
+                }
+                if machines
+                    .iter()
+                    .enumerate()
+                    .any(|(other, machine)| other != index && machine["name"] == json!(new))
+                {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "name_taken",
+                        &format!("a machine named {new} already exists"),
+                        "pick another name",
+                    )?;
+                    continue;
+                }
+                machines[index]["name"] = json!(new);
+                // Rename mirrored terminals exactly as core does: removed for
+                // the old address, created for the new, streams left open.
+                let renamed: Vec<(String, String)> = remote_terminals
+                    .iter()
+                    .filter_map(|address| {
+                        address
+                            .strip_prefix(&format!("{old}/"))
+                            .map(|rest| (address.clone(), format!("{new}/{rest}")))
+                    })
+                    .collect();
+                for (from, to) in &renamed {
+                    if let Some(slot) = remote_terminals.iter_mut().find(|a| *a == from) {
+                        slot.clone_from(to);
+                    }
+                    for target in channel_targets.values_mut() {
+                        if target == from {
+                            target.clone_from(to);
+                        }
+                    }
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(event_seq, "removed", from, json!({})),
+                    )?;
+                    let mut record = live_record(5400);
+                    record["address"] = json!(to);
+                    event_seq += 1;
+                    notify(&mut output, agent_event(event_seq, "created", to, record))?;
+                }
+                let renamed = machines[index].clone();
+                reply(&mut output, &id, machine_profile(&renamed))?;
+            }
+            "machine.rm" => {
+                let name = message["params"]["machine"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let Some(index) = machines
+                    .iter()
+                    .position(|machine| machine["name"] == json!(name))
+                else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "machine_unknown",
+                        &format!("no machine named {name}"),
+                        "machine.list names them",
+                    )?;
+                    continue;
+                };
+                machines.remove(index);
+                reply(&mut output, &id, json!({"removed": true}))?;
+                let gone: Vec<String> = remote_terminals
+                    .iter()
+                    .filter(|address| address.starts_with(&format!("{name}/")))
+                    .cloned()
+                    .collect();
+                remote_terminals.retain(|address| !gone.contains(address));
+                for address in &gone {
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(event_seq, "removed", address, json!({})),
+                    )?;
+                }
+                // Core forgets the line and finishes its relayed streams.
+                let channels: Vec<u32> = channel_targets
+                    .iter()
+                    .filter(|(_, target)| gone.contains(target))
+                    .map(|(channel, _)| *channel)
+                    .collect();
+                for channel in channels {
+                    write_frame(&mut output, channel, CLOSE, b"")?;
+                    attached_channels.remove(&channel);
+                    channel_targets.remove(&channel);
+                }
+            }
             "terminal.run" => {
                 runs += 1;
                 if scenario == "workspace-pending" && generation == 1 && runs == 2 {
@@ -5264,11 +7904,39 @@ fn fake_connect() -> io::Result<()> {
                     return Ok(());
                 }
                 let name = message["params"]["name"].as_str().unwrap_or_default();
+                let machine_on = message["params"]["on"].as_str().map(str::to_owned);
+                if let Some(on) = &machine_on
+                    && !machines.iter().any(|machine| machine["name"] == json!(on))
+                {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "machine_unknown",
+                        &format!("no machine named {on}"),
+                        "ht machine manager lists machines",
+                    )?;
+                    continue;
+                }
                 last_run_labels = message["params"]["labels"]
                     .as_object()
                     .cloned()
                     .unwrap_or_default();
-                let record = if scenario == "workspace-pending" {
+                let record = if let Some(on) = &machine_on {
+                    // A machine run is mirrored under the machine's prefix;
+                    // the labels and every other run field are the client's
+                    // own. Tests read `machine_run` to see what core mapped.
+                    let address = format!("{on}/t{}", 8 + runs);
+                    remote_terminals.push(address.clone());
+                    log(
+                        log_path,
+                        json!({"machine_run": {"on": on, "address": address}}),
+                    );
+                    let mut record = live_record(5200 + runs);
+                    record["address"] = json!(address);
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    record
+                } else if scenario == "workspace-pending" {
                     if runs == 1 {
                         named_record("t1", name, 4242)
                     } else {
@@ -5394,6 +8062,20 @@ fn fake_connect() -> io::Result<()> {
                         "t1 has finished",
                         "read what it left: hc read t1",
                     )?;
+                } else if matches!(
+                    scenario.as_str(),
+                    "machines-remote-finished-rename" | "machines-missed-rename"
+                ) && target == "alpha/t7"
+                {
+                    // The remote pane finished before this screen attached;
+                    // its final screen is recovered and kept without a stream.
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "finished",
+                        "alpha/t7 has finished",
+                        "read what it left: hc read alpha/t7",
+                    )?;
                 } else if parked {
                     // The kept terminal has no program until core restarts
                     // it; the `restarted` event follows immediately.
@@ -5416,6 +8098,7 @@ fn fake_connect() -> io::Result<()> {
                     let channel = next_channel;
                     next_channel += 1;
                     attached_channels.insert(channel);
+                    channel_targets.insert(channel, target.clone());
                     log(log_path, json!({"attached": channel, "terminal": target}));
                     let second_pane = target == "t2"
                         && matches!(scenario.as_str(), "workspace-pending" | "workspace-missed");
@@ -5425,6 +8108,26 @@ fn fake_connect() -> io::Result<()> {
                         // Interactive scenarios attach several panes; the
                         // record must name the terminal that was attached.
                         let mut record = live_record(4242);
+                        record["address"] = json!(target);
+                        record
+                    } else if scenario == "manager-cross-screen" {
+                        match target.as_str() {
+                            "t9" => cross_screen_worker_record("t9"),
+                            "t10" => same_screen_stale_worker_record("t10"),
+                            _ => doc_record_for(&scenario, &target),
+                        }
+                    } else if scenario.starts_with("manager") {
+                        if target == "t9" {
+                            manager_worker_record("t9", "working")
+                        } else {
+                            doc_record_for(&scenario, &target)
+                        }
+                    } else if scenario.starts_with("files") {
+                        file_pane_record(&target)
+                    } else if target.contains('/') {
+                        // A mirrored remote terminal keeps its qualified
+                        // address; the client stores it verbatim.
+                        let mut record = live_record(5300);
                         record["address"] = json!(target);
                         record
                     } else if doc_scenario(&scenario)
@@ -5494,16 +8197,6 @@ fn fake_connect() -> io::Result<()> {
                         // registered before the frame arrives.
                         "observe-bad-resize" => {
                             write_frame(&mut output, channel, DATA, b"READY\n")?;
-                        }
-                        // A normal attach on a core without the feature.
-                        "observe-missing" => {
-                            write_frame(&mut output, channel, DATA, b"NORMAL\n")?;
-                            write_frame(
-                                &mut output,
-                                channel,
-                                CLOSE,
-                                br#"{"reason":"exited","exit_code":0}"#,
-                            )?;
                         }
                         // RESIZE on an attach stream, then output that wraps
                         // at the new grid. A viewer that ignores it would draw
@@ -5614,6 +8307,27 @@ fn fake_connect() -> io::Result<()> {
                         "doc-mismatch" | "doc-missing" | "doc-foreign" | "doc-fresh"
                         | "doc-deleted" | "doc-orphan-invalid" => {
                             write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
+                        }
+                        "manager" | "manager-events" => {
+                            if target == "t9" {
+                                if confirmed && observe {
+                                    preview_channel = Some(channel);
+                                    write_frame(&mut output, channel, 3, &resize_payload(24, 6))?;
+                                    write_frame(&mut output, channel, DATA, b"PREVIEW-WORKER\n")?;
+                                } else {
+                                    write_frame(&mut output, channel, DATA, b"WORKER-PANE\n")?;
+                                }
+                            } else {
+                                write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
+                            }
+                        }
+                        "manager-cross-screen" => {
+                            let text: &[u8] = match target.as_str() {
+                                "t9" => b"FOREIGN-PANE\n",
+                                "t10" => b"STALE-PANE\n",
+                                _ => b"PANE-ONE\n",
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
                         }
                         // Agent scenarios paint their whole pane, and some
                         // emit the events the scenario is about once both
@@ -5773,6 +8487,9 @@ fn fake_connect() -> io::Result<()> {
                         "screen-reconnect" => {
                             write_frame(&mut output, channel, DATA, b"RECONNECTED\n")?;
                         }
+                        scenario if scenario.starts_with("files") => {
+                            write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
+                        }
                         _ => {
                             // The probe cannot write this anywhere: its stdout
                             // is broken.
@@ -5793,7 +8510,9 @@ fn fake_connect() -> io::Result<()> {
                     )?;
                     continue;
                 }
-                let record = if doc_scenario(&scenario) {
+                let record = if scenario.starts_with("files") {
+                    file_pane_record(target)
+                } else if doc_scenario(&scenario) {
                     if target == last_run_address && target != "t1" {
                         let mut record = live_record(8000);
                         record["address"] = json!(target);
@@ -5989,6 +8708,167 @@ fn fake_connect() -> io::Result<()> {
                     notify(&mut output, doc_event_message(version))?;
                 }
             }
+            // Files live in one store next to the log, keyed by machine and
+            // resolved path, like core's own local/remote resolution.
+            "file.read" => {
+                file_reads += 1;
+                let params = message.get("params").cloned().unwrap_or_default();
+                let key = file_key(&params);
+                let Some(stored) = read_files(file_path).get(&key).cloned() else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "not_found",
+                        &format!("no file {}", file_display(&params)),
+                        "check the path",
+                    )?;
+                    continue;
+                };
+                let text = if scenario == "files-conflict" && file_reads > 2 {
+                    "changed by another writer\n".to_owned()
+                } else {
+                    stored
+                };
+                let first = params["offset"].as_u64().unwrap_or(1) as usize;
+                let limit = params["limit"]
+                    .as_u64()
+                    .map(|limit| limit as usize)
+                    .unwrap_or(usize::MAX);
+                let whole = params.get("offset").is_none() && params.get("limit").is_none();
+                if whole {
+                    whole_reads += 1;
+                }
+                // Core caps an unbounded read at ~8 MB and answers a
+                // whole-line prefix with `last < lines`; these scenarios model
+                // that without allocating 8 MB.
+                let text = if scenario == "files-truncated-overwrite" && whole && whole_reads == 2 {
+                    "changed by another writer\n".to_owned()
+                } else {
+                    text
+                };
+                let truncated = match scenario.as_str() {
+                    "files-truncated" => whole,
+                    "files-truncated-recheck" => whole && whole_reads > 1,
+                    "files-truncated-overwrite" => whole && whole_reads > 2,
+                    _ => false,
+                };
+                let total = text.split_inclusive('\n').count();
+                if first == 0 || (first > total && first > 1) {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "invalid_params",
+                        &format!("offset {first}: the file has {total} lines"),
+                        "",
+                    )?;
+                    continue;
+                }
+                let limit = if truncated { limit.min(2) } else { limit };
+                let window: String = text
+                    .split_inclusive('\n')
+                    .skip(first - 1)
+                    .take(limit)
+                    .collect();
+                let given = window.split_inclusive('\n').count();
+                reply(
+                    &mut output,
+                    &id,
+                    json!({
+                        "text": window,
+                        "first": first,
+                        "last": first + given - 1,
+                        "lines": total,
+                    }),
+                )?;
+            }
+            "file.write" => {
+                let params = message.get("params").cloned().unwrap_or_default();
+                if scenario == "files-write-fail" {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "io",
+                        "disk is full",
+                        "free some space and retry",
+                    )?;
+                    continue;
+                }
+                let Some(bytes) = params["data"].as_str().and_then(decode_base64) else {
+                    reply_error(&mut output, &id, "invalid_params", "data is not base64", "")?;
+                    continue;
+                };
+                let Ok(text) = String::from_utf8(bytes) else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "not_text",
+                        "the file is not UTF-8 text",
+                        "",
+                    )?;
+                    continue;
+                };
+                let key = file_key(&params);
+                let mut files = read_files(file_path);
+                files.insert(key, text.clone());
+                write_files(file_path, &files);
+                reply(
+                    &mut output,
+                    &id,
+                    json!({
+                        "path": file_resolved(&params).display().to_string(),
+                        "bytes": text.len(),
+                    }),
+                )?;
+            }
+            "file.edit" => {
+                let params = message.get("params").cloned().unwrap_or_default();
+                let key = file_key(&params);
+                let Some(text) = read_files(file_path).get(&key).cloned() else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "not_found",
+                        &format!("no file {}", file_display(&params)),
+                        "check the path",
+                    )?;
+                    continue;
+                };
+                let edits: Vec<(String, String)> = params["edits"]
+                    .as_array()
+                    .map(|edits| {
+                        edits
+                            .iter()
+                            .map(|edit| {
+                                (
+                                    edit["old"].as_str().unwrap_or_default().to_owned(),
+                                    edit["new"].as_str().unwrap_or_default().to_owned(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let Some(edited) = apply_file_edits(&text, &edits) else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "edit_failed",
+                        "an edit no longer matches the file",
+                        "read it again: exact text",
+                    )?;
+                    continue;
+                };
+                let mut files = read_files(file_path);
+                files.insert(key, edited.clone());
+                write_files(file_path, &files);
+                reply(
+                    &mut output,
+                    &id,
+                    json!({
+                        "path": file_resolved(&params).display().to_string(),
+                        "bytes": edited.len(),
+                    }),
+                )?;
+            }
             _ => reply(&mut output, &id, json!({}))?,
         }
     }
@@ -6061,6 +8941,41 @@ fn snapshot_for(
         });
     }
     let terminals: Vec<Value> = match scenario {
+        "manager" => vec![
+            doc_record_for(scenario, "t1"),
+            manager_worker_record("t9", "working"),
+        ],
+        "manager-events" => vec![
+            doc_record_for(scenario, "t1"),
+            manager_worker_record("t9", "working"),
+            manager_worker_record("t8", "idle"),
+            manager_worker_record("t7", "idle"),
+        ],
+        "manager-cross-screen" => vec![
+            doc_record_for(scenario, "t1"),
+            cross_screen_worker_record("t9"),
+            same_screen_stale_worker_record("t10"),
+        ],
+        "machines-remote"
+        | "machines-missed"
+        | "machines-reconnect"
+        | "machines-external-rename"
+        | "machines-remote-streamless-rename"
+        | "machines-remote-gone" => vec![
+            doc_terminal("t1", 1, 2, 3),
+            doc_terminal("alpha/t7", 1, 2, 4),
+        ],
+        "machines-remote-finished-rename" | "machines-missed-rename" => vec![
+            doc_terminal("t1", 1, 2, 3),
+            finished_doc_terminal("alpha/t7", 1, 2, 4),
+        ],
+        "files"
+        | "files-conflict"
+        | "files-write-fail"
+        | "files-truncated"
+        | "files-truncated-recheck"
+        | "files-truncated-overwrite" => vec![file_pane_record("t1")],
+        "files-remote" => vec![file_pane_record("alpha/t7")],
         "doc-restore"
         | "doc-remove"
         | "doc-deleted-recover"
@@ -6090,7 +9005,7 @@ fn snapshot_for(
         "doc-deleted-claim-lost" => Vec::new(),
         "doc-orphan" => vec![doc_record_for(scenario, "t1"), orphan_record("t7", 5, 6, 9)],
         "doc-orphan-invalid" => vec![doc_record_for(scenario, "t1"), unlabeled_record("t9")],
-        "doc-foreign" => vec![foreign_record("t1")],
+        "doc-foreign" => vec![unlabeled_record("t1")],
         "agents-lost" if generation > 1 => vec![agent_snapshot_record("t1")],
         "agents-reconnect-blocked" if generation > 1 => {
             vec![agent_blocked_snapshot_record("t1")]
@@ -6102,6 +9017,135 @@ fn snapshot_for(
     json!({"seq": 1, "terminals": terminals, "channel": EVENTS_CHANNEL})
 }
 
+/// Core's machine profiles for a machine-manager scenario. Lines carry the
+/// state, age and reason core reports; profiles do not.
+fn seeded_machines(scenario: &str) -> Vec<Value> {
+    if !scenario.starts_with("machines") {
+        return Vec::new();
+    }
+    vec![
+        machine_entry(MachineSeed {
+            name: "alpha",
+            target: "can@alpha.example:2222",
+            state: "connected",
+            why: None,
+            temporary: false,
+            via: false,
+            session: None,
+            host: "alpha-host",
+        }),
+        machine_entry(MachineSeed {
+            name: "delta",
+            target: "ssh -J jump.example delta.example",
+            state: "connected",
+            why: None,
+            temporary: true,
+            via: true,
+            session: Some("work"),
+            host: "delta-host",
+        }),
+        machine_entry(MachineSeed {
+            name: "gamma",
+            target: "gamma.example",
+            state: "needs_login",
+            why: Some("password required"),
+            temporary: false,
+            via: false,
+            session: None,
+            host: "",
+        }),
+        machine_entry(MachineSeed {
+            name: "beta",
+            target: "beta.example",
+            state: "unreachable",
+            why: Some("connection refused"),
+            temporary: false,
+            via: false,
+            session: None,
+            host: "",
+        }),
+    ]
+}
+
+struct MachineSeed<'a> {
+    name: &'a str,
+    target: &'a str,
+    state: &'a str,
+    why: Option<&'a str>,
+    temporary: bool,
+    via: bool,
+    session: Option<&'a str>,
+    host: &'a str,
+}
+
+fn machine_entry(seed: MachineSeed<'_>) -> Value {
+    let MachineSeed {
+        name,
+        target,
+        state,
+        why,
+        temporary,
+        via,
+        session,
+        host,
+    } = seed;
+    let since = matches!(state, "unreachable" | "needs_login" | "needs_update")
+        .then(|| json!(fake_now_ms() - 60_000));
+    json!({
+        "name": name,
+        "target": target,
+        "via": via,
+        "temporary": temporary,
+        "session": session,
+        "id": format!("id-{name}"),
+        "host": host,
+        "version": "0.1.18",
+        "state": state,
+        "since_ms": since,
+        "why": why,
+    })
+}
+
+fn machine_profile(entry: &Value) -> Value {
+    let mut profile = entry.clone();
+    if let Some(object) = profile.as_object_mut() {
+        for field in ["state", "since_ms", "why"] {
+            object.remove(field);
+        }
+    }
+    profile
+}
+
+/// Core's default name for a target: the host part, cleaned to the name
+/// alphabet. The client never derives this itself; it reads the reply.
+fn machine_name_for(target: &str) -> String {
+    let host = target.rsplit('@').next().unwrap_or(target);
+    let host = host.split(':').next().unwrap_or(host);
+    let name: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = name.trim_matches('-').to_owned();
+    if name.is_empty() {
+        "machine".to_owned()
+    } else {
+        name
+    }
+}
+
+fn fake_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn client_labels(space: u64, tab: u64, pane: u64) -> Value {
     json!({
         "herdr.client": "herdr-terminal",
@@ -6111,11 +9155,88 @@ fn client_labels(space: u64, tab: u64, pane: u64) -> Value {
     })
 }
 
+/// A live terminal in core that this client's document does not name: the
+/// terminal manager's inventory sees it from the event snapshot alone.
+fn manager_worker_record(address: &str, state: &str) -> Value {
+    let mut record = live_record(7700);
+    record["address"] = json!(address);
+    record["name"] = json!("worker");
+    record["title"] = json!("Worker");
+    record["labels"] = json!({"herdr.client": "someone-else"});
+    record["status"] = agent_status(state, "claude", "Worker", None, None, "");
+    record["cwd"] = json!("/srv/work");
+    record
+}
+
+/// Labels another ht screen wrote: the same client name, but the pane id is
+/// in that screen's namespace (2), not the default screen's (1).
+fn cross_screen_labels() -> Value {
+    json!({
+        "herdr.client": "herdr-terminal",
+        "herdr.terminal.pane": ((2u64 << 32) | 7).to_string(),
+    })
+}
+
+/// A live terminal carrying another ht screen's labels.
+fn cross_screen_worker_record(address: &str) -> Value {
+    let mut record = live_record(7373);
+    record["address"] = json!(address);
+    record["name"] = json!("worker");
+    record["title"] = json!("Worker");
+    record["labels"] = cross_screen_labels();
+    record["cwd"] = json!("/srv/work");
+    record
+}
+
+/// This screen's identity labels with a stale pane id (same namespace).
+fn same_screen_stale_labels() -> Value {
+    json!({
+        "herdr.client": "herdr-terminal",
+        "herdr.terminal.pane": ((1u64 << 32) | 11).to_string(),
+    })
+}
+
+/// A live terminal this screen labeled in an older pane, now shown from a
+/// different pane by the manager.
+fn same_screen_stale_worker_record(address: &str) -> Value {
+    let mut record = live_record(7474);
+    record["address"] = json!(address);
+    record["name"] = json!("worker");
+    record["title"] = json!("Worker");
+    record["labels"] = same_screen_stale_labels();
+    record["cwd"] = json!("/srv/work");
+    record
+}
+
 /// A live terminal carrying the labels a document pane expects.
 fn doc_terminal(address: &str, space: u64, tab: u64, pane: u64) -> Value {
     let mut record = live_record(9000 + pane as u32);
     record["address"] = json!(address);
     record["labels"] = client_labels(space, tab, pane);
+    record
+}
+
+/// The file scenarios' terminal: its cwd is where the path prompt starts,
+/// from the test's scratch directory (or a remote working directory).
+fn file_pane_record(address: &str) -> Value {
+    let mut record = live_record(4242);
+    record["address"] = json!(address);
+    if address.contains('/') {
+        record["cwd"] = json!("/srv/app");
+    } else {
+        record["cwd"] =
+            json!(std::env::var("FAKE_FILES_CWD").unwrap_or_else(|_| "/var/tmp".to_owned()));
+    }
+    record
+}
+
+/// The same pane's record after its program exited normally.
+fn finished_doc_terminal(address: &str, space: u64, tab: u64, pane: u64) -> Value {
+    let mut record = doc_terminal(address, space, tab, pane);
+    record["state"] = json!("finished");
+    record["pid"] = Value::Null;
+    record["reason"] = json!("exited");
+    record["exit_code"] = json!(7);
     record
 }
 
@@ -6183,14 +9304,6 @@ fn agent_blocked_snapshot_record(address: &str) -> Value {
         "argv": ["claude", "run"],
         "cwd": "/work",
     });
-    record
-}
-
-/// A terminal without the pane label: the same address is not enough.
-fn foreign_record(address: &str) -> Value {
-    let mut record = live_record(9191);
-    record["address"] = json!(address);
-    record["labels"] = json!({"herdr.client": "herdr-terminal"});
     record
 }
 
@@ -6334,6 +9447,113 @@ fn replace_doc(path: Option<&Path>, value: Value) -> u64 {
     let version = current + 1;
     write_doc(path, &value, version);
     version
+}
+
+// --- file store ------------------------------------------------------------
+
+fn read_files(path: Option<&Path>) -> BTreeMap<String, String> {
+    path.and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_files(path: Option<&Path>, files: &BTreeMap<String, String>) {
+    let Some(path) = path else { return };
+    let _ = std::fs::write(path, json!(files).to_string());
+}
+
+/// Where core would resolve a request: an absolute path stays, a relative one
+/// joins `cwd` (or `.`). The machine is part of the key, never the local disk.
+fn file_resolved(params: &Value) -> PathBuf {
+    let path = params["path"].as_str().unwrap_or_default();
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    Path::new(params["cwd"].as_str().unwrap_or(".")).join(path)
+}
+
+fn file_key(params: &Value) -> String {
+    format!(
+        "{}|{}",
+        params["on"].as_str().unwrap_or(""),
+        file_resolved(params).display()
+    )
+}
+
+fn file_display(params: &Value) -> String {
+    match params["on"].as_str().filter(|on| !on.is_empty()) {
+        Some(on) => format!("{on}:{}", file_resolved(params).display()),
+        None => file_resolved(params).display().to_string(),
+    }
+}
+
+/// The standard base64 alphabet with padding, as the client's encoder emits.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut chunk = 0u32;
+    let mut bits = 0u32;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32;
+        chunk = (chunk << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((chunk >> bits) as u8);
+            chunk &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Core's all-or-none edit rule: each old occurs exactly once in the original
+/// and the spans do not overlap.
+fn apply_file_edits(text: &str, edits: &[(String, String)]) -> Option<String> {
+    if edits.is_empty() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for (index, (old, _new)) in edits.iter().enumerate() {
+        if old.is_empty() {
+            return None;
+        }
+        let step = old.chars().next().map_or(1, char::len_utf8);
+        let (mut first, mut count, mut from) = (0usize, 0usize, 0usize);
+        while let Some(at) = text[from..].find(old) {
+            if count == 0 {
+                first = from + at;
+            }
+            count += 1;
+            from += at + step;
+        }
+        if count != 1 {
+            return None;
+        }
+        spans.push((first, first + old.len(), index));
+    }
+    spans.sort();
+    if spans.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    for (start, end, index) in spans {
+        out.push_str(&text[done..start]);
+        out.push_str(&edits[index].1);
+        done = end;
+    }
+    out.push_str(&text[done..]);
+    Some(out)
 }
 
 fn doc_event_message(version: u64) -> Value {
@@ -6577,10 +9797,18 @@ fn write_labels(path: Option<&Path>, store: &serde_json::Map<String, Value>) {
 
 /// The labels a terminal already carries when its first label call arrives.
 fn base_labels(
-    _scenario: &str,
+    scenario: &str,
     target: &str,
     run_labels: &BTreeMap<String, serde_json::Map<String, Value>>,
 ) -> serde_json::Map<String, Value> {
+    if scenario.starts_with("manager") {
+        // A background terminal brought in by the manager carries another
+        // client's labels; core's label reply keeps them and adds ours.
+        return json!({"herdr.client": "someone-else"})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+    }
     if let Some(labels) = run_labels.get(target) {
         return labels.clone();
     }
@@ -6796,6 +10024,36 @@ impl Scratch {
 
     fn doc_version(&self) -> u64 {
         self.doc().1
+    }
+
+    fn files(&self) -> PathBuf {
+        self.dir.join("files.json")
+    }
+
+    /// Seeds a file core can read, on a machine (`Some("alpha")`) or locally.
+    fn seed_file(&self, on: Option<&str>, path: &str, text: &str) {
+        let mut files = read_files(Some(&self.files()));
+        files.insert(format!("{}|{path}", on.unwrap_or("")), text.to_owned());
+        write_files(Some(&self.files()), &files);
+    }
+
+    fn file_text(&self, on: Option<&str>, path: &str) -> Option<String> {
+        read_files(Some(&self.files()))
+            .get(&format!("{}|{path}", on.unwrap_or("")))
+            .cloned()
+    }
+
+    /// Writes the core label store as if the terminals already carried these
+    /// labels before the client connected.
+    fn seed_labels(&self, value: serde_json::Value) {
+        std::fs::write(self.dir.join("labels.json"), value.to_string()).expect("seed labels");
+    }
+
+    fn labels_value(&self) -> serde_json::Value {
+        std::fs::read_to_string(self.dir.join("labels.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
     }
 
     /// Writes the per-screen local view where the client looks for it.

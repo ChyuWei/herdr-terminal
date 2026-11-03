@@ -58,6 +58,13 @@ impl IdAllocator {
     pub fn is_used(&self, id: u64) -> bool {
         self.used.contains(&id)
     }
+
+    /// The high 32 bits every id this screen allocates carries. Labels this
+    /// screen wrote name ids in this namespace, which is how a client tells
+    /// its own labels from another screen's labels for the same client name.
+    pub fn namespace(&self) -> u64 {
+        self.namespace
+    }
 }
 
 fn namespace(screen: &str) -> u64 {
@@ -93,9 +100,10 @@ mod tests {
         let a = one.alloc();
         let b = two.alloc();
         assert_ne!(a >> 32, b >> 32);
-        assert_eq!(a >> 32, IdAllocator::new("one").namespace);
+        assert_eq!(a >> 32, IdAllocator::new("one").namespace());
         // The same screen keeps a stable namespace across processes.
-        assert_eq!(a >> 32, IdAllocator::new("one").namespace);
+        assert_eq!(a >> 32, IdAllocator::new("one").namespace());
+        assert_eq!(a >> 32, one.namespace());
 
         let mut third = IdAllocator::new("third");
         let mut ids = BTreeSet::new();

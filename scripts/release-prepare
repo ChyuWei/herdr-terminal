@@ -1,0 +1,81 @@
+#!/bin/sh
+# Bump the [package] version in Cargo.toml to <version> and run the checks.
+# Tags and commits nothing: review the uncommitted bump, then run
+# scripts/release-publish <version>.
+#
+# The release notes must already be in CHANGELOG.md under
+# `## [<version>] - YYYY-MM-DD`.
+#
+# A failed check restores Cargo.toml and Cargo.lock, so the tree is left as it
+# was; only a successful run leaves the bump in place.
+set -eu
+cd "$(dirname "$0")/.."
+
+version=${1:-}
+[ -n "$version" ] || { echo "usage: scripts/release-prepare <version>" >&2; exit 2; }
+printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+    echo "error: version must look like 0.1.5, no v" >&2
+    exit 1
+}
+[ -z "$(git status --porcelain)" ] || { echo "error: working tree must be clean" >&2; exit 1; }
+grep -Fq "## [$version] - " CHANGELOG.md || {
+    echo "error: write release notes in CHANGELOG.md under ## [$version] - YYYY-MM-DD first" >&2
+    exit 1
+}
+
+work=$(mktemp -d "${TMPDIR:-/var/tmp}/ht-release-prepare.XXXXXX")
+keep=0
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$keep" -ne 1 ]; then
+        cp "$work/Cargo.toml" Cargo.toml
+        if [ -f "$work/Cargo.lock" ]; then
+            cp "$work/Cargo.lock" Cargo.lock
+        else
+            rm -f Cargo.lock
+        fi
+    fi
+    rm -rf "$work"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+cp Cargo.toml "$work/Cargo.toml"
+if [ -f Cargo.lock ]; then
+    cp Cargo.lock "$work/Cargo.lock"
+fi
+
+# Only the [package] table's version; a dependency line with `version =` in it
+# must never be touched.
+awk -v version="$version" '
+    /^[[:space:]]*\[/ {
+        in_package = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*$/)
+        print
+        next
+    }
+    in_package && !done && /^[[:space:]]*version[[:space:]]*=/ {
+        print "version = \"" version "\""
+        done = 1
+        next
+    }
+    { print }
+' Cargo.toml >"$work/Cargo.toml.new"
+mv "$work/Cargo.toml.new" Cargo.toml
+
+have=$(scripts/package-version)
+[ "$have" = "$version" ] || {
+    echo "error: package version became $have, not $version" >&2
+    exit 1
+}
+
+# Refresh the workspace member's entry in Cargo.lock; dependencies stay put.
+cargo metadata --format-version 1 >/dev/null
+
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+
+keep=1
+echo "release $version prepared (uncommitted). Review it, then: scripts/release-publish $version"

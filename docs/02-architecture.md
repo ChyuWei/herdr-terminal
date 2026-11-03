@@ -62,7 +62,7 @@ Rules:
 - **Core never sends draw commands.** The TUI runs its own VT and composes its own cells.
 - **Status is only OSC 7501.** No screen scraping, no agent registry, no vendor logic.
 - **A client owns its document and label namespace.** Do not read another client's private state as yours.
-- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar flag stay in the per-screen view; scrollback, search, selection and theme stay in memory.
+- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar flag stay in the per-screen view; scrollback, search, selection, theme and terminal-/machine-manager state stay in memory, and open file contents stay out of the document and labels (only the editor's temp copy is local).
 - **Feature-gate on `hello`.** Check generation, version, methods and features; generation 1 only grows.
 
 ## 4. Architecture
@@ -87,7 +87,8 @@ Start with threads and channels; introduce an async runtime only if a measured n
 | `model` | Pure event and terminal model shared by the screen and workspace |
 | `screen` | Single-pane lifecycle, attach playback, pointer and view |
 | `vt` | libghostty-vt binding: cells and grapheme clusters, keys, mouse, scrollback, search, selection |
-| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect and agent handling |
+| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, terminal manager, machine manager, file viewer, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect, manager, machine, file and agent handling; `ui/machine_ui.rs` draws the machine panel |
+| `workspace::file`, `workspace::runtime::file` | Pure file context, 400-line paging, line diff, editor selection/temp rules and write-back rules; runtime file IO through Core and the editor session |
 | `workspace::state`, `workspace::local` | Runtime UI state and per-screen view |
 | `config` | Startup settings: theme, scrollback, mouse, clipboard, prefix keys |
 | `theme` | Chrome colors, default/dark/light, 16/256/truecolor mapping |
@@ -128,9 +129,11 @@ placement, selection and search consistent with Core.
 **Mouse precedence**, in order:
 
 1. An in-progress split resize or selection drag owns every mouse event.
-2. An open overlay (help, prompt, palette, search, peek, sidebar) consumes
-   every mouse event. A selection is not in that list: a fresh press leaves
-   selection and is routed as if none existed.
+2. An open overlay (help, prompt, palette, search, manager, machine manager
+   with its add/rename prompt and removal confirmation, file overlay with its
+   path prompt, viewer, diff and conflict states, preview, peek, sidebar)
+   consumes every mouse event. A selection is not in that list: a fresh press
+   leaves selection and is routed as if none existed.
 3. Chrome: a tab-bar click selects a tab, a status-bar click is consumed, and
    a split-gap press starts a resize. Chrome never reaches a program.
 4. A pane-grid press focuses the pane; a border press only focuses it. With
@@ -229,10 +232,14 @@ snapshot is still restored. A pane whose terminal is confirmed gone is pruned
 from the document; the tab stays. A deleted document is rebuilt from the
 labels of live terminals at its retained version instead of being replaced by
 a new shell. An explicitly given PROGRAM starts in a new tab (or the empty
-tab), not in place of a restored pane. Restored and
-recovered panes are workspace-owned for close semantics (`x` ends a non-kept
-program, `e` detaches, `X` kills), while their `Session` is adopted so a local
-startup or fatal error never kills a program this process did not start.
+tab), not in place of a restored pane. Restored and recovered panes that carry
+this client's label and match their own pane label are workspace-owned for
+close semantics (`x` ends a non-kept program, `e` detaches, `X` kills), while
+their `Session` is adopted so a local startup or fatal error never kills a
+program this process did not start. A manager-shown pane is matched by the
+document's address and restored unowned: it is a viewer for that program, so
+`x`/`e` detach and `X` kills. A missing or stale pane label never grants
+ownership.
 
 ### 4.6 Agents, attention and the sidebar
 
@@ -287,13 +294,192 @@ terminals start with `herdr.seen=0`. These labels are deliberately excluded
 from document capture and from restore's repair comparison: seen/pin changes
 must never dirty the layout document.
 
-### 4.7 Core client and lifecycle
+### 4.7 Terminal manager and preview
+
+**Manager** (`prefix t`; palette "terminal manager", action `terminals`) is a
+modal overlay. It lists every live terminal in the connected Core from the
+existing `events.subscribe` model, including terminals that are not in this
+workspace; it never calls `terminal.read` and never reads screen text. A row
+shows `*` when the terminal is shown here, its OSC 7501 word (`unknown` when
+the program never reported), age and address, then name, title, parent,
+machine and cwd when present. Rows sort blocked/error, working, done, idle,
+unknown, then oldest first and address. `j`/`k` or the arrows move, `g`/`G` go
+to the first/last row, `/` edits the filter, and Esc closes; the filter is a
+case-insensitive substring of the facts the row shows. At narrow widths a row
+keeps the marker, status word and address, then adds name and the other facts
+only while they fit; it shortens the address with `…` rather than wrapping.
+Selection, filter and scroll offset live in `UiState`; they are not persisted
+in the shared document or the per-screen view.
+
+`Enter` toggles the selected terminal. Showing a hidden terminal inserts a pane
+that adopts the existing address (`owned = false`) and attaches to the program
+already running; it never calls `terminal.run` and never spawns or respawns. A
+terminal already shown is focused instead of adding a second pane. Hiding
+detaches the pane's stream and removes the pane from the layout; it never sends
+`terminal.kill` or `terminal.rm`, so the program keeps running and can be shown
+again by address.
+
+**Preview** (`p`) attaches the selected terminal as a read-only observer,
+renders it through a local VT, applies each RESIZE before the DATA that follows
+it, and sends no keys, mouse reports, RESIZE, FOCUS or FACTS. It does not
+change the workspace or the document. Any key or Esc closes it, and no key
+reaches the manager or the program. The local-VT agent peek is a separate
+feature and is unchanged.
+
+**Hide labels and ownership.** Hide always removes the pane from the shared
+layout. It clears the four identity labels (`herdr.client`,
+`herdr.terminal.space`, `herdr.terminal.tab`, `herdr.terminal.pane`) only when
+the terminal carries this client's `herdr.client` value and its pane label is
+in this screen's id namespace. Labels written by another `ht` screen are left
+for that screen's recovery, so Hide is durable across restarts only for
+terminals this screen created; a later label-based recovery may re-add a
+terminal whose labels were not cleared. Durable cross-screen hide would need a
+shared-document marker, which this feature does not have. A manager-shown pane
+is captured in the document and restored by address as unowned: it is a
+viewer, so `x`/`e` detach and `X` kills.
+
+### 4.8 Machine manager and remote terminals
+
+**Manager** (`prefix m`; palette "machine manager", action `machines`) is a
+modal overlay over `machine.list`. It is separate from the terminal manager:
+`t` lists terminals, while `m` lists the machines Core can reach. Opening it
+closes the other overlays, and opening the terminal manager closes it. Core
+reports machine state but emits no machine-state event, so the list is
+refreshed only when the overlay opens, after each action, and on a short
+bounded timer while it stays open; a closed manager never calls
+`machine.list`. A `missed` snapshot while it is open refreshes it at the next
+loop step. Selection, filter and scroll offset live in `UiState`; they are
+not written to the document or the per-screen view.
+
+A row shows the name Core uses in `machine/t7` addresses, its state
+(`connecting`, `connected`, `needs_login`, `needs_update`, `unreachable`, or
+`unknown` when the reply carries no state), the elapsed time of its current
+state and Core's reason when present, its target, host and version, its
+session, and the `temporary` and `via` facts when present. Rows sort connected,
+connecting, `needs_login`, `needs_update`, `unreachable`, then unknown or
+future states; permanent machines precede temporary ones in the same group,
+then case-insensitive name. At narrow widths a row keeps name, state and
+target and adds the secondary facts only while they fit. `/` filters with a
+case-insensitive substring over the facts the row shows. `j`/`k` or the
+arrows move, `g`/`G` go to the first/last row, and Esc closes. While the
+overlay or its prompt/confirmation is open, every key is consumed and none
+reaches a program.
+
+**Actions.** `Enter` calls `machine.connect` for the selected machine, which
+connects or retries; Core owns the retry loop and the client reports only the
+state it returns. `a` opens a one-line target prompt: the text is passed to
+`machine.add` unchanged, including `user@host:port`; the client does not
+parse, rewrite or add a `via` path, and Core chooses the name. `r` opens a
+rename prompt prefilled with the current name. `d` asks for confirmation and
+then calls `machine.rm`; Core aborts the line and its terminals leave through
+Core's `removed` events, never through a local guess. `n` starts a new
+terminal on the selected machine and closes the manager so the pane is
+visible. Errors and Core's refusals stay inside the overlay. A core without
+`machine.list` gets an upgrade message there, and the client never calls the
+missing method.
+
+**Remote terminals.** A start from the manager uses this client's one
+connection and its normal labels, with `terminal.run` `on` naming the machine;
+the reply's `machine/t7` address is stored unchanged and the terminal behaves
+as an ordinary workspace pane: input, resize, focus, FACTS, terminal-manager
+Show/Hide and observer Preview all apply. Pane titles and the status bar show
+the machine prefix. Remote panes are captured in the local `herdr-terminal`
+document with their full qualified address and restored by it. A short `t7`
+is never assumed unique across machines: identity is the whole address, so a
+local `t7` and `alpha/t7` are different panes.
+
+**Rename and recovery.** Core owns the machine line (SSH or a `via` command),
+dialing, backoff, mirror replacement and relayed streams; `ht` never dials,
+adds an SSH path, or runs a private remote reconnect loop. A machine rename
+reaches the client as `removed` for the old qualified addresses followed by
+`created` for the new ones, or in a `missed` snapshot. The client re-addresses
+its existing pane by the `herdr.terminal.pane` label, keeps the pane, its
+attach stream and any final screen, and writes the new qualified address. On
+`missed` it marks the document stale, fetches and merges it, and only then
+reconciles the snapshot, as the reconnect path does. If the new address is
+already shown, the move is refused rather than creating a second pane for one
+terminal; the old pane leaves once Core no longer has its old address, and
+the pane holding the address keeps it. A stream-less `removed` waits one loop
+step so a following `created` can move the pane first. A terminal Core truly
+removed still leaves through its `removed` event; no liveness is inferred
+from screen text or process names, and no recovery path calls `terminal.run`
+or spawns a replacement.
+
+**Local document.** The workspace, including remote panes, stays in the local
+`herdr-terminal` document. This feature reads and writes no remote document
+(any later remote document use must call `doc.get`/`doc.set` with `on`), and
+never touches Herdr App's document or `herdr.space`/`herdr.tab` labels.
+
+### 4.9 Files: viewer, editor and write-back
+
+**Overlay and context.** `prefix o` (palette "file viewer", action `files`)
+opens a modal file overlay and closes the other overlays. While it or its
+prompt, viewer, diff or conflict state is open, every key is consumed and none
+reaches a program. The context comes from the focused pane when the overlay
+opens: a qualified `machine/t7` address sends `on` and the terminal's cwd; a
+local pane omits `on` but still sends its cwd; with no pane both are omitted,
+so Core's default applies. The path prompt starts at that cwd with a trailing
+separator, or empty. There is no directory listing or file picker: the path
+prompt is the picker, and a trailing `/` or `\` is refused before any read;
+other directory paths surface Core's IO error. Esc closes the prompt.
+
+**Viewer.** The viewer is read-only and paged. It calls `file.read` with
+`offset` and `limit` for a 400-line window and never loads the whole file for
+display. A header names the machine (`local` or its name), the path, the
+loaded range and the file's total line count (`lines 1-400 of 900`,
+`line 3 of 5`, or `empty file`). `j`/`k` or the arrows move a line, PgUp/PgDn
+move a screen, and `g`/`G` or Home/End go to the first/last line; leaving the
+loaded window fetches the next or previous 400-line page. Esc closes. Read
+errors stay in the overlay, under a heading that names the machine and path,
+and leave the TUI usable.
+
+**Editor and diff.** `e` makes one unbounded `file.read` and requires a
+complete reply before it looks up an editor or creates a temp. It chooses
+`$VISUAL`, else `$EDITOR`; the value is split on whitespace (no shell
+quoting) and the temp path is appended, with no `vi` fallback. The client
+writes a unique local temp file `ht-<pid>-<serial>-<basename>` with
+create-new, mode 0600 where supported, and the source basename and extension
+preserved, then suspends the TUI: it leaves the alternate screen and raw mode
+and restores keyboard enhancement, paste, focus and mouse on return, even when
+the editor fails or exits nonzero. The temp is read back and removed. An
+unchanged buffer returns to the viewer; a changed one becomes a line diff
+(LCS, `+`/`-` marks, an added/removed summary; a large alignment is shown as
+one changed block and the row list is capped). The diff is a display aid only:
+there is no merge or three-way resolution.
+
+**Write-back.** `w`/Enter re-reads the whole file and compares it with the
+first full read; Core has no file version or etag. A difference shows a
+conflict and refuses to write; `o` in that state is the explicit overwrite.
+`q`/Esc discards without writing. Without a conflict, one exact contiguous
+replacement uses `file.edit`; every other change, and the explicit overwrite,
+uses `file.write` with base64 data. A failed write keeps the diff and buffer
+with the error. A whole read that Core truncates at its inline cap (about
+8 MB of estimated JSON bytes; `last < lines`) is refused before the editor
+starts and again on the write re-read, before any comparison or write, so a
+partial buffer is never edited, compared or saved. The viewer can still page
+through such a file. The refusal names the machine, path and read/known line
+counts.
+
+**Boundary.** Core reads and writes the file, local or remote, through this
+client's one long-lived connection; the client never opens a remote path and
+does no direct path IO for the file itself. Contents stay in the in-memory
+file session: they never enter the `herdr-terminal` document, labels,
+another client's document or a Core document. Only the editor's temp copy is
+local.
+`file.read`, `file.write` and `file.edit` are required at connect; the minimum
+Core stays 0.1.17, and the existing `hello` check refuses a core without them,
+with no fallback. There is no directory listing, embedded editor, merge,
+three-way resolution or direct local/remote path IO.
+
+### 4.10 Core client and lifecycle
 
 **Supported Core**
 
-Core 0.1.16 or newer at protocol generation 1. Optional capabilities are gated
-on `hello.features`, never a version string. Testing uses 0.1.17; 0.1.16 is
-checked by source and the no-feature path, not by running a 0.1.16 binary.
+Core 0.1.17 or newer at protocol generation 1, with the required methods and
+features (including `resize_notifications`). Older or unreadable versions are
+refused at connect with a message naming the reported and minimum versions and
+the update path. There is no reduced-capability mode. Other optional
+capabilities are gated on `hello.features`, never a version string.
 
 **Shared Core**
 
@@ -310,7 +496,7 @@ and reattaches. `ht` has no update command.
 
 1. Discover the core binary (configured path, `PATH`, login shell `PATH`, usual install dirs; accept it only if `--version` prints `hc …`).
 2. Connect to the socket or `hc connect`; send `hello {"framed": true}`.
-3. Check generation, version, methods and features; fail with a clear message if a required method is missing.
+3. Check generation, minimum version, methods and features; fail with a clear message if a required method or feature is missing, or the core is older than 0.1.17 or its version is unreadable.
 4. `events.subscribe`; keep the snapshot.
 5. Read the `herdr-terminal` document. If it is absent (version 0), claim an
    empty one at version 0; a lost claim race re-reads the winner. If it was
@@ -336,24 +522,22 @@ explicit PROGRAM after restore, `ht screen`, a replacement after reconnect, and
 `ht probe`. Workspace starts use the pending pane's exact inner grid, previewed
 on a clone of the deterministic insertion so a failed run leaves no empty tab.
 A path that cannot know the size omits the field and core's default applies.
-Older cores ignore the unknown field; no version gate is used. This matters
-because a program that reads its size once at startup, before a viewer
+The minimum supported Core applies the field, so no version gate is used. This
+matters because a program that reads its size once at startup, before a viewer
 attaches, would otherwise draw its first frame at core's default size.
 
 **Observer attach**
 
-The client library can attach a terminal as a read-only observer for a future
-peek view; no peek UI uses it yet. `terminal.attach` takes `observe` and
-`resize_notifications`; the client requests them only when `hello.features`
-advertises `resize_notifications`, and no Core version string is consulted. The
-reply must confirm the feature, or the client abandons the channel and fails
-instead of falling back to a normal attach that would take over the grid. A
-confirmed observer receives RESIZE (kind 3, four little-endian bytes) before
-each paint that uses a new grid, applies it to the local VT before the following
-DATA, and pays no stream credit for it. It sends no keys, mouse reports, RESIZE,
-FOCUS or FACTS. Normal attaches are unchanged; on a core without the feature,
-the `size` event updates the terminal record, while the pane VT follows the
-client layout and its own RESIZE.
+The terminal manager's Preview attaches a terminal as a read-only observer; the
+local-VT agent peek is a different feature and does not use this path.
+`terminal.attach` takes `observe` and `resize_notifications`; the connection
+requires the feature, so the client requests both unconditionally and consults
+no Core version string. The reply must confirm the feature, or the client
+abandons the channel and fails instead of falling back to a normal attach that
+would take over the grid. A confirmed observer receives RESIZE (kind 3, four
+little-endian bytes) before each paint that uses a new grid, applies it to the
+local VT before the following DATA, and pays no stream credit for it. It sends
+no keys, mouse reports, RESIZE, FOCUS or FACTS. Normal attaches are unchanged.
 
 **Reconnect**
 
@@ -368,7 +552,7 @@ client layout and its own RESIZE.
   same bounded conflict/merge budget as a normal write, and save the local
   view; do not stop core unless the user explicitly asks.
 
-### 4.8 Scrollback, search, palette, settings and themes
+### 4.11 Scrollback, search, palette, settings and themes
 
 **Scrollback** is Ghostty's own bounded history per pane. Attach asks core for
 history above the screen, so output printed before a screen attached is
@@ -433,6 +617,9 @@ Statuses:
 | Connection | Core discovery, long-lived framed connection, `hello` check, reconnect |
 | Terminals | Run, attach, render, keys, mouse wheel/click, resize, focus, FACTS |
 | Workspace | Spaces, tabs, panes, split/close/move, focus, zoom |
+| Terminal manager | Core-wide live-terminal inventory, Show/Hide, read-only Preview |
+| Machine manager | `machine.list` machines, connect/add/rename/remove, remote `machine/t7` terminals |
+| Files | Paged read-only viewer, `$VISUAL`/`$EDITOR`, line diff, content-checked write-back |
 | Terminals | New/close/rename, labels, keep, kill/rm, shell/command |
 | Agents | Status, turn, title, foreground, list/sidebar, peek, seen/pinned |
 | UI | Tab bar, pane borders, status bar, command palette, help, toast/confirm/prompt |
@@ -440,17 +627,17 @@ Statuses:
 | Themes | 16/256/truecolor, default palette, basic theme config |
 | Recovery | `lost`/`restarted`/`finished`, `missed`, heartbeat, reattach |
 | Diagnostics | Version, core status, logs, `ht status` |
+| Distribution | macOS Apple Silicon package with notices, GitHub Actions CI and a tag-triggered GitHub release workflow |
 
 ### 5.2 Expected later
 
 | Feature | Notes |
 |---|---|
 | Tab reorder | Mouse and keyboard |
-| Machines: add/connect/list/rename/rm | Remote terminals and events |
-| Files: read/write/edit, diff, external editor | Core `file.*`; no embedded editor |
-| File picker | Simple list; use `machine.exec`/`file.*` |
+| File picker / directory listing | Simple list; the path prompt is the picker today |
 | Custom layouts, accessibility | Settings and config |
-| Packaging, install, `--skill`, CLI docs | Distribution |
+| Install, `--skill`, CLI docs | Distribution |
+| Non-macOS packaging | When those platforms become release targets |
 | Mods/plugins (manifest + external commands) | See §6.3 |
 | Kitty graphics/images | See §6.3 |
 
@@ -498,6 +685,25 @@ currently implements.
   display facts, credit-based flow control, and the attach lifecycle (`lost`,
   `restarted`, `finished`, reattach).
 - **Workspace:** spaces, tabs, panes, split/close/move, focus and zoom.
+- **Terminal manager:** a Core-wide modal inventory of every live terminal
+  from the event model, with a shown marker, status word, age and optional
+  facts; status sort and substring filter; Show adopts an existing address and
+  Hide detaches without kill/rm; a read-only observer Preview; selection and
+  filter live in `UiState`.
+- **Machine manager:** a modal `machine.list` inventory with state, since/why
+  and connection facts, sorted and filtered locally; connect, target-only add,
+  rename and confirmed remove; `terminal.run` with `on` starts a remote
+  terminal whose qualified `machine/t7` address persists in the local
+  document and appears in pane/status names; label-based re-addressing keeps
+  panes, streams and final screens across a Core rename or `missed` snapshot,
+  without duplicates or replacement spawns. The list refreshes only while the
+  overlay is open; Core has no machine-state event.
+- **Files:** a modal `prefix o` path prompt (no directory listing), a read-only
+  400-line paged `file.read` viewer, `$VISUAL`/`$EDITOR` on a local temp with
+  full TUI suspend/restore, a line diff, content-checked write-back with an
+  explicit `o` overwrite, and a refusal to edit or write a whole read
+  truncated at Core's inline cap; contents stay out of the document and
+  labels.
 - **Persistence:** the `herdr-terminal` document, restore, multi-screen
   compare-and-set, and terminal rediscovery by labels.
 - **Agents:** status, turn, title and foreground from core; the agent
@@ -511,11 +717,12 @@ currently implements.
   (DEC mode 2027) by default like Core and Herdr App, so variation-selector
   emoji form one cluster two cells wide, followed by a zero-width spacer cell,
   and RIS keeps it on. Every spawn path sends the optional `terminal.run` size
-  when the attach grid is known; older cores ignore the field and still work.
-- **Observer attach (foundation):** the library can attach a read-only
-  observer when the core advertises and confirms resize notifications; it
-  applies RESIZE before the following DATA, pays no credit for it, and sends no
-  input or control frames. No peek UI uses it yet; normal attaches are
+  when the attach grid is known; the minimum supported Core applies it, so no
+  version gate is needed.
+- **Observer attach:** the connection requires `resize_notifications`, and the
+  attach reply must confirm it; the terminal manager's Preview then attaches a
+  read-only observer. It applies RESIZE before the following DATA, pays no
+  credit for it, and sends no input or control frames. Normal attaches are
   unchanged.
 - **Mouse and history:** clicks focus panes and select tabs, split gaps drag,
   and chrome never reaches a program. Programs that track the mouse receive
@@ -540,17 +747,20 @@ currently implements.
 The implemented set covers the connection and terminal foundation, the
 workspace and its persistence, agent awareness, the daily-driver input layer
 (mouse, history, search, selection, clipboard, palette, settings and themes),
-the local VT's grapheme clustering, initial terminal sizes and the
-observer-attach foundation. Still planned: tab reorder, custom layouts,
-accessibility, general confirm/toast prompts, machines, files,
-packaging/install, `ht status` and mods. Scrollback, search,
-selection and theme stay in memory and are never written to the shared
-document or the per-screen view. Settings are read at startup; there is no
-settings UI and no live reload.
+the local VT's grapheme clustering, initial terminal sizes, the Core-wide
+terminal manager and its read-only Preview, the machine manager with its
+remote terminals and rename recovery, and the Core-backed file viewer, editor,
+line diff and write-back. Packaging, notices, CI and versioning are also
+implemented; the package is macOS Apple Silicon. Still planned: tab reorder,
+custom layouts, accessibility, general confirm/toast prompts, the file picker
+and directory listing, install scripts, `ht status` and mods. Scrollback,
+search, selection, theme, terminal- and machine-manager state, and open file
+contents stay out of the shared document and the per-screen view. Settings are
+read at startup; there is no settings UI and no live reload.
 
-The implementation is unreleased: there is no release, packaging or install
-procedure yet. See §3 for the boundary rules, §7 for conventions, and
-[AGENTS.md](../AGENTS.md) for the traps and the source layout.
+The implementation is unreleased: the macOS package and CI exist, but no
+version has been tagged yet. See §3 for the boundary rules, §7 for conventions,
+and [AGENTS.md](../AGENTS.md) for the traps and the source layout.
 
 ## 6. Planned work
 
@@ -564,17 +774,16 @@ Current status is §5.5. The remaining work, grouped by capability:
 - General confirm/toast prompts.
 - Performance tuning for many panes.
 
-### Machines and files
+### File picker and future remote state
 
-- Machine add/connect/list/rename/rm.
-- Remote terminals, events and documents.
-- Reconnect after network loss.
-- File read/write/edit; diff; external editor; simple file picker.
+- File picker and directory listing; the path prompt is the picker today.
+- Remote documents remain unimplemented: the workspace document is local.
+  Any future remote document access must use `doc.get`/`doc.set` with `on`.
 
 ### Distribution and testing
 
-- Packaging and install.
-- `--skill`, CLI docs and CI.
+- Install script and non-macOS packaging.
+- `--skill` and CLI docs.
 - `ht status` and core/log diagnostics.
 - End-to-end tests and golden buffers.
 
@@ -606,7 +815,7 @@ Current status is §5.5. The remaining work, grouped by capability:
    core's minimal binding does not expose. Extracting a shared crate or a
    pure-Rust VT remains a future option.
 2. **Async runtime:** threads + channels vs tokio. Start simple; measure.
-3. **Document layout:** one `herdr-terminal` document per core with machine-qualified ids, or one document per machine like Herdr App? Start local, revisit when remote machines are added.
+3. **Document layout:** one `herdr-terminal` document per core with machine-qualified ids, or one document per machine like Herdr App? The workspace document stays local and holds qualified addresses; revisit only if remote or shared layout state is designed.
 4. **Clipboard:** resolved for v1: OSC 52 by default, with a configured native
    helper, both, or off; a native failure falls back to OSC 52.
 5. **Notifications:** resolved for v1: one in-app status-bar notice and one

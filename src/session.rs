@@ -79,6 +79,13 @@ impl Session {
         &self.address
     }
 
+    /// Points the session at the same terminal under a new address, used when
+    /// core renames a machine and every mirrored address changes prefix. The
+    /// attach channel and ownership are unchanged.
+    pub fn set_address(&mut self, address: String) {
+        self.address = address;
+    }
+
     /// Whether this process ran the terminal (as opposed to adopting it).
     pub fn owned(&self) -> bool {
         self.owned
@@ -94,6 +101,18 @@ impl Session {
     /// clears the "leave it alone" state a reconnect or a loss set.
     pub fn attach(&mut self, cols: u16, rows: u16, history: usize) -> Result<Attached> {
         let attached = self.client.attach(&self.address, cols, rows, history)?;
+        self.channel = Some(attached.channel);
+        self.done = false;
+        Ok(attached)
+    }
+
+    /// Attaches as a read-only observer. Core confirms resize notifications
+    /// before the stream is used; there is no normal-attach fallback, so a
+    /// refusal leaves the session without a channel.
+    pub fn attach_observer(&mut self, cols: u16, rows: u16, history: usize) -> Result<Attached> {
+        let attached = self
+            .client
+            .attach_observer(&self.address, cols, rows, history)?;
         self.channel = Some(attached.channel);
         self.done = false;
         Ok(attached)

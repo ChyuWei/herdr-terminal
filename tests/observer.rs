@@ -1,14 +1,16 @@
 #![cfg(unix)]
 //! End-to-end observer attach against a real, isolated core.
 //!
-//! A normal viewer owns the size; an observer asks for resize notifications.
+//! A normal viewer owns the size; an observer requires resize notifications.
 //! The observer's stream must carry RESIZE before each paint: the first grid
 //! before the first paint, and every later change before its replacement
-//! paint. This is the ordering the peek path will rely on.
+//! paint. This is the ordering the read-only terminal-manager preview relies
+//! on; the client refuses an observer attach when core does not confirm it.
 //!
-//! The test skips when herdr-core is not installed (unless
-//! `HERDR_TERMINAL_REQUIRE_CORE` is set) and when the installed core does not
-//! advertise the optional feature.
+//! The test skips only when herdr-core is not installed (unless
+//! `HERDR_TERMINAL_REQUIRE_CORE` is set). `resize_notifications` is not
+//! optional: an installed core that lacks it makes this test fail with a
+//! clear message.
 
 use herdr_terminal::core::{CoreClient, RunOptions, StreamItem};
 use herdr_terminal::vt::Vt;
@@ -138,11 +140,11 @@ fn an_observer_receives_the_grid_before_each_paint() {
     isolated.start();
     let client = CoreClient::connect(Some(&isolated.wrapper)).expect("connect to the test core");
     if !client.hello().supports("resize_notifications") {
-        eprintln!(
-            "skipping: {} does not advertise resize_notifications",
+        panic!(
+            "the installed core {} does not advertise resize_notifications; \
+             observer attach (and the terminal-manager preview) requires core 0.1.17 or newer",
             client.hello().version
         );
-        return;
     }
 
     let record = client

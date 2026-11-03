@@ -86,7 +86,6 @@ pub fn restore(
 
     let by_address: BTreeMap<&str, &TerminalInfo> = terminals
         .iter()
-        .filter(|terminal| terminal.is_ours())
         .map(|terminal| (terminal.address.as_str(), terminal))
         .collect();
     let mut by_pane_label: BTreeMap<&str, Vec<&TerminalInfo>> = BTreeMap::new();
@@ -100,6 +99,7 @@ pub fn restore(
     let mut matched = Vec::new();
     let mut missing = 0usize;
     let mut repaired = false;
+    let mut claimed = BTreeSet::new();
     for space in &doc.spaces {
         for tab in &space.tabs {
             for pane in tab.leaves() {
@@ -107,6 +107,21 @@ pub fn restore(
                     missing += 1;
                     continue;
                 };
+                if let Some(label) = info.pane_label()
+                    && let Ok(label_id) = label.parse::<u64>()
+                    && label_id != pane.id
+                {
+                    // This screen has seen the pane the label names. If the
+                    // referencing pane later disappears in a merge, recovery
+                    // must not resurrect the terminal under that stale id.
+                    seen.insert(PaneId(label_id));
+                }
+                if !claimed.insert(info.address.as_str()) {
+                    // One terminal can back only one pane.
+                    missing += 1;
+                    continue;
+                }
+                let pane_key = pane.id.to_string();
                 let mut record = Pane {
                     id: PaneId(pane.id),
                     address: info.address.clone(),
@@ -114,11 +129,15 @@ pub fn restore(
                     labels: info.labels.clone(),
                     title: String::new(),
                     status: None,
-                    // Workspace-owned for close semantics: `x` ends the
-                    // program, `e` detaches and `X` kills. The `Session`
-                    // around it is still adopted, so local errors never end a
-                    // program this process did not start.
-                    owned: true,
+                    // A restored pane is workspace-owned only when this
+                    // client's pane label names this exact document pane.
+                    // Without that proof the terminal is a viewer: a matching
+                    // address alone is how a shown (adopted) terminal is
+                    // rediscovered. An adopted pane's default `x` and `e`
+                    // detach, while `X` kills; an owned pane's `x` ends it.
+                    // The `Session` around either one is adopted, so local
+                    // errors never end a program this process did not start.
+                    owned: info.is_ours() && info.pane_label() == Some(pane_key.as_str()),
                     keep: false,
                     exit: None,
                 };
@@ -222,15 +241,28 @@ fn match_terminal<'a>(
     by_pane_label: &BTreeMap<&str, Vec<&'a TerminalInfo>>,
 ) -> Option<&'a TerminalInfo> {
     let key = pane.id.to_string();
-    if let Some(info) = by_address.get(pane.address.as_str())
-        && info.pane_label() == Some(key.as_str())
-    {
-        return Some(info);
+    if let Some(info) = by_address.get(pane.address.as_str()) {
+        if !info.is_ours() {
+            // An adopted terminal carries another client's labels (or none),
+            // so there is no pane label to verify. The address recorded in
+            // this client's document is the only handle; the capture rewrites
+            // the pane with the record's labels.
+            return Some(info);
+        }
+        if info.pane_label() == Some(key.as_str()) {
+            return Some(info);
+        }
     }
     // A terminal rediscovered under a new address is found by the unique pane
-    // label; an ambiguous label is not a match.
-    let candidates = by_pane_label.get(key.as_str())?;
-    (candidates.len() == 1).then_some(candidates[0])
+    // label; an ambiguous label is not a match. A terminal we labeled but
+    // whose pane label is stale or absent is also accepted by address, but
+    // only as a viewer (see the ownership rule in `restore`), so a shown
+    // terminal stays rediscoverable even if label cleanup did not complete.
+    by_pane_label
+        .get(key.as_str())
+        .filter(|candidates| candidates.len() == 1)
+        .map(|candidates| candidates[0])
+        .or_else(|| by_address.get(pane.address.as_str()).copied())
 }
 
 fn build_layout(layout: &DocLayout) -> Layout {
@@ -259,6 +291,13 @@ pub fn recover_orphans(
 ) -> Vec<(PaneId, String)> {
     let mut recovered = Vec::new();
     for terminal in terminals.iter().filter(|terminal| terminal.is_ours()) {
+        // One address backs at most one pane. A terminal already referenced by
+        // the workspace (for example a shown/adopted pane restored by address
+        // while its pane label still names an older pane) is never recovered
+        // a second time.
+        if workspace.pane_by_address(&terminal.address).is_some() {
+            continue;
+        }
         let Some(space_id) = label_id(terminal, SPACE_LABEL) else {
             continue;
         };
@@ -382,7 +421,7 @@ pub fn pane_addresses(doc: &SharedDoc) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::schema::{DocSpace, DocTab, PINNED_LABEL, SEEN_LABEL};
+    use super::super::schema::{DocChild, DocSpace, DocTab, PINNED_LABEL, SEEN_LABEL};
     use super::*;
 
     fn labels(pane: u64) -> BTreeMap<String, String> {
@@ -416,6 +455,13 @@ mod tests {
 
     fn info(address: &str, pane: u64) -> TerminalInfo {
         TerminalInfo::new(address, labels(pane))
+    }
+
+    fn address_count(workspace: &Workspace, address: &str) -> usize {
+        workspace
+            .panes()
+            .filter(|pane| pane.address == address)
+            .count()
     }
 
     #[test]
@@ -499,12 +545,163 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_without_our_client_label_is_never_matched() {
-        let mut foreign = info("t1", 3);
-        foreign.labels.remove(CLIENT_LABEL);
+    fn an_adopted_terminal_is_matched_by_address_and_stays_unowned() {
+        let foreign = TerminalInfo::new("t1", BTreeMap::new());
         let restored = restore(&doc("t1"), IdAllocator::new("default"), (1, 1), &[foreign]);
+        assert_eq!(restored.missing, 0);
+        assert_eq!(restored.matched, vec![(PaneId(3), "t1".to_owned())]);
+        let pane = restored.workspace.pane(PaneId(3)).expect("pane");
+        assert!(
+            !pane.owned,
+            "another client's terminal is adopted and close only detaches"
+        );
+        assert!(pane.labels.is_empty(), "its labels are kept verbatim");
+    }
+
+    #[test]
+    fn our_terminal_with_a_stale_pane_label_is_still_matched_by_address() {
+        // A shown terminal keeps the labels core gave it, which may name the
+        // pane id it had before it was hidden; the document must not prune it.
+        // But without this document pane in its label there is no proof it is
+        // owned here, so it is restored as a viewer.
+        let stale = info("t1", 99);
+        let restored = restore(&doc("t1"), IdAllocator::new("default"), (1, 1), &[stale]);
+        assert_eq!(restored.missing, 0);
+        assert_eq!(restored.matched, vec![(PaneId(3), "t1".to_owned())]);
+        assert!(
+            !restored.workspace.pane(PaneId(3)).unwrap().owned,
+            "an address fallback without a matching pane label restores unowned"
+        );
+        assert!(restored.seen.contains(&PaneId(99)));
+
+        // The same terminal with the document pane's own label is owned.
+        let matching = info("t1", 3);
+        let restored = restore(&doc("t1"), IdAllocator::new("default"), (1, 1), &[matching]);
+        assert!(restored.workspace.pane(PaneId(3)).unwrap().owned);
+    }
+
+    #[test]
+    fn a_show_adopted_terminal_is_never_restored_into_two_panes() {
+        // The review's proof scenario: document leaf 3 names t9, but t9's
+        // pane label names pane 99 (it was created by this screen in an older
+        // pane). Restore matches it by address as a viewer; recovery must not
+        // adopt the same address again under the stale label.
+        let terminal = info("t9", 99);
+        let mut restored = restore(
+            &doc("t9"),
+            IdAllocator::new("default"),
+            (1, 1),
+            std::slice::from_ref(&terminal),
+        );
+        assert_eq!(restored.matched, vec![(PaneId(3), "t9".to_owned())]);
+        assert!(restored.seen.contains(&PaneId(99)));
+        let recovered = recover_orphans(
+            &mut restored.workspace,
+            std::slice::from_ref(&terminal),
+            &restored.seen,
+        );
+        assert!(recovered.is_empty(), "recovered {recovered:?}");
+        assert_eq!(restored.workspace.pane_count(), 1);
+        assert_eq!(address_count(&restored.workspace, "t9"), 1);
+
+        // A second restart from the repaired document has the same outcome.
+        let document = restored.workspace.capture_doc();
+        let mut again = restore(
+            &document,
+            IdAllocator::new("default"),
+            (1, 1),
+            std::slice::from_ref(&terminal),
+        );
+        assert_eq!(again.matched, vec![(PaneId(3), "t9".to_owned())]);
+        assert!(!again.workspace.pane(PaneId(3)).unwrap().owned);
+        assert!(again.seen.contains(&PaneId(99)));
+        let recovered = recover_orphans(
+            &mut again.workspace,
+            std::slice::from_ref(&terminal),
+            &again.seen,
+        );
+        assert!(
+            recovered.is_empty(),
+            "second restart recovered {recovered:?}"
+        );
+        assert_eq!(again.workspace.pane_count(), 1);
+        assert_eq!(address_count(&again.workspace, "t9"), 1);
+    }
+
+    #[test]
+    fn an_address_already_in_the_workspace_is_never_recovered() {
+        // The hard invariant does not depend on `seen`: an address a pane
+        // already references is skipped even when recovery is given no
+        // exclusions at all.
+        let mut restored = restore(
+            &doc("t9"),
+            IdAllocator::new("default"),
+            (1, 1),
+            &[info("t9", 3)],
+        );
+        assert_eq!(restored.workspace.pane_count(), 1);
+        let recovered =
+            recover_orphans(&mut restored.workspace, &[info("t9", 12)], &BTreeSet::new());
+        assert!(recovered.is_empty(), "recovered {recovered:?}");
+        assert_eq!(restored.workspace.pane_count(), 1);
+        assert_eq!(address_count(&restored.workspace, "t9"), 1);
+    }
+
+    #[test]
+    fn a_stale_label_witnessed_by_restore_is_never_resurrected() {
+        // The live document path: the referencing pane disappears in a merge,
+        // so the address check alone cannot help; the witnessed stale pane id
+        // must keep recovery from adopting the terminal under that id.
+        let terminal = info("t9", 99);
+        let mut restored = restore(
+            &doc("t9"),
+            IdAllocator::new("default"),
+            (1, 1),
+            std::slice::from_ref(&terminal),
+        );
+        assert!(restored.seen.contains(&PaneId(99)));
+        restored.workspace.remove_pane(PaneId(3));
+        let recovered = recover_orphans(
+            &mut restored.workspace,
+            std::slice::from_ref(&terminal),
+            &restored.seen,
+        );
+        assert!(recovered.is_empty(), "recovered {recovered:?}");
+        assert_eq!(restored.workspace.pane_count(), 0);
+    }
+
+    #[test]
+    fn one_terminal_is_never_restored_into_two_panes() {
+        let mut document = doc("t1");
+        let second = DocLayout::Leaf(DocPane {
+            id: 4,
+            address: "t1".into(),
+            name: "t1".into(),
+            labels: BTreeMap::new(),
+        });
+        let first = document.spaces[0].tabs[0].layout.take().expect("layout");
+        document.spaces[0].tabs[0].layout = Some(DocLayout::Split {
+            axis: Axis::Columns,
+            children: vec![
+                DocChild {
+                    size: 1,
+                    layout: first,
+                },
+                DocChild {
+                    size: 1,
+                    layout: second,
+                },
+            ],
+        });
+        let restored = restore(
+            &document,
+            IdAllocator::new("default"),
+            (1, 1),
+            &[info("t1", 3)],
+        );
+        assert_eq!(restored.matched.len(), 1);
         assert_eq!(restored.missing, 1);
-        assert!(restored.matched.is_empty());
+        assert!(restored.repaired);
     }
 
     #[test]

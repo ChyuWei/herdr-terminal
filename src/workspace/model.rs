@@ -43,8 +43,9 @@ mod view;
 
 pub use doc::{
     CLIENT_LABEL, CLIENT_NAME, Conflict, DOC_NAME, DocChild, DocError, DocLayout, DocPane,
-    DocSpace, DocTab, MergeResult, PINNED_LABEL, SEEN_LABEL, SharedDoc, TerminalInfo,
-    identity_labels, is_attention_label, merge, pane_addresses, pane_ids, recover_orphans, restore,
+    DocSpace, DocTab, MergeResult, PANE_LABEL, PINNED_LABEL, SEEN_LABEL, SPACE_LABEL, SharedDoc,
+    TAB_LABEL, TerminalInfo, identity_labels, is_attention_label, merge, pane_addresses, pane_ids,
+    recover_orphans, restore,
 };
 pub use ids::IdAllocator;
 pub use view::{LocalView, TabView};
@@ -265,6 +266,25 @@ impl Space {
     pub fn tab(&self, id: TabId) -> Option<&Tab> {
         self.tabs.iter().find(|tab| tab.id == id)
     }
+}
+
+/// A live core terminal being shown in this workspace for the first time. It
+/// was not started by this screen, so it is adopted: the record's labels,
+/// name, title, status and keep flag are preserved and the pane is not owned.
+/// Nothing is run or respawned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptedTerminal {
+    pub address: String,
+    /// The core display name, else the address.
+    pub name: String,
+    /// The terminal's core labels, kept verbatim. No label is written here:
+    /// another client's labels are never overwritten.
+    pub labels: BTreeMap<String, String>,
+    /// The terminal title reported by core (OSC 0/2).
+    pub title: String,
+    /// The OSC 7501 root word reported by core, if any.
+    pub status: Option<String>,
+    pub keep: bool,
 }
 
 /// A request to start a terminal. The runtime runs it, then calls
@@ -489,6 +509,32 @@ impl Workspace {
         self.pane_by_address(address).map(|pane| pane.id)
     }
 
+    /// Points one pane at the same terminal under a new address, used when
+    /// core renames a machine and mirrored addresses change prefix. A name
+    /// that was just the old address follows it; a user-visible title or an
+    /// unrelated name does not. Returns false for an unknown pane, an empty
+    /// address, or one already shown by another pane.
+    pub fn rename_pane_address(&mut self, pane: PaneId, address: String) -> bool {
+        if address.is_empty() {
+            return false;
+        }
+        if self
+            .panes
+            .values()
+            .any(|other| other.id != pane && other.address == address)
+        {
+            return false;
+        }
+        let Some(pane) = self.panes.get_mut(&pane) else {
+            return false;
+        };
+        if pane.name == pane.address {
+            pane.name.clone_from(&address);
+        }
+        pane.address = address;
+        true
+    }
+
     /// The space/tab that owns a pane, if it is in a layout.
     pub fn location(&self, pane: PaneId) -> Option<(SpaceId, TabId)> {
         for space in &self.spaces {
@@ -571,6 +617,14 @@ impl Workspace {
             .unwrap_or((1, 1))
     }
 
+    /// Reserves ids for showing an existing core terminal. It goes next to the
+    /// focused pane of the current tab; an empty tab takes it alone. The
+    /// runtime never runs anything for this request: it calls
+    /// [`Workspace::insert_adopted`] with the core record.
+    pub fn adopt_request(&mut self) -> StartRequest {
+        self.start_request(StartKind::Split(Axis::Columns))
+    }
+
     /// Inserts a successfully started terminal. Creates the requested space or
     /// tab when needed, makes it active, focuses the pane and clears zoom.
     /// The returned id is stable for the life of the workspace.
@@ -580,7 +634,57 @@ impl Workspace {
         address: String,
         name: String,
     ) -> PaneId {
+        let pane = Pane {
+            id: request.pane,
+            address,
+            name,
+            labels: request.labels(),
+            title: String::new(),
+            status: None,
+            owned: true,
+            keep: false,
+            exit: None,
+        };
+        self.insert_pane(request, pane)
+    }
+
+    /// Inserts a pane for a terminal that already runs in core. The record's
+    /// labels, name, title, status and keep flag are kept; the pane is not
+    /// owned, so closing it only detaches. Returns `None` when the address is
+    /// empty or already shown, so a terminal never gets a second pane.
+    pub fn insert_adopted(
+        &mut self,
+        request: &StartRequest,
+        terminal: AdoptedTerminal,
+    ) -> Option<PaneId> {
+        if terminal.address.is_empty() || self.pane_by_address(&terminal.address).is_some() {
+            return None;
+        }
+        let name = if terminal.name.is_empty() {
+            terminal.address.clone()
+        } else {
+            terminal.name
+        };
+        let pane = Pane {
+            id: request.pane,
+            address: terminal.address,
+            name,
+            labels: terminal.labels,
+            title: terminal.title,
+            status: terminal.status,
+            owned: false,
+            keep: terminal.keep,
+            exit: None,
+        };
+        Some(self.insert_pane(request, pane))
+    }
+
+    /// The shared insertion logic: create the requested space/tab, place the
+    /// pane in the layout, make it active and focus it. The pane's id is
+    /// `request.pane`; the caller has already checked for duplicates.
+    fn insert_pane(&mut self, request: &StartRequest, mut pane: Pane) -> PaneId {
         let pane_id = request.pane;
+        pane.id = pane_id;
         self.ids.mark(pane_id.0);
         if !self.spaces.iter().any(|space| space.id == request.space) {
             let space_name = self.space_name();
@@ -614,20 +718,7 @@ impl Workspace {
         self.active = self.spaces[si].id;
         self.spaces[si].active = tab_id;
 
-        self.panes.insert(
-            pane_id,
-            Pane {
-                id: pane_id,
-                address,
-                name,
-                labels: request.labels(),
-                title: String::new(),
-                status: None,
-                owned: true,
-                keep: false,
-                exit: None,
-            },
-        );
+        self.panes.insert(pane_id, pane);
 
         let tab = &mut self.spaces[si].tabs[ti];
         let leaf = Layout::Leaf(pane_id);

@@ -417,6 +417,10 @@ pub mod pty {
     }
 
     impl Pty {
+        // `openpty` takes `*mut winsize` on macOS/BSD but `*const winsize` on
+        // Linux. One call keeps both platforms on the same path, so the mutable
+        // borrow is only unnecessary on Linux.
+        #[allow(clippy::unnecessary_mut_passed)]
         pub fn open(cols: u16, rows: u16) -> Pty {
             let mut size = libc::winsize {
                 ws_row: rows,

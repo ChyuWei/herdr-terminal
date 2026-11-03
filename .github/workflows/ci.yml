@@ -1,0 +1,73 @@
+# Format, lint and test on Linux; do the same on macOS and build the package
+# there. CI never needs a real Core: the real-Core tests skip when `hc` is
+# absent, and nothing here installs or starts one.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  # In the cache key: ghostty-sys cannot tell when Zig changes.
+  ZIG_VERSION: 0.16.0
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, runner: ubuntu-22.04 }
+          - { platform: macos-aarch64, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ci-${{ matrix.platform }}-zig${{ env.ZIG_VERSION }}
+          cache-bin: false
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: scripts/package
+      - name: Check the macOS package
+        if: runner.os == 'macOS'
+        run: |
+          archive=$(ls dist/herdr-terminal-*-macos-*.tar.gz)
+          mkdir -p /tmp/herdr-terminal-package
+          tar -xzf "$archive" -C /tmp/herdr-terminal-package
+          /tmp/herdr-terminal-package/herdr-terminal/ht --version

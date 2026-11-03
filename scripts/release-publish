@@ -1,0 +1,58 @@
+#!/bin/sh
+# Push the current branch, wait for its CI run, then tag v<version> and push
+# the tag. The tag starts the release workflow (the macOS package).
+#
+# Run scripts/release-prepare <version> first and commit the bump; this helper
+# refuses a dirty tree.
+set -eu
+cd "$(dirname "$0")/.."
+
+version=${1:-}
+[ -n "$version" ] || { echo "usage: scripts/release-publish <version>" >&2; exit 2; }
+printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+    echo "error: version must look like 0.1.5, no v" >&2
+    exit 1
+}
+[ -z "$(git status --porcelain)" ] || { echo "error: working tree must be clean" >&2; exit 1; }
+have=$(scripts/package-version)
+[ "$have" = "$version" ] || {
+    echo "error: this checkout is $have, not $version; run scripts/release-prepare $version" >&2
+    exit 1
+}
+branch=$(git rev-parse --abbrev-ref HEAD)
+[ "$branch" != HEAD ] || { echo "error: check out the release branch, not a detached HEAD" >&2; exit 1; }
+tag="v$version"
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+    echo "error: $tag already exists" >&2
+    exit 1
+fi
+command -v gh >/dev/null 2>&1 || {
+    echo "error: gh is needed to wait for CI before tagging" >&2
+    exit 1
+}
+
+git push origin HEAD
+sha=$(git rev-parse HEAD)
+run=""
+tries=0
+while [ "$tries" -lt 60 ]; do
+    # Require the push run for this branch: a pull_request run on the same SHA
+    # must not satisfy the wait.
+    run=$(gh run list --workflow ci.yml --commit "$sha" --event push --branch "$branch" \
+        --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+    case "$run" in
+        "" | null) run="" ;;
+        *) break ;;
+    esac
+    tries=$((tries + 1))
+    sleep 5
+done
+[ -n "$run" ] || { echo "error: no push CI run for $sha on $branch" >&2; exit 1; }
+gh run watch "$run" --exit-status --interval 30 || {
+    echo "error: CI failed; nothing tagged" >&2
+    exit 1
+}
+
+git tag "$tag"
+git push origin "$tag"
+echo "$tag pushed: the release workflow builds and publishes the macOS package"

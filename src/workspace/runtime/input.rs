@@ -55,6 +55,13 @@ impl Screen<'_> {
             self.detach = true;
             return Ok(());
         }
+        if self.ui.preview.is_some() {
+            // A preview is read-only and modal: any key closes it and none
+            // reaches the program or the manager underneath.
+            self.close_preview();
+            self.swallow = Some(key.code);
+            return Ok(());
+        }
         // A key ends a click that never became a drag.
         self.selection_press = None;
         if self.ui.peek.is_some() {
@@ -82,6 +89,18 @@ impl Screen<'_> {
         if self.ui.search.is_some() {
             self.swallow = Some(key.code);
             return self.search_key(&key);
+        }
+        if self.ui.manager.open {
+            self.swallow = Some(key.code);
+            return self.manager_key(&key);
+        }
+        if self.ui.machines.open {
+            self.swallow = Some(key.code);
+            return self.machine_key(&key);
+        }
+        if self.ui.files.open {
+            self.swallow = Some(key.code);
+            return self.file_key(&key);
         }
         if self.ui.selecting.is_some() {
             if self.selection_key(&key)? {
@@ -302,6 +321,9 @@ impl Screen<'_> {
                 self.dirty = true;
             }
             Effect::Agents => self.toggle_sidebar(),
+            Effect::Terminals => self.toggle_manager(),
+            Effect::Machines => self.toggle_machines(),
+            Effect::Files => self.toggle_files(),
             Effect::Peek => self.peek_focused(),
             Effect::JumpAgent(jump) => self.jump_agent(jump),
             Effect::Palette => self.open_palette(),
@@ -315,13 +337,32 @@ impl Screen<'_> {
 
     pub(super) fn start_terminal(&mut self, request: StartRequest) -> Result<()> {
         let name = session::start_name();
-        self.start_with_name(request, name)
+        self.start_with_name_on(request, name, None)
+    }
+
+    /// Starts a terminal on another machine this core added. Core dials and
+    /// relays; the returned address is `machine/t7` and is stored unchanged.
+    /// The labels and every other run option are the local ones.
+    pub(super) fn start_terminal_on(
+        &mut self,
+        request: StartRequest,
+        machine: String,
+    ) -> Result<()> {
+        let name = session::start_name();
+        self.start_with_name_on(request, name, Some(machine))
     }
 
     /// Runs one terminal under a name that is unique among live terminals. If
     /// the reply is lost with the connection, the name is how the reconnect
     /// finds (or safely redoes) the start instead of orphaning a terminal.
-    fn start_with_name(&mut self, request: StartRequest, name: String) -> Result<()> {
+    /// `on` is carried into the retry so a machine start is never redone on
+    /// the local core by accident.
+    fn start_with_name_on(
+        &mut self,
+        request: StartRequest,
+        name: String,
+        on: Option<String>,
+    ) -> Result<()> {
         let size = self.workspace.pending_attach_size(&request, self.area());
         let run = RunOptions {
             argv: Vec::new(),
@@ -330,6 +371,7 @@ impl Screen<'_> {
             keep: true,
             rm: false,
             size: Some(size),
+            on: on.clone(),
             ..RunOptions::default()
         };
         let session = match Session::start(self.client.clone(), &run) {
@@ -338,7 +380,7 @@ impl Screen<'_> {
                 // The terminal may exist under this pane id; never let orphan
                 // recovery adopt it before the pending start is resolved.
                 self.seen.insert(request.pane);
-                self.pending = Some(PendingStart { request, name });
+                self.pending = Some(PendingStart { request, name, on });
                 self.begin_reconnect();
                 return Ok(());
             }
@@ -386,7 +428,7 @@ impl Screen<'_> {
                 let session = Session::reclaim(self.client.clone(), address);
                 self.finish_start(pending.request, session)
             }
-            None => self.start_with_name(pending.request, pending.name),
+            None => self.start_with_name_on(pending.request, pending.name, pending.on),
         }
     }
 

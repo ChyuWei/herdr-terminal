@@ -88,6 +88,14 @@ pub struct UiState {
     pub connection: Connection,
     /// The modal agent sidebar and its selection.
     pub sidebar: Sidebar,
+    /// The Core-wide terminal manager and its local selection/filter.
+    pub manager: ManagerState,
+    /// The machine manager and its local selection/filter/prompt.
+    pub machines: MachineState,
+    /// The file viewer/editor overlay: open, its path prompt and its error.
+    pub files: FileState,
+    /// The read-only observer preview, when open.
+    pub preview: Option<PreviewState>,
     /// The agent being peeked, when the peek overlay is open.
     pub peek: Option<PaneId>,
     /// The effective prefix key map, so the palette can show current hints.
@@ -106,6 +114,10 @@ impl Default for UiState {
             prefix: false,
             connection: Connection::Live,
             sidebar: Sidebar::default(),
+            manager: ManagerState::default(),
+            machines: MachineState::default(),
+            files: FileState::default(),
+            preview: None,
             peek: None,
             keymap: KeyMap::default(),
         }
@@ -124,8 +136,16 @@ impl UiState {
             Overlay::Palette
         } else if self.search.is_some() {
             Overlay::Search
+        } else if self.preview.is_some() {
+            Overlay::Preview
         } else if let Some(pane) = self.peek {
             Overlay::Peek(pane)
+        } else if self.manager.open {
+            Overlay::Manager
+        } else if self.machines.open {
+            Overlay::Machines
+        } else if self.files.open {
+            Overlay::Files
         } else if self.sidebar.open {
             Overlay::Sidebar
         } else {
@@ -142,6 +162,10 @@ impl UiState {
             || self.palette.is_some()
             || self.search.is_some()
             || self.peek.is_some()
+            || self.manager.open
+            || self.machines.open
+            || self.files.open
+            || self.preview.is_some()
             || self.sidebar.open
     }
 
@@ -213,6 +237,101 @@ pub struct Sidebar {
     pub open: bool,
     pub selected: Option<PaneId>,
     pub offset: usize,
+}
+
+/// The terminal manager's local state. The selection is an address, not a
+/// pane id: a hidden terminal has no pane. The filter and selection are never
+/// part of the shared document.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagerState {
+    pub open: bool,
+    pub selected: Option<String>,
+    pub filter: Line,
+    pub filtering: bool,
+    pub offset: usize,
+}
+
+/// The machine manager's local state. The selection is a core machine name,
+/// not a pane or an ssh target. A prompt edits a new target or a new name; a
+/// confirmation holds the machine a `d` key would remove. None of it is ever
+/// part of the shared document.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MachineState {
+    pub open: bool,
+    pub selected: Option<String>,
+    pub filter: Line,
+    pub filtering: bool,
+    pub offset: usize,
+    pub prompt: Option<MachinePrompt>,
+    /// The machine waiting for the second `d`/Enter of a removal.
+    pub confirm: Option<String>,
+    /// Core's refusal or a connection problem, shown inside the overlay.
+    pub error: Option<String>,
+}
+
+/// The file overlay's local state. The path prompt is shown before a read;
+/// an error stays visible inside the overlay while the person corrects the
+/// path. The viewer, diff and buffers are runtime state, not UI state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileState {
+    pub open: bool,
+    /// Where the overlay's path prompt points: the focused pane's machine and
+    /// cwd at the moment it opened.
+    pub context: super::file::Context,
+    /// The path prompt, prefilled from the focused pane's cwd.
+    pub prompt: Option<Line>,
+    /// Core's refusal or a local IO problem, shown inside the overlay.
+    pub error: Option<String>,
+}
+
+/// The one-line machine prompt: add a target, or rename the selected machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachinePrompt {
+    pub kind: MachinePromptKind,
+    pub line: Line,
+}
+
+/// What a machine prompt will call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MachinePromptKind {
+    /// `machine.add` with the typed target unchanged. Core chooses the name.
+    Add,
+    /// `machine.rename` for the captured machine name.
+    Rename { machine: String },
+}
+
+impl MachinePrompt {
+    pub fn add() -> MachinePrompt {
+        MachinePrompt {
+            kind: MachinePromptKind::Add,
+            line: Line::default(),
+        }
+    }
+
+    pub fn rename(machine: &str) -> MachinePrompt {
+        MachinePrompt {
+            kind: MachinePromptKind::Rename {
+                machine: machine.to_owned(),
+            },
+            line: Line::new(machine),
+        }
+    }
+
+    /// The status-bar label before the editable text.
+    pub fn label(&self) -> &'static str {
+        match self.kind {
+            MachinePromptKind::Add => "add machine target: ",
+            MachinePromptKind::Rename { .. } => "rename machine: ",
+        }
+    }
+}
+
+/// The address and title of the terminal being previewed. The stream and VT
+/// live in the runtime; this is what the overlays and input rules read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewState {
+    pub address: String,
+    pub title: String,
 }
 
 /// Whether the client currently has a usable core connection.

@@ -1674,7 +1674,7 @@ fn config_applies_theme_and_rebound_keys_at_startup() {
     std::fs::create_dir_all(&dir).expect("config dir");
     std::fs::write(
         dir.join("config.json"),
-        r#"{"theme":"light","keys":{"new_tab":"t"}}"#,
+        r#"{"theme":"light","keys":{"new_tab":"b"}}"#,
     )
     .expect("seed config");
     let mut run = Run::spawn(&session, 80, 24);
@@ -1695,7 +1695,7 @@ fn config_applies_theme_and_rebound_keys_at_startup() {
         run.errors()
     );
 
-    run.command(b't');
+    run.command(b'b');
     assert!(
         wait_addresses(&session, 2, secs(10)).len() == 2,
         "the rebound new-tab key did not start a terminal: {:?}",
@@ -1850,6 +1850,124 @@ fn a_large_output_burst_keeps_the_workspace_responsive() {
         run.wait_screen(secs(10), |screen| screen.contains("BURST-END")),
         "a key did not return the pane to live: {:?}",
         run.rendered()
+    );
+
+    run.send(&[DETACH]);
+    let status = run.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
+    cleanup_all(&session);
+}
+
+/// The manager shows a background `hc run --bg` worker as an adopted pane,
+/// hides it without ending the program, and shows the same address again with
+/// no duplicate pane.
+#[test]
+fn the_manager_shows_and_hides_a_background_worker() {
+    const WORKER: &str = r#"printf 'WORKER-READY\n'
+while IFS= read -r line; do printf 'WORKER-GOT:%s\n' "$line"; done"#;
+
+    let Some(mut session) = session() else { return };
+    session.start();
+    let started = session.hc_json(&[
+        "run",
+        "--bg",
+        "--no-parent",
+        "--name",
+        "worker",
+        "--",
+        "sh",
+        "-c",
+        WORKER,
+    ]);
+    let worker = started["address"]
+        .as_str()
+        .expect("the worker's address")
+        .to_owned();
+
+    let mut run = Run::spawn(&session, 80, 24);
+    wait_addresses(&session, 2, secs(10));
+
+    // The manager lists core's worker, which this workspace never started.
+    run.command(b't');
+    assert!(
+        run.wait_text("terminal manager · 1 shown · 2 live", secs(10)),
+        "the manager did not list the background worker: {:?}",
+        run.rendered()
+    );
+    run.send(b"/worker");
+    assert!(
+        run.wait_text("filter: worker · 1/2 match", secs(5)),
+        "the filter did not find the worker: {:?}",
+        run.rendered()
+    );
+    run.send(b"\r");
+    run.send(b"\r");
+    assert!(
+        run.wait_text("WORKER-READY", secs(10)),
+        "the worker was not shown: stderr={:?}",
+        run.errors()
+    );
+
+    // Typing reaches the adopted pane's program.
+    run.send(b"ping\n");
+    assert!(
+        run.wait_text("WORKER-GOT:ping", secs(10)),
+        "input did not reach the adopted worker: {:?}",
+        run.rendered()
+    );
+
+    // Hide it: the pane disappears and only its output goes with it.
+    run.command(b't');
+    assert!(
+        run.wait_text("terminal manager · 2 shown · 2 live", secs(5)),
+        "the shown worker is not marked: {:?}",
+        run.rendered()
+    );
+    run.send(b"\r");
+    assert!(
+        run.wait_screen(secs(5), |screen| !screen.contains("WORKER-GOT:ping")),
+        "the hidden worker stayed on screen: {:?}",
+        run.rendered()
+    );
+    let held = record(&session, &worker);
+    assert_eq!(
+        held["state"],
+        serde_json::json!("live"),
+        "hiding must leave the worker running: {held}"
+    );
+    assert!(
+        held["pid"].as_u64().is_some(),
+        "the hidden worker still has its program: {held}"
+    );
+
+    // The program keeps running while hidden; its output is there when the
+    // same address is shown again.
+    session.hc_json(&["send", &worker, "still"]);
+    run.command(b't');
+    assert!(
+        run.wait_text("terminal manager · 1 shown · 2 live", secs(5)),
+        "the hidden worker is not listed: {:?}",
+        run.rendered()
+    );
+    run.send(b"\r");
+    assert!(
+        run.wait_text("WORKER-GOT:still", secs(10)),
+        "showing the worker again lost its output: {:?}",
+        run.rendered()
+    );
+    let addresses = doc_addresses(&session.doc("herdr-terminal"));
+    assert_eq!(
+        addresses
+            .iter()
+            .filter(|address| *address == &worker)
+            .count(),
+        1,
+        "the worker must have exactly one pane: {addresses:?}"
+    );
+    assert_eq!(
+        addresses.len(),
+        2,
+        "one shell and one worker: {addresses:?}"
     );
 
     run.send(&[DETACH]);

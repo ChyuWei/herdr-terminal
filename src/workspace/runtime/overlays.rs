@@ -476,9 +476,9 @@ impl Screen<'_> {
     }
 }
 
-/// Editing actions the palette and search share. Commit and Cancel are handled
-/// by their owners.
-fn text_edit(key: &KeyEvent) -> Option<Edit> {
+/// Editing actions the palette, search and terminal-manager filter share.
+/// Commit and Cancel are handled by their owners.
+pub(super) fn text_edit(key: &KeyEvent) -> Option<Edit> {
     match key.code {
         KeyCode::Backspace => Some(Edit::Backspace),
         KeyCode::Delete => Some(Edit::Delete),

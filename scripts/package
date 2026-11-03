@@ -1,0 +1,140 @@
+#!/bin/sh
+# Build and pack a macOS release of HerdR Terminal:
+#
+#   scripts/package                 -> dist/herdr-terminal-<version>-macos-<arch>.tar.gz
+#   scripts/package <rust-target>   -> the same for another macOS Rust target
+#
+# The archive holds ht, LICENSE, THIRD-PARTY-NOTICES and a short README with
+# install notes. It does not include a Core: ht requires Herdr Core 0.1.17 or
+# newer. Non-macOS targets are refused until another platform is a release
+# target.
+#
+# The archive is byte-reproducible: explicit file order, fixed mtime/owner and
+# a gzip header without a timestamp or name. Two runs on the same tree print
+# the same sha256.
+set -eu
+cd "$(dirname "$0")/.."
+
+version=$(scripts/package-version)
+[ -n "$version" ] || { echo "package: Cargo.toml has no version" >&2; exit 1; }
+
+target=${1:-}
+if [ -n "$target" ]; then
+    case "$target" in
+        *-apple-darwin) ;;
+        *) echo "package: only macOS packages are supported for now; got $target" >&2; exit 2 ;;
+    esac
+    arch=${target%%-*}
+    bin="target/$target/release/ht"
+else
+    [ "$(uname -s)" = Darwin ] || {
+        echo "package: only macOS packages are supported for now (this is $(uname -s))" >&2
+        exit 2
+    }
+    case "$(uname -m)" in
+        arm64 | aarch64) arch=aarch64 ;;
+        x86_64 | amd64) arch=x86_64 ;;
+        *)
+            echo "package: unsupported CPU $(uname -m)" >&2
+            exit 2
+            ;;
+    esac
+    bin=target/release/ht
+fi
+
+for notice in LICENSE THIRD-PARTY-NOTICES; do
+    [ -s "$notice" ] || {
+        echo "package: $notice is missing or empty; run scripts/notices" >&2
+        exit 1
+    }
+done
+command -v python3 >/dev/null 2>&1 || {
+    echo "package: python3 is needed to write the reproducible archive" >&2
+    exit 1
+}
+
+echo "package: herdr-terminal $version for macos-$arch"
+if [ -n "$target" ]; then
+    cargo build --release --locked --target "$target"
+else
+    cargo build --release --locked
+fi
+[ -x "$bin" ] || { echo "package: $bin was not built" >&2; exit 1; }
+
+work=$(mktemp -d "${TMPDIR:-/var/tmp}/ht-package.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+mkdir -p dist "$work/herdr-terminal"
+
+cp "$bin" "$work/herdr-terminal/ht"
+cp LICENSE THIRD-PARTY-NOTICES "$work/herdr-terminal/"
+cat >"$work/herdr-terminal/README.md" <<EOF
+HerdR Terminal $version (macOS $arch)
+
+ht is the terminal client for Herdr Core. This package does not include
+Herdr Core: install or update Core 0.1.17 or newer first (for example with
+"hc update").
+
+Put ht on your PATH (for example in /usr/local/bin) and run: ht
+
+The binary is unsigned. If macOS blocks it, allow it in System Settings >
+Privacy & Security, or remove the quarantine flag:
+
+    xattr -d com.apple.quarantine ht
+EOF
+
+out="dist/herdr-terminal-$version-macos-$arch.tar.gz"
+# macOS tar embeds file mtimes and gzip metadata. Write the archive in Python
+# instead, with a stable order, fixed mtime/owner and no gzip timestamp/name.
+python3 -I - "$work" "$out" <<'PY'
+import gzip
+import os
+import sys
+import tarfile
+
+root, out = sys.argv[1], sys.argv[2]
+# SOURCE_DATE_EPOCH is honoured when set; the default is a fixed epoch, not
+# the build time, so two runs are identical.
+mtime = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
+entries = [
+    ("herdr-terminal/ht", 0o755),
+    ("herdr-terminal/LICENSE", 0o644),
+    ("herdr-terminal/THIRD-PARTY-NOTICES", 0o644),
+    ("herdr-terminal/README.md", 0o644),
+]
+with open(out, "wb") as raw:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=9) as gz:
+        with tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+            for name, mode in entries:
+                path = os.path.join(root, name)
+                info = tarfile.TarInfo(name)
+                info.size = os.path.getsize(path)
+                info.mode = mode
+                info.mtime = mtime
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                with open(path, "rb") as data:
+                    tar.addfile(info, data)
+PY
+
+# The archive must hold exactly these files, and the copies must match the
+# repository's.
+expected=$(printf '%s\n' \
+    herdr-terminal/LICENSE \
+    herdr-terminal/README.md \
+    herdr-terminal/THIRD-PARTY-NOTICES \
+    herdr-terminal/ht | LC_ALL=C sort)
+actual=$(tar -tzf "$out" | LC_ALL=C sort)
+[ "$actual" = "$expected" ] || {
+    echo "package: archive contents differ from the expected files:" >&2
+    printf '%s\n' "$actual" >&2
+    exit 1
+}
+tar -xOf "$out" herdr-terminal/LICENSE | cmp - LICENSE
+tar -xOf "$out" herdr-terminal/THIRD-PARTY-NOTICES | cmp - THIRD-PARTY-NOTICES
+
+if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(sha256sum "$out" | cut -d' ' -f1)
+else
+    digest=$(shasum -a 256 "$out" | cut -d' ' -f1)
+fi
+echo "package: $out ($(wc -c <"$out") bytes, sha256 $digest)"

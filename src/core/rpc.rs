@@ -16,11 +16,59 @@ pub const REQUIRED_METHODS: &[&str] = &[
     "terminal.label",
     "doc.get",
     "doc.set",
+    "file.read",
+    "file.write",
+    "file.edit",
 ];
-/// Features this client needs, as `hello` reports them.
-pub const REQUIRED_FEATURES: &[&str] = &["framed", "attach", "events"];
-/// The optional feature that lets an observer receive RESIZE before paints.
+/// The feature that lets an observer receive RESIZE before paints. Observer
+/// attach has no fallback, so this feature is required.
 pub const RESIZE_NOTIFICATIONS: &str = "resize_notifications";
+/// Features this client needs, as `hello` reports them. Observer attach is the
+/// only path and has no fallback, so `resize_notifications` is required.
+pub const REQUIRED_FEATURES: &[&str] = &["framed", "attach", "events", RESIZE_NOTIFICATIONS];
+
+/// The oldest Core this client works with.
+pub const MINIMUM_CORE: CoreVersion = CoreVersion {
+    major: 0,
+    minor: 1,
+    patch: 17,
+};
+
+/// A core version's numeric `major.minor.patch`. A trailing `-suffix` or
+/// `+build` is ignored; anything else that is not exactly three numbers is
+/// unreadable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CoreVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl CoreVersion {
+    pub fn parse(text: &str) -> Option<CoreVersion> {
+        let head = text.trim().split(['-', '+']).next()?;
+        let mut parts = head.split('.');
+        let version = CoreVersion {
+            major: number(parts.next()?)?,
+            minor: number(parts.next()?)?,
+            patch: number(parts.next()?)?,
+        };
+        parts.next().is_none().then_some(version)
+    }
+}
+
+fn number(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+impl fmt::Display for CoreVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct CoreInfo {
@@ -28,6 +76,197 @@ pub struct CoreInfo {
     pub id: String,
     #[serde(default)]
     pub name: String,
+}
+
+/// A machine this core added, with the state of its line when the view has
+/// one. `machine.add` and `machine.rename` return the profile alone (empty
+/// `state`); `machine.list` and `machine.connect` return the view. Unknown
+/// fields are ignored and every field defaults, so a partial record never
+/// discards the whole answer.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct Machine {
+    /// What this core calls it: `rohan` in `rohan/t7`.
+    #[serde(default)]
+    pub name: String,
+    /// How it is reached: an ssh target, or (`via`) a command.
+    #[serde(default)]
+    pub target: String,
+    /// `target` is a command that runs a shell line there, not an ssh target.
+    #[serde(default)]
+    pub via: bool,
+    /// Short-lived, for a task; clients may show it apart.
+    #[serde(default)]
+    pub temporary: bool,
+    /// The hc session there; `None` is its default.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// The other core's permanent id.
+    #[serde(default)]
+    pub id: String,
+    /// What that core calls itself (its hostname).
+    #[serde(default)]
+    pub host: String,
+    /// Its hc version when last seen.
+    #[serde(default)]
+    pub version: String,
+    /// `connecting`, `connected`, `needs_login`, `needs_update` or
+    /// `unreachable`; empty on a profile reply.
+    #[serde(default)]
+    pub state: String,
+    /// Since when the line is not connected, in milliseconds since the epoch.
+    #[serde(default)]
+    pub since_ms: Option<u64>,
+    /// Why the line is not connected, when core knows.
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
+/// `machine.list`'s reply.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MachineListResult {
+    #[serde(default)]
+    pub machines: Vec<Machine>,
+}
+
+/// `machine.add` params. `target` is passed through unchanged (an ssh target
+/// such as `user@host:port`); `via` is a command instead. The client omits
+/// `install`: copying an hc is an interactive CLI concern, and the API reports
+/// `hc_missing`/`needs_update` instead.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct MachineAdd {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub temporary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+impl MachineAdd {
+    /// Add `target` unchanged; core derives the name and uses the default
+    /// session.
+    pub fn target(target: impl Into<String>) -> MachineAdd {
+        MachineAdd {
+            target: Some(target.into()),
+            ..MachineAdd::default()
+        }
+    }
+}
+
+/// The `machine.connect`/`machine.rm` params.
+pub fn machine_params(machine: &str) -> Value {
+    serde_json::json!({"machine": machine})
+}
+
+/// The `machine.rename` params. Only this core's name changes; addresses with
+/// the old prefix stop working.
+pub fn machine_rename_params(machine: &str, new_name: &str) -> Value {
+    serde_json::json!({"machine": machine, "new_name": new_name})
+}
+
+/// A file here or on a machine. `on` and `cwd` are omitted when unknown, so a
+/// local relative path resolves exactly as core's own default.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FileAt {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl FileAt {
+    pub fn new(path: impl Into<String>) -> FileAt {
+        FileAt {
+            path: path.into(),
+            on: None,
+            cwd: None,
+        }
+    }
+}
+
+/// `file.read` params: a window of whole lines, `offset` from 1 and at most
+/// `limit`. `None` lets core give all of it, up to its 8 MB cap.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FileRead {
+    #[serde(flatten)]
+    pub at: FileAt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl FileRead {
+    /// A window starting at line `offset` (from 1).
+    pub fn at_line(at: FileAt, offset: usize, limit: usize) -> FileRead {
+        FileRead {
+            at,
+            offset: Some(offset),
+            limit: Some(limit),
+        }
+    }
+
+    /// The whole file, bounded only by core's reply cap.
+    pub fn whole(at: FileAt) -> FileRead {
+        FileRead {
+            at,
+            offset: None,
+            limit: None,
+        }
+    }
+}
+
+/// `file.read`'s reply: whole lines with their ends kept, the range given, and
+/// the file's total line count. `last < first` means the range is empty.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct FileReadResult {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub first: usize,
+    #[serde(default)]
+    pub last: usize,
+    #[serde(default)]
+    pub lines: usize,
+}
+
+/// `file.write` params: the new content, base64, at most 8 MB raw.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FileWrite {
+    #[serde(flatten)]
+    pub at: FileAt,
+    pub data: String,
+}
+
+/// `file.edit` params: exact replacements, all or none.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FileEdit {
+    #[serde(flatten)]
+    pub at: FileAt,
+    pub edits: Vec<FileEditOp>,
+}
+
+/// One exact text replacement for `file.edit`. `old` must occur exactly once
+/// in the file as it was; edits are applied together or not at all.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileEditOp {
+    pub old: String,
+    pub new: String,
+}
+
+/// `file.write` and `file.edit`'s reply: the absolute path written and its
+/// size.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct FileResult {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub bytes: usize,
 }
 
 /// The `hello` reply: what this core is and what it can do.
@@ -48,6 +287,12 @@ pub struct Hello {
 }
 
 impl Hello {
+    /// Whether this core advertises a method. Optional API such as the
+    /// machine manager is gated on the reply, never on a version number.
+    pub fn has_method(&self, method: &str) -> bool {
+        self.methods.iter().any(|have| have == method)
+    }
+
     /// Whether this core advertises a feature. Optional capabilities are
     /// gated on the reply, never on a version number.
     pub fn supports(&self, feature: &str) -> bool {
@@ -65,6 +310,21 @@ impl Hello {
                 have: self.generation,
                 want: GENERATION,
             });
+        }
+        match CoreVersion::parse(&self.version) {
+            Some(have) if have >= MINIMUM_CORE => {}
+            Some(have) => {
+                return Err(Mismatch::VersionTooOld {
+                    have,
+                    want: MINIMUM_CORE,
+                });
+            }
+            None => {
+                return Err(Mismatch::VersionUnreadable {
+                    have: self.version.clone(),
+                    want: MINIMUM_CORE,
+                });
+            }
         }
         let missing: Vec<String> = REQUIRED_METHODS
             .iter()
@@ -90,7 +350,18 @@ impl Hello {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mismatch {
     NotFramed,
-    Generation { have: u32, want: u32 },
+    Generation {
+        have: u32,
+        want: u32,
+    },
+    VersionTooOld {
+        have: CoreVersion,
+        want: CoreVersion,
+    },
+    VersionUnreadable {
+        have: String,
+        want: CoreVersion,
+    },
     MissingMethods(Vec<String>),
     MissingFeatures(Vec<String>),
 }
@@ -105,9 +376,21 @@ impl fmt::Display for Mismatch {
                     "core speaks protocol generation {have}; this client speaks generation {want}"
                 )
             }
-            Mismatch::MissingMethods(methods) => {
-                write!(f, "core lacks required methods: {}", methods.join(", "))
-            }
+            Mismatch::VersionTooOld { have, want } => write!(
+                f,
+                "core {have} is older than the minimum supported {want}; update herdr-core \
+                 (for example with `hc update`)"
+            ),
+            Mismatch::VersionUnreadable { have, want } => write!(
+                f,
+                "core reported an unreadable version \"{have}\"; this client needs herdr-core \
+                 {want} or newer (update with `hc update`)"
+            ),
+            Mismatch::MissingMethods(methods) => write!(
+                f,
+                "core lacks required methods: {}; update herdr-core (for example with `hc update`)",
+                methods.join(", ")
+            ),
             Mismatch::MissingFeatures(features) => {
                 write!(f, "core lacks required features: {}", features.join(", "))
             }
@@ -205,6 +488,10 @@ pub struct Terminal {
     pub signal: Option<i64>,
     #[serde(default)]
     pub finished_ms: Option<u64>,
+    /// When core created the terminal, in milliseconds since the epoch. A
+    /// `terminal.run` reply may omit it; a snapshot record carries it.
+    #[serde(default)]
+    pub created_ms: Option<u64>,
     /// The program's own OSC 7501 word, stored as reported.
     #[serde(default)]
     pub status: Option<Status>,
@@ -291,7 +578,8 @@ pub struct AttachResult {
     #[serde(default)]
     pub terminal: Terminal,
     /// True only when an observer asked for resize notifications and the
-    /// whole path confirmed them. Absent or false means track `size` events.
+    /// whole path confirmed them. An observer whose reply is absent or false
+    /// is an error; there is no normal-attach fallback.
     #[serde(default)]
     pub resize_notifications: bool,
 }
@@ -333,7 +621,7 @@ mod tests {
     fn hello(generation: u32, framed: bool, methods: &[&str], features: &[&str]) -> Hello {
         Hello {
             generation,
-            version: "0.1.16".into(),
+            version: "0.1.17".into(),
             framed,
             methods: methods.iter().map(|m| (*m).to_owned()).collect(),
             features: features.iter().map(|f| (*f).to_owned()).collect(),
@@ -345,20 +633,117 @@ mod tests {
         hello(GENERATION, true, REQUIRED_METHODS, REQUIRED_FEATURES)
     }
 
+    fn at_version(version: &str) -> Hello {
+        Hello {
+            version: version.into(),
+            ..full()
+        }
+    }
+
     #[test]
     fn optional_features_are_read_from_hello_not_from_a_version() {
         let bare = full();
         assert!(bare.supports("framed"));
-        assert!(!bare.supports(RESIZE_NOTIFICATIONS));
+        assert!(bare.supports(RESIZE_NOTIFICATIONS));
+        assert!(!bare.supports("automatic_input"));
 
         let supporting = hello(
             GENERATION,
             true,
             REQUIRED_METHODS,
-            &["framed", "attach", "events", RESIZE_NOTIFICATIONS],
+            &[
+                "framed",
+                "attach",
+                "events",
+                RESIZE_NOTIFICATIONS,
+                "automatic_input",
+            ],
         );
-        assert!(supporting.supports(RESIZE_NOTIFICATIONS));
+        assert!(supporting.supports("automatic_input"));
         assert_eq!(supporting.check(), Ok(()));
+    }
+
+    #[test]
+    fn the_minimum_core_version_is_enforced() {
+        for version in [
+            "0.1.17",
+            "0.1.17-9",
+            "0.1.17+build.2",
+            "0.1.17-rc.1+any",
+            " 0.1.17 ",
+            "0.1.18",
+            "0.2.0",
+            "1.0.0",
+        ] {
+            assert_eq!(at_version(version).check(), Ok(()), "{version:?}");
+        }
+
+        assert_eq!(
+            at_version("0.1.16").check(),
+            Err(Mismatch::VersionTooOld {
+                have: CoreVersion {
+                    major: 0,
+                    minor: 1,
+                    patch: 16
+                },
+                want: MINIMUM_CORE,
+            })
+        );
+        assert_eq!(
+            at_version("0.0.99").check(),
+            Err(Mismatch::VersionTooOld {
+                have: CoreVersion {
+                    major: 0,
+                    minor: 0,
+                    patch: 99
+                },
+                want: MINIMUM_CORE,
+            })
+        );
+        for version in ["", "dev", "0.1", "0.1.x", "0.1.17.1", "v0.1.17", "0.1.17x"] {
+            assert!(
+                matches!(
+                    at_version(version).check(),
+                    Err(Mismatch::VersionUnreadable { .. })
+                ),
+                "{version:?} must be unreadable"
+            );
+        }
+
+        let message = at_version("0.1.16").check().unwrap_err().to_string();
+        assert!(message.contains("0.1.16"), "{message}");
+        assert!(message.contains("0.1.17"), "{message}");
+        assert!(message.contains("hc update"), "{message}");
+
+        let message = at_version("").check().unwrap_err().to_string();
+        assert!(message.contains("unreadable"), "{message}");
+        assert!(message.contains("0.1.17"), "{message}");
+    }
+
+    #[test]
+    fn a_version_is_three_numeric_parts_with_an_ignored_suffix() {
+        let version = |major, minor, patch| CoreVersion {
+            major,
+            minor,
+            patch,
+        };
+        assert_eq!(CoreVersion::parse("0.1.17"), Some(version(0, 1, 17)));
+        assert_eq!(
+            CoreVersion::parse("12.34.56-rc.1"),
+            Some(version(12, 34, 56))
+        );
+        assert_eq!(
+            CoreVersion::parse("12.34.56+deadbeef"),
+            Some(version(12, 34, 56))
+        );
+        assert_eq!(CoreVersion::parse(" 12.34.56 "), Some(version(12, 34, 56)));
+        for bad in [
+            "", " ", "dev", "0", "0.1", "0.1.x", "0.1.17.1", "-1.2.3", "1.2.3. ", "0.1.17 x",
+        ] {
+            assert_eq!(CoreVersion::parse(bad), None, "{bad:?}");
+        }
+        assert!(version(0, 1, 17) < version(0, 1, 18));
+        assert!(version(0, 2, 0) > version(0, 1, 99));
     }
 
     #[test]
@@ -372,6 +757,102 @@ mod tests {
         }))
         .expect("reply");
         assert!(confirmed.resize_notifications);
+    }
+
+    #[test]
+    fn a_machine_view_keeps_every_documented_fact_and_ignores_new_ones() {
+        let machine: Machine = serde_json::from_value(serde_json::json!({
+            "name": "rohan",
+            "target": "can@10.0.0.7:2222",
+            "via": false,
+            "temporary": true,
+            "session": "work",
+            "id": "core-id",
+            "host": "rohan-host",
+            "version": "0.1.18",
+            "state": "needs_login",
+            "since_ms": 1234,
+            "why": "login required",
+            "future_field": {"anything": true},
+        }))
+        .expect("machine view");
+        assert_eq!(machine.name, "rohan");
+        assert_eq!(machine.target, "can@10.0.0.7:2222");
+        assert!(!machine.via);
+        assert!(machine.temporary);
+        assert_eq!(machine.session.as_deref(), Some("work"));
+        assert_eq!(machine.id, "core-id");
+        assert_eq!(machine.host, "rohan-host");
+        assert_eq!(machine.version, "0.1.18");
+        assert_eq!(machine.state, "needs_login");
+        assert_eq!(machine.since_ms, Some(1234));
+        assert_eq!(machine.why.as_deref(), Some("login required"));
+
+        let empty: Machine = serde_json::from_value(serde_json::json!({})).expect("partial");
+        assert_eq!(empty, Machine::default());
+
+        let list: MachineListResult = serde_json::from_value(serde_json::json!({
+            "machines": [{"name": "one"}, {"name": "two", "state": "connected"}],
+            "unknown": 1,
+        }))
+        .expect("list");
+        assert_eq!(list.machines.len(), 2);
+        assert_eq!(list.machines[1].state, "connected");
+    }
+
+    #[test]
+    fn machine_add_passes_the_target_through_unchanged() {
+        let target = "can@10.0.0.7:2222";
+        let params = serde_json::to_value(MachineAdd::target(target)).expect("params");
+        assert_eq!(
+            params,
+            serde_json::json!({"target": target}),
+            "the target is not parsed or rewritten and unset options are absent"
+        );
+        assert_eq!(params["target"], serde_json::json!(target));
+        assert!(params.get("via").is_none());
+        assert!(params.get("temporary").is_none());
+        assert!(params.get("name").is_none());
+        assert!(params.get("session").is_none());
+
+        let full = MachineAdd {
+            target: Some(target.into()),
+            via: None,
+            temporary: true,
+            name: Some("rohan".into()),
+            session: Some("work".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(full).expect("params"),
+            serde_json::json!({
+                "target": target,
+                "temporary": true,
+                "name": "rohan",
+                "session": "work",
+            })
+        );
+
+        let via = MachineAdd {
+            target: None,
+            via: Some("fly ssh console -a app --pty=false -C".into()),
+            ..MachineAdd::default()
+        };
+        assert_eq!(
+            serde_json::to_value(via).expect("params"),
+            serde_json::json!({"via": "fly ssh console -a app --pty=false -C"})
+        );
+    }
+
+    #[test]
+    fn machine_requests_name_the_machine_exactly() {
+        assert_eq!(
+            machine_params("rohan"),
+            serde_json::json!({"machine": "rohan"})
+        );
+        assert_eq!(
+            machine_rename_params("rohan", "vps"),
+            serde_json::json!({"machine": "rohan", "new_name": "vps"})
+        );
     }
 
     #[test]
@@ -398,7 +879,15 @@ mod tests {
         };
         assert_eq!(
             methods,
-            ["terminal.attach", "terminal.label", "doc.get", "doc.set"]
+            [
+                "terminal.attach",
+                "terminal.label",
+                "doc.get",
+                "doc.set",
+                "file.read",
+                "file.write",
+                "file.edit",
+            ]
         );
         assert!(
             missing
@@ -412,6 +901,100 @@ mod tests {
         let Err(Mismatch::MissingFeatures(features)) = missing.check() else {
             panic!("missing feature not detected")
         };
-        assert_eq!(features, ["events"]);
+        assert_eq!(features, ["events", RESIZE_NOTIFICATIONS]);
+    }
+
+    #[test]
+    fn file_requests_omit_unknown_context_and_unbounded_windows() {
+        let local = FileRead::whole(FileAt::new("notes.txt"));
+        assert_eq!(
+            serde_json::to_value(&local).expect("params"),
+            serde_json::json!({"path": "notes.txt"}),
+            "a local whole-file read sends no on, cwd, offset or limit"
+        );
+
+        let mut at = FileAt::new("src/main.rs");
+        at.on = Some("rohan".into());
+        at.cwd = Some("/srv/app".into());
+        let window = FileRead::at_line(at.clone(), 41, 200);
+        assert_eq!(
+            serde_json::to_value(&window).expect("params"),
+            serde_json::json!({
+                "path": "src/main.rs",
+                "on": "rohan",
+                "cwd": "/srv/app",
+                "offset": 41,
+                "limit": 200,
+            })
+        );
+
+        let write = FileWrite {
+            at: at.clone(),
+            data: "payload".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&write).expect("params"),
+            serde_json::json!({
+                "path": "src/main.rs",
+                "on": "rohan",
+                "cwd": "/srv/app",
+                "data": "payload",
+            })
+        );
+
+        let edit = FileEdit {
+            at,
+            edits: vec![FileEditOp {
+                old: "old\n".into(),
+                new: "new\n".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&edit).expect("params"),
+            serde_json::json!({
+                "path": "src/main.rs",
+                "on": "rohan",
+                "cwd": "/srv/app",
+                "edits": [{"old": "old\n", "new": "new\n"}],
+            })
+        );
+    }
+
+    #[test]
+    fn file_results_keep_the_documented_facts_and_ignore_more() {
+        let read: FileReadResult = serde_json::from_value(serde_json::json!({
+            "text": "one\ntwo\n",
+            "first": 1,
+            "last": 2,
+            "lines": 9,
+            "etag": "no such thing",
+        }))
+        .expect("read result");
+        assert_eq!(
+            read,
+            FileReadResult {
+                text: "one\ntwo\n".into(),
+                first: 1,
+                last: 2,
+                lines: 9,
+            }
+        );
+
+        let empty: FileReadResult = serde_json::from_value(serde_json::json!({})).expect("partial");
+        assert_eq!(empty, FileReadResult::default());
+        assert_eq!(
+            (empty.first, empty.last),
+            (0, 0),
+            "missing fields default; an empty text is what makes the window empty"
+        );
+
+        let written: FileResult = serde_json::from_value(serde_json::json!({
+            "path": "/srv/app/src/main.rs",
+            "bytes": 12,
+            "mode": "0644",
+        }))
+        .expect("file result");
+        assert_eq!(written.path, "/srv/app/src/main.rs");
+        assert_eq!(written.bytes, 12);
     }
 }

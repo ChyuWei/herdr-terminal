@@ -121,6 +121,54 @@ impl ScreenGuard {
             return;
         }
         self.restored = true;
+        self.leave();
+    }
+
+    /// Hands the outer terminal back for a child process (an editor): leave
+    /// the alternate screen, raw mode, mouse, keyboard enhancement, focus and
+    /// paste reporting. [`Self::resume`] puts the TUI back. Idempotent, and a
+    /// guard that is dropped while suspended still restores cleanly.
+    pub(crate) fn suspend(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.leave();
+    }
+
+    /// Returns to the alternate screen and every mode the TUI needs after
+    /// [`Self::suspend`]. A no-op before the guard is suspended or after it
+    /// was restored.
+    pub(crate) fn resume(&mut self) -> Result<()> {
+        if self.restored || self.raw.is_some() {
+            return Ok(());
+        }
+        let raw = RawMode::enter()?
+            .ok_or_else(|| Error::Usage("ht needs a terminal on stdin and stdout".into()))?;
+        self.raw = Some(raw);
+        let mut out = stdout();
+        execute!(out, EnterAlternateScreen).map_err(Error::Io)?;
+        self.alternate = true;
+        if execute!(out, EnableFocusChange).is_ok() {
+            self.focus = true;
+        }
+        if execute!(
+            out,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        )
+        .is_ok()
+        {
+            self.keyboard = true;
+        }
+        if execute!(out, EnableBracketedPaste).is_ok() {
+            self.paste = true;
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
         let mut out = stdout();
         if self.paste {
             let _ = execute!(out, DisableBracketedPaste);

@@ -1,0 +1,59 @@
+#!/bin/sh
+# Print the version from the [package] table of a Cargo.toml (default:
+# ./Cargo.toml). Only that table counts: a dependency line such as
+# `ghostty-sys = { version = "0.1.0", ... }` must never satisfy a release
+# version check.
+#
+#   scripts/package-version              # the checkout's package version
+#   scripts/package-version PATH         # any manifest
+#   scripts/package-version --self-check # prove a dependency version is ignored
+set -eu
+
+package_version() {
+    awk '
+        /^[[:space:]]*\[/ {
+            in_package = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*$/)
+            next
+        }
+        in_package && !found && /^[[:space:]]*version[[:space:]]*=/ {
+            if (match($0, /"[^"]*"/)) {
+                print substr($0, RSTART + 1, RLENGTH - 2)
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                printf "package-version: no [package] version in %s\n", FILENAME > "/dev/stderr"
+                exit 1
+            }
+        }
+    ' "$1"
+}
+
+if [ "${1:-}" = "--self-check" ]; then
+    work=$(mktemp -d "${TMPDIR:-/var/tmp}/ht-version-check.XXXXXX")
+    trap 'rm -rf "$work"' EXIT HUP INT TERM
+    cat >"$work/Cargo.toml" <<'EOF'
+[package]
+name = "fixture"
+version = "0.2.0"
+
+[dependencies]
+ghostty-sys = { version = "0.1.0", path = "crates/ghostty-sys" }
+EOF
+    # The old guard grepped the whole file, so this line matched.
+    grep -Fq 'version = "0.1.0"' "$work/Cargo.toml" || {
+        echo "package-version: self-check fixture is wrong" >&2
+        exit 1
+    }
+    got=$(package_version "$work/Cargo.toml")
+    [ "$got" = "0.2.0" ] || {
+        echo "package-version: self-check failed: got '$got', want 0.2.0" >&2
+        exit 1
+    }
+    echo "package-version: self-check ok ([package] 0.2.0 wins over dependency 0.1.0)"
+    exit 0
+fi
+
+package_version "${1:-Cargo.toml}"

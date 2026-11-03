@@ -6,9 +6,9 @@ The terminal client for **Herdr Core**.
 
 HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that runs the programs and keeps their terminals alive. It is a sibling of the Herdr App desktop client and a replacement for the old Herdr 1.x TUI. HerdR Terminal owns the screen and workspace organization; Herdr Core owns the programs and the facts about them.
 
-**Status:** implemented and unreleased. The client connects to Herdr Core, renders terminals through a local VT, runs a spaces/tabs/panes workspace with restore and agent awareness, and adds daily-driver input: mouse, bounded scrollback and search, selection with copy/paste, a command palette, and startup settings with default/dark/light themes. Later features remain planned.
+**Status:** implemented and unreleased. The client connects to Herdr Core, renders terminals through a local VT, runs a spaces/tabs/panes workspace with restore and agent awareness, and adds daily-driver input: mouse, bounded scrollback and search, selection with copy/paste, a command palette, and startup settings with default/dark/light themes, plus a Core-wide terminal manager, a machine manager for Core machines and remote terminals, and a Core-backed file viewer with an external editor, line diff and write-back. A file picker and the other later features remain planned.
 
-**Compatibility:** Herdr Core 0.1.16 or newer, protocol generation 1. Optional capabilities are gated on the `hello` features a core advertises, not a version string. Testing used Core 0.1.17; 0.1.16 support is checked by source and the no-feature path, not by running a 0.1.16 binary.
+**Compatibility:** Herdr Core 0.1.17 or newer, protocol generation 1. Older or unreadable versions are refused at connect with an update hint; a core missing a required method or feature is also refused. `resize_notifications` is required by the connection, not optional (observer attach has no fallback); other capabilities are gated on the `hello` features a core advertises, not a version string.
 
 ## Features
 
@@ -17,9 +17,12 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 - **Connection:** Core discovery, one long-lived framed connection, `hello` check, reconnect without losing running programs.
 - **Terminals:** Run, attach, local VT rendering, keyboard and mouse input, resize, focus, display facts, credit-based flow control, and the `lost`/`restarted`/`finished` lifecycle.
 - **Text rendering:** Grapheme clustering is on by default, matching Core and Herdr App, so variation-selector emoji such as `✍️` and `❤️` form one cluster two cells wide, followed by a zero-width spacer cell, instead of splitting across cells.
-- **Terminal sizing:** New terminals are spawned with the grid they will attach at — the initial shell, splits/tabs/spaces, explicit programs, `ht screen`, reconnect replacements and `ht probe` — so a program that reads its size once starts with the right layout. Cores that predate the field ignore it and still work.
+- **Terminal sizing:** New terminals are spawned with the grid they will attach at — the initial shell, splits/tabs/spaces, explicit programs, `ht screen`, reconnect replacements and `ht probe` — so a program that reads its size once starts with the right layout. Every supported Core applies it, so no version gate is needed.
 - **Workspace:** Create spaces, tabs and panes; split/close/move; focus, zoom; rename tabs and spaces.
-- **Terminal management:** Labels, keep, kill/rm, shell or command.
+- **Terminal operations:** Labels, keep, kill/rm, shell or command.
+- **Terminal manager:** `prefix t` opens a Core-wide list of every live terminal, with a marker for panes shown here, its OSC 7501 status (or `unknown`), age, address, and optional name/title/parent/machine/cwd; rows sort blocked/error first, then working, done, idle and unknown, and filter by case-insensitive substring. `Enter` shows a hidden terminal by adopting its existing address (no new program) or hides a shown one by detaching and removing the pane (never kill/rm); `p` previews it read-only through an observer attach, separate from the agent peek. Selection and filter are local UI state.
+- **Machine manager:** `prefix m` opens a modal list of the machines Core knows, from `machine.list`, with name, state (connecting, connected, needs_login, needs_update, unreachable or unknown), the elapsed time of its current state and Core's reason when present, target, host/version, session, and temporary/via facts; rows sort connected, connecting, needs_login, needs_update, unreachable and unknown, with permanent machines ahead of temporary ones in the same state, and filter by case-insensitive substring. `Enter` connects or retries, `a` adds by target (passed to Core unchanged), `r` renames, `d` removes after confirmation, and `n` starts a terminal on the selected machine. A remote terminal gets a `machine/t7` address, lives in this workspace like a local pane, and restores from the local document; Core owns the machine line (SSH or `via`), dialing, backoff and relayed streams, while the client follows a machine rename by pane label and keeps the pane and stream. The list refreshes when the overlay opens, after each action, and on a timer only while it is open; Core has no machine-state event.
+- **Files:** `prefix o` opens a modal file overlay. It reads and writes through Core, using the focused pane's machine (as `on`) and cwd when present; the path prompt starts at that cwd, and there is no directory listing or picker (a trailing separator is refused without a read). The viewer is read-only and pages 400 lines at a time with `file.read`, showing the machine, path, loaded range and total lines; j/k or arrows, PgUp/PgDn, g/G or Home/End scroll and fetch the next or previous page; Esc closes. `e` reads the whole file through Core and opens a unique local temp copy in `$VISUAL` or `$EDITOR` (split on whitespace, with no `vi` fallback), suspending and restoring the TUI; the result is shown as a `+`/`-` line diff. `w`/Enter writes and `q`/Esc discards. Before writing, the file is re-read and compared with the first read; a change shows a conflict and `o` is the explicit overwrite. Without a conflict, one exact contiguous change uses `file.edit`; otherwise `file.write`, including the explicit overwrite. A whole read that Core truncates at its inline cap is refused for editing and writing, while the viewer still pages through it. File contents never enter the document or labels; only the editor's temp copy is written locally. `file.read`, `file.write` and `file.edit` are required at connect.
 - **Agents:** Status, turn, title, foreground, agent sidebar, local-VT peek, jump, seen/pinned, blocked/finished alerts.
 - **State:** Own `herdr-terminal` document, restore, multi-screen sync; rediscover terminals by labels.
 - **Recovery:** Detach keeps programs running; reconnect, reattach, and resnapshot after a missed event.
@@ -31,14 +34,14 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 - **Settings:** Startup config at `$XDG_CONFIG_HOME/herdr-terminal/config.json` (HOME fallback) for theme, scrollback, mouse, clipboard and prefix keys; bad values warn and fall back. Settings are read once at startup; there is no settings UI or live reload.
 - **Performance:** Bounded per-frame work and bounded scrollback/search keep input responsive during large output.
 - **CLI:** `ht` opens the workspace, `ht screen` runs or reattaches to one terminal, `ht probe` copies raw attach bytes; `--version`, `--help`, `--hc`, `--cols`, `--rows`, `-v`.
+- **Distribution:** macOS Apple Silicon package with `ht`, license and generated third-party notices; GitHub Actions CI and a tag-triggered GitHub release workflow. The package requires Herdr Core 0.1.17 or newer and does not include a Core.
 
 **Planned**
 
 - **UI:** General confirm/toast prompts.
 - **Workspace polish:** Tab reorder, custom layouts, accessibility.
-- **Machines:** Add/connect/list/rename/rm, remote terminals and events.
-- **Files:** Read/write/edit, diff, external editor, simple file picker.
-- **Distribution:** Packaging, install, `--skill`, CLI docs, `ht status` and core/log diagnostics.
+- **Files:** Directory listing and a simple file picker.
+- **Distribution:** Install script, `--skill`, CLI docs, `ht status` and core/log diagnostics.
 - **Mods/plugins (postponed):** Later via the manifest + external-command model, not JS/GPUI.
 - **Kitty images (postponed):** Later if there is demand.
 

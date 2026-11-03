@@ -18,17 +18,23 @@
 
 mod agents;
 mod events;
+mod file;
 mod input;
+mod machines;
+mod manager;
 mod mouse;
 mod overlays;
 mod panes;
 mod reconnect;
 mod sync;
 
+use super::machines::MachineRow;
 use agents::AgentRuntime;
+use manager::ManagerPreview;
 
 use super::geometry;
 use super::local::ViewStore;
+use super::manager::ManagerRow;
 use super::model::{PaneId, StartRequest, Workspace};
 use super::state::UiState;
 use super::sync::DocState;
@@ -155,6 +161,21 @@ pub(super) struct Settings {
 struct PendingStart {
     request: StartRequest,
     name: String,
+    /// The machine the start was for, so a retry never falls back to local.
+    on: Option<String>,
+}
+
+/// One open file, its pre-editor text and the local temp file an editor may
+/// still be using. Contents live only in memory here: they never enter the
+/// workspace document or a label.
+struct FileSession {
+    pane: super::file::Pane,
+    /// The full text first read, for the content-based conflict check.
+    original: String,
+    /// The editor's buffer, while a diff is pending.
+    edited: Option<String>,
+    /// The local temp file, until the editor returns and it is removed.
+    temp: Option<PathBuf>,
 }
 
 pub(super) struct Screen<'a> {
@@ -166,6 +187,9 @@ pub(super) struct Screen<'a> {
     model: Model,
     workspace: Workspace,
     links: BTreeMap<PaneId, Link>,
+    /// Stream-less panes whose `removed` waits one event batch for a
+    /// same-rename `created` to move them first.
+    deferred_removals: Vec<(PaneId, String)>,
     /// The shared document's base, version and CAS state.
     doc: DocState,
     /// The per-screen focus/zoom file.
@@ -178,6 +202,19 @@ pub(super) struct Screen<'a> {
     ui: UiState,
     /// Agent rows, seen/pin bookkeeping, sidebar selection and alerts.
     agents: AgentRuntime,
+    /// The Core-wide manager's inventory, refreshed once per frame while open.
+    manager_rows: Vec<ManagerRow>,
+    /// Core's machines, refreshed on open, after each action and on a timer
+    /// while the machine manager stays open.
+    machine_rows: Vec<MachineRow>,
+    /// When the open machine manager should ask core again.
+    machine_next_refresh: Option<Instant>,
+    /// The read-only observer preview, when one is open.
+    preview: Option<ManagerPreview>,
+    /// The open file overlay's contents, when a path was read.
+    file: Option<FileSession>,
+    /// Names this screen's editor temp files uniquely.
+    file_serial: u64,
     terminal: ScreenTerminal,
     guard: &'a mut ScreenGuard,
     reconn: Option<Reconnect>,
@@ -236,12 +273,19 @@ impl<'a> Screen<'a> {
             model,
             workspace,
             links: BTreeMap::new(),
+            deferred_removals: Vec::new(),
             doc,
             view,
             seen,
             pending: None,
             ui,
             agents: AgentRuntime::default(),
+            manager_rows: Vec::new(),
+            machine_rows: Vec::new(),
+            machine_next_refresh: None,
+            preview: None,
+            file: None,
+            file_serial: 0,
             terminal,
             guard,
             reconn: None,
@@ -271,6 +315,13 @@ impl<'a> Screen<'a> {
     /// the caller can detach, leave them alone, or clean up.
     pub(super) fn run(mut self) -> Finish {
         let result = self.play();
+        // The preview is not a workspace session: close its observer stream
+        // before the sessions are handed back.
+        if self.reconn.is_none() {
+            self.close_preview();
+        } else {
+            self.drop_preview();
+        }
         if self.reconn.is_none() {
             if let Some(error) = self.view.save_now(&self.workspace, self.ui.sidebar.open) {
                 eprintln!("ht: warning: {error}");
@@ -327,11 +378,16 @@ impl<'a> Screen<'a> {
         if self.reconn.is_some() {
             return Ok(());
         }
+        let preview_data = self.drain_preview()?;
+        if self.reconn.is_some() {
+            return Ok(());
+        }
         self.apply_events()?;
         if self.reconn.is_some() {
             return Ok(());
         }
-        self.poll_input(had_data)?;
+        self.refresh_machines_if_due();
+        self.poll_input(had_data || preview_data)?;
         self.drive_search();
         self.sync_mouse()?;
         self.refresh_agents()?;
@@ -372,6 +428,11 @@ impl<'a> Screen<'a> {
             return Ok(());
         }
 
+        self.refresh_manager();
+        let preview_screen = match self.preview.as_mut() {
+            Some(preview) => Some(preview.vt.snapshot().map_err(vt_error)?),
+            None => None,
+        };
         let rects = self.rects();
         let mut screens: BTreeMap<PaneId, VtScreen> = BTreeMap::new();
         for (pane, _) in &rects.panes {
@@ -453,8 +514,11 @@ impl<'a> Screen<'a> {
         let workspace = &self.workspace;
         let visible = &screens;
         let rows = &self.agents.rows;
+        let manager_rows = &self.manager_rows;
+        let machine_rows = &self.machine_rows;
         let theme = &self.theme;
         let scroll_hint = self.scroll_hint();
+        let file_pane = self.file.as_ref().map(|session| &session.pane);
         // A finished pane has no prompt to type into; its final cursor would
         // suggest otherwise.
         let finished: Vec<PaneId> = self
@@ -478,6 +542,10 @@ impl<'a> Screen<'a> {
                     theme,
                     selections: &selections,
                     scroll_hint: scroll_hint.as_deref(),
+                    manager: manager_rows,
+                    machines: machine_rows,
+                    preview: preview_screen.as_ref(),
+                    files: file_pane,
                 };
                 let rendered =
                     ui::render_with(frame.buffer_mut(), area, workspace, &ui_state, &view);
