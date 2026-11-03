@@ -7,9 +7,10 @@
 
 use super::discovery;
 use super::events::{self, EventStream, Notification};
-use super::frames::{Frame, FrameDecoder};
+use super::frames::{Frame, FrameDecoder, FrameError, parse_resize};
 use super::rpc::{
-    AttachResult, DocGetResult, DocSetResult, Hello, ReadResult, RpcError, Snapshot, Terminal,
+    AttachResult, DocGetResult, DocSetResult, Hello, RESIZE_NOTIFICATIONS, ReadResult, RpcError,
+    Snapshot, Terminal,
 };
 use super::{Error, Result};
 use serde_json::{Value, json};
@@ -35,10 +36,13 @@ const READ_CHUNK: usize = 64 * 1024;
 const MAX_HELLO_LINE: usize = 1 << 20;
 
 /// What an attach stream delivers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StreamItem {
     /// Raw program output (first paint, then live bytes).
     Data(Vec<u8>),
+    /// The terminal's grid, sent by core to a confirmed observer before the
+    /// paint that uses it. It carries no terminal bytes and costs no credit.
+    Resize { cols: u16, rows: u16 },
     /// Core ended the stream; the JSON reason says why (for example an exit).
     Closed(Option<Value>),
     /// The connection dropped. The program may still be running.
@@ -50,6 +54,9 @@ pub struct Attached {
     pub channel: u32,
     pub terminal: Terminal,
     pub stream: Receiver<StreamItem>,
+    /// True only for an observer whose attach reply confirmed that RESIZE
+    /// precedes every paint. Normal viewers always see `false`.
+    pub resize_notifications: bool,
 }
 
 /// What `terminal.run` starts and how. The defaults carry the identity HerdR
@@ -125,6 +132,41 @@ fn run_params(options: &RunOptions) -> Value {
         params["size"] = json!({"cols": cols, "rows": rows});
     }
     params
+}
+
+/// The `terminal.attach` params. A normal viewer sends no observer fields at
+/// all; an observer asks for `observe` and, when the core advertises it,
+/// `resize_notifications`.
+fn attach_params(
+    terminal: &str,
+    cols: u16,
+    rows: u16,
+    history: usize,
+    observe: bool,
+    resize_notifications: bool,
+) -> Value {
+    let mut params = json!({
+        "terminal": terminal,
+        "cols": cols,
+        "rows": rows,
+        "history": history,
+    });
+    if observe {
+        params["observe"] = json!(true);
+        if resize_notifications {
+            params["resize_notifications"] = json!(true);
+        }
+    }
+    params
+}
+
+/// Whether already-arrived frames contain the end of the stream. A RESIZE is
+/// stream content, not an ending: treating it as one would drop the live
+/// route and lose everything after it.
+fn early_ended(early: &[StreamItem]) -> bool {
+    early
+        .iter()
+        .any(|item| matches!(item, StreamItem::Closed(_)))
 }
 
 /// One framed connection to core.
@@ -299,9 +341,7 @@ impl CoreClient {
                 return Err(Error::Closed);
             }
             let early = routes.early.remove(&channel).unwrap_or_default();
-            let ended = early
-                .iter()
-                .any(|item| !matches!(item, StreamItem::Data(_)));
+            let ended = early_ended(&early);
             let mut credits = 0usize;
             if ended {
                 // Core closed the channel before we registered it. Deliver
@@ -375,16 +415,56 @@ impl CoreClient {
 
     /// Opens a raw stream to a live terminal at the given size, asking for up
     /// to `history` lines above the screen so local scrollback also covers
-    /// output the program produced before this client attached.
+    /// output the program produced before this client attached. A normal
+    /// viewer: it may type and its size is the one the program uses.
     pub fn attach(&self, terminal: &str, cols: u16, rows: u16, history: usize) -> Result<Attached> {
+        self.attach_with(terminal, cols, rows, history, false)
+    }
+
+    /// Attaches as an observer: it never types or resizes, so it cannot steal
+    /// the size from the viewer the person is using.
+    ///
+    /// When core advertises `resize_notifications`, the attach asks for them
+    /// and requires the reply to confirm; a confirmed observer applies each
+    /// RESIZE before the DATA that follows it. Without the feature there is no
+    /// safe observer path, so this fails instead of attaching as a normal
+    /// viewer.
+    pub fn attach_observer(
+        &self,
+        terminal: &str,
+        cols: u16,
+        rows: u16,
+        history: usize,
+    ) -> Result<Attached> {
+        if !self.hello.supports(RESIZE_NOTIFICATIONS) {
+            return Err(Error::Protocol(format!(
+                "this core does not advertise {RESIZE_NOTIFICATIONS}; observer attach is unavailable"
+            )));
+        }
+        let attached = self.attach_with(terminal, cols, rows, history, true)?;
+        if !attached.resize_notifications {
+            // Core accepted the stream but cannot promise the ordering the
+            // observer relies on. Leave no route, early frames or open channel
+            // behind, then fail clearly.
+            self.abandon(attached.channel);
+            return Err(Error::Protocol(
+                "core did not confirm resize notifications for the observer attach".into(),
+            ));
+        }
+        Ok(attached)
+    }
+
+    fn attach_with(
+        &self,
+        terminal: &str,
+        cols: u16,
+        rows: u16,
+        history: usize,
+        observe: bool,
+    ) -> Result<Attached> {
         let value = self.call(
             "terminal.attach",
-            json!({
-                "terminal": terminal,
-                "cols": cols,
-                "rows": rows,
-                "history": history,
-            }),
+            attach_params(terminal, cols, rows, history, observe, observe),
         )?;
         let result: AttachResult = serde_json::from_value(value)?;
         let (tx, rx) = mpsc::channel();
@@ -397,9 +477,7 @@ impl CoreClient {
             // reply and this registration; the 256 KiB start window bounds
             // them. Deliver them in order under the same lock the reader uses.
             let early = routes.early.remove(&result.channel).unwrap_or_default();
-            let ended = early
-                .iter()
-                .any(|item| !matches!(item, StreamItem::Data(_)));
+            let ended = early_ended(&early);
             if !ended {
                 routes.streams.insert(result.channel, tx.clone());
             }
@@ -411,7 +489,20 @@ impl CoreClient {
             channel: result.channel,
             terminal: result.terminal,
             stream: rx,
+            resize_notifications: observe && result.resize_notifications,
         })
+    }
+
+    /// Forgets a channel this client is not going to use, so late frames are
+    /// dropped and core sees the stream closed.
+    fn abandon(&self, channel: u32) {
+        {
+            let mut routes = lock(&self.routes);
+            routes.streams.remove(&channel);
+            routes.early.remove(&channel);
+            routes.retired.insert(channel);
+        }
+        let _ = self.write(Frame::close(channel, None));
     }
 
     /// Reads a versioned opaque document. An absent document is
@@ -613,7 +704,14 @@ fn read_loop(mut stdout: ChildStdout, routes: Arc<Mutex<Routes>>, writer: Arc<Mu
                 decoder.push(&buf[..n]);
                 loop {
                     match decoder.next_frame() {
-                        Ok(Some(frame)) => dispatch(&routes, &writer, frame),
+                        Ok(Some(frame)) => {
+                            if dispatch(&routes, &writer, frame).is_err() {
+                                // A malformed stream frame corrupts the
+                                // framing itself; the connection is over.
+                                routes_closed(routes);
+                                return;
+                            }
+                        }
                         Ok(None) => break,
                         Err(_) => {
                             // A stream that cannot be framed is over.
@@ -630,14 +728,18 @@ fn read_loop(mut stdout: ChildStdout, routes: Arc<Mutex<Routes>>, writer: Arc<Mu
     routes_closed(routes);
 }
 
-fn dispatch(routes: &Arc<Mutex<Routes>>, writer: &Arc<Mutex<ChildStdin>>, frame: Frame) {
+fn dispatch(
+    routes: &Arc<Mutex<Routes>>,
+    writer: &Arc<Mutex<ChildStdin>>,
+    frame: Frame,
+) -> std::result::Result<(), FrameError> {
     if frame.channel == 0 {
         if frame.kind == super::frames::DATA
             && let Ok(message) = serde_json::from_slice::<Value>(&frame.payload)
         {
             dispatch_message(routes, message);
         }
-        return;
+        return Ok(());
     }
 
     let mut credit = 0usize;
@@ -645,7 +747,7 @@ fn dispatch(routes: &Arc<Mutex<Routes>>, writer: &Arc<Mutex<ChildStdin>>, frame:
     {
         let mut routes = lock(routes);
         if routes.closed || routes.retired.contains(&frame.channel) {
-            return;
+            return Ok(());
         }
         let events_channel = routes.events.as_ref().map(|route| route.channel);
         if events_channel == Some(frame.channel) {
@@ -661,36 +763,8 @@ fn dispatch(routes: &Arc<Mutex<Routes>>, writer: &Arc<Mutex<ChildStdin>>, frame:
                 }
                 _ => {}
             }
-        } else if let Some(tx) = routes.streams.get(&frame.channel).cloned() {
-            match frame.kind {
-                super::frames::DATA => {
-                    let _ = tx.send(StreamItem::Data(frame.payload));
-                }
-                super::frames::CLOSE => {
-                    routes.streams.remove(&frame.channel);
-                    routes.retired.insert(frame.channel);
-                    let _ = tx.send(StreamItem::Closed(close_reason(&frame.payload)));
-                }
-                _ => {}
-            }
         } else {
-            // The reply for this channel has not been registered yet.
-            match frame.kind {
-                super::frames::DATA => routes
-                    .early
-                    .entry(frame.channel)
-                    .or_default()
-                    .push(StreamItem::Data(frame.payload)),
-                super::frames::CLOSE => {
-                    routes.retired.insert(frame.channel);
-                    routes
-                        .early
-                        .entry(frame.channel)
-                        .or_default()
-                        .push(StreamItem::Closed(close_reason(&frame.payload)));
-                }
-                _ => {}
-            }
+            route_attach_frame(&mut routes, &frame)?;
         }
     }
     if let Some((tx, values)) = notifications {
@@ -704,6 +778,56 @@ fn dispatch(routes: &Arc<Mutex<Routes>>, writer: &Arc<Mutex<ChildStdin>>, frame:
         // The reader has consumed these bytes; give core room for more.
         let _ = write_frame(writer, Frame::credit(frame.channel, credit));
     }
+    Ok(())
+}
+
+/// Routes one attach-channel frame to its live stream, or to the early queue
+/// while the attach reply is still being handled. RESIZE is content, not an
+/// ending, and carries no credit.
+fn route_attach_frame(routes: &mut Routes, frame: &Frame) -> std::result::Result<(), FrameError> {
+    if let Some(tx) = routes.streams.get(&frame.channel).cloned() {
+        match frame.kind {
+            super::frames::DATA => {
+                let _ = tx.send(StreamItem::Data(frame.payload.clone()));
+            }
+            super::frames::RESIZE => {
+                let (cols, rows) = parse_resize(&frame.payload)?;
+                let _ = tx.send(StreamItem::Resize { cols, rows });
+            }
+            super::frames::CLOSE => {
+                routes.streams.remove(&frame.channel);
+                routes.retired.insert(frame.channel);
+                let _ = tx.send(StreamItem::Closed(close_reason(&frame.payload)));
+            }
+            _ => {}
+        }
+    } else {
+        match frame.kind {
+            super::frames::DATA => routes
+                .early
+                .entry(frame.channel)
+                .or_default()
+                .push(StreamItem::Data(frame.payload.clone())),
+            super::frames::RESIZE => {
+                let (cols, rows) = parse_resize(&frame.payload)?;
+                routes
+                    .early
+                    .entry(frame.channel)
+                    .or_default()
+                    .push(StreamItem::Resize { cols, rows });
+            }
+            super::frames::CLOSE => {
+                routes.retired.insert(frame.channel);
+                routes
+                    .early
+                    .entry(frame.channel)
+                    .or_default()
+                    .push(StreamItem::Closed(close_reason(&frame.payload)));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn dispatch_message(routes: &Arc<Mutex<Routes>>, message: Value) {
@@ -790,5 +914,93 @@ mod tests {
             run_params(&options)["size"],
             json!({"cols": 78, "rows": 20})
         );
+    }
+
+    #[test]
+    fn a_normal_attach_sends_no_observer_fields() {
+        let normal = attach_params("t7", 80, 24, 200, false, false);
+        assert_eq!(
+            normal,
+            json!({"terminal": "t7", "cols": 80, "rows": 24, "history": 200}),
+            "normal attach params are unchanged, byte for byte"
+        );
+
+        let observer = attach_params("t7", 80, 24, 0, true, true);
+        assert_eq!(observer["observe"], json!(true));
+        assert_eq!(observer["resize_notifications"], json!(true));
+    }
+
+    #[test]
+    fn a_resize_is_stream_content_that_never_looks_like_an_ending() {
+        let mut routes = Routes::default();
+        let (tx, rx) = mpsc::channel();
+        routes.streams.insert(7, tx);
+
+        route_attach_frame(&mut routes, &Frame::resize(7, 120, 40)).expect("valid resize");
+        assert_eq!(
+            rx.try_recv().expect("resize item"),
+            StreamItem::Resize {
+                cols: 120,
+                rows: 40
+            }
+        );
+        assert!(!routes.retired.contains(&7), "the stream is still live");
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        // The same frame before registration is queued, not treated as CLOSE.
+        let mut early_routes = Routes::default();
+        route_attach_frame(&mut early_routes, &Frame::resize(9, 20, 5)).expect("valid resize");
+        let early = early_routes.early.get(&9).expect("early queue");
+        assert!(matches!(
+            early.as_slice(),
+            [StreamItem::Resize { cols: 20, rows: 5 }]
+        ));
+        assert!(!early_ended(early));
+        assert!(!early_routes.retired.contains(&9));
+    }
+
+    #[test]
+    fn a_malformed_resize_is_a_frame_error_and_does_not_panic() {
+        let mut routes = Routes::default();
+        let (tx, _rx) = mpsc::channel();
+        routes.streams.insert(7, tx);
+        for payload in [Vec::new(), vec![1], vec![1, 2, 3], vec![0; 5]] {
+            let frame = Frame {
+                channel: 7,
+                kind: super::super::frames::RESIZE,
+                payload: payload.clone(),
+            };
+            assert_eq!(
+                route_attach_frame(&mut routes, &frame),
+                Err(FrameError::BadResize { len: payload.len() })
+            );
+        }
+
+        // An early malformed frame is refused the same way.
+        let mut early_routes = Routes::default();
+        let frame = Frame {
+            channel: 9,
+            kind: super::super::frames::RESIZE,
+            payload: vec![1, 2],
+        };
+        assert_eq!(
+            route_attach_frame(&mut early_routes, &frame),
+            Err(FrameError::BadResize { len: 2 })
+        );
+        assert!(early_routes.early.get(&9).is_none_or(Vec::is_empty));
+    }
+
+    #[test]
+    fn only_a_close_ends_the_early_frames() {
+        assert!(!early_ended(&[]));
+        assert!(!early_ended(&[StreamItem::Data(b"paint".to_vec())]));
+        assert!(!early_ended(&[
+            StreamItem::Resize { cols: 80, rows: 24 },
+            StreamItem::Data(b"paint".to_vec()),
+        ]));
+        assert!(early_ended(&[
+            StreamItem::Resize { cols: 80, rows: 24 },
+            StreamItem::Closed(None),
+        ]));
     }
 }

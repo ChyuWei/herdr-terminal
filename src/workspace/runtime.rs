@@ -96,6 +96,9 @@ struct Link {
     stream: Option<std::sync::mpsc::Receiver<StreamItem>>,
     vt: Vt,
     vt_size: (u16, u16),
+    /// This stream is an observer's: core sends it RESIZE, and the client
+    /// must not send keys, RESIZE, FOCUS or FACTS back.
+    observed: bool,
     /// When to try `terminal.attach` again; `None` when not waiting.
     retry_at: Option<Instant>,
     /// Core said the program finished; the CLOSE reason is still to come.
@@ -391,6 +394,12 @@ impl<'a> Screen<'a> {
         let mut lost = false;
         let mut fatal = None;
         for (pane, link) in &mut self.links {
+            if link.observed {
+                // An observer's colors come from the viewer that owns the
+                // size; sending FACTS would take display ownership.
+                link.needs_facts = false;
+                continue;
+            }
             if !link.needs_facts || lost {
                 continue;
             }

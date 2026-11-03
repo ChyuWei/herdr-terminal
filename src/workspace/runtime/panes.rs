@@ -22,6 +22,11 @@ impl Screen<'_> {
             let Some(link) = self.links.get_mut(pane) else {
                 continue;
             };
+            if link.observed {
+                // An observer follows the grid core sends and never sizes the
+                // program; its recorded vt_size is that grid already.
+                continue;
+            }
             if link.vt_size == size {
                 continue;
             }
@@ -124,9 +129,11 @@ impl Screen<'_> {
         };
 
         let vt = Vt::new_with_scrollback(cols, rows, self.config.scrollback).map_err(vt_error)?;
+        let observed = attached.resize_notifications;
         if let Some(link) = self.links.get_mut(&pane) {
             link.vt = vt;
             link.vt_size = (cols, rows);
+            link.observed = observed;
             link.stream = Some(attached.stream);
             link.retry_at = None;
             link.finished = false;
@@ -150,6 +157,7 @@ impl Screen<'_> {
                 stream: None,
                 vt,
                 vt_size: (cols, rows),
+                observed: false,
                 retry_at: Some(Instant::now()),
                 finished: false,
                 finalized: false,
@@ -171,6 +179,10 @@ impl Screen<'_> {
         let client = self.client.clone();
         let mut updates = Vec::new();
         for (pane, link) in &mut self.links {
+            if link.observed {
+                link.focus_sent = None;
+                continue;
+            }
             if link.stream.is_none() {
                 link.focus_sent = None;
                 continue;

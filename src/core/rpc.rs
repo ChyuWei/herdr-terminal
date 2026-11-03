@@ -19,6 +19,8 @@ pub const REQUIRED_METHODS: &[&str] = &[
 ];
 /// Features this client needs, as `hello` reports them.
 pub const REQUIRED_FEATURES: &[&str] = &["framed", "attach", "events"];
+/// The optional feature that lets an observer receive RESIZE before paints.
+pub const RESIZE_NOTIFICATIONS: &str = "resize_notifications";
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct CoreInfo {
@@ -46,6 +48,12 @@ pub struct Hello {
 }
 
 impl Hello {
+    /// Whether this core advertises a feature. Optional capabilities are
+    /// gated on the reply, never on a version number.
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.iter().any(|have| have == feature)
+    }
+
     /// Whether this core can serve this client. Feature-gate on the reply;
     /// protocol generation 1 only grows.
     pub fn check(&self) -> Result<(), Mismatch> {
@@ -68,7 +76,7 @@ impl Hello {
         }
         let missing: Vec<String> = REQUIRED_FEATURES
             .iter()
-            .filter(|feature| !self.features.iter().any(|have| have == *feature))
+            .filter(|feature| !self.supports(feature))
             .map(|feature| (*feature).to_owned())
             .collect();
         if !missing.is_empty() {
@@ -282,6 +290,10 @@ pub struct AttachResult {
     pub channel: u32,
     #[serde(default)]
     pub terminal: Terminal,
+    /// True only when an observer asked for resize notifications and the
+    /// whole path confirmed them. Absent or false means track `size` events.
+    #[serde(default)]
+    pub resize_notifications: bool,
 }
 
 /// `terminal.read`'s reply: the screen text (or history above it).
@@ -331,6 +343,35 @@ mod tests {
 
     fn full() -> Hello {
         hello(GENERATION, true, REQUIRED_METHODS, REQUIRED_FEATURES)
+    }
+
+    #[test]
+    fn optional_features_are_read_from_hello_not_from_a_version() {
+        let bare = full();
+        assert!(bare.supports("framed"));
+        assert!(!bare.supports(RESIZE_NOTIFICATIONS));
+
+        let supporting = hello(
+            GENERATION,
+            true,
+            REQUIRED_METHODS,
+            &["framed", "attach", "events", RESIZE_NOTIFICATIONS],
+        );
+        assert!(supporting.supports(RESIZE_NOTIFICATIONS));
+        assert_eq!(supporting.check(), Ok(()));
+    }
+
+    #[test]
+    fn an_attach_reply_confirms_resize_notifications_only_when_it_says_so() {
+        let bare: AttachResult =
+            serde_json::from_value(serde_json::json!({"channel": 7})).expect("reply");
+        assert!(!bare.resize_notifications);
+        let confirmed: AttachResult = serde_json::from_value(serde_json::json!({
+            "channel": 7,
+            "resize_notifications": true,
+        }))
+        .expect("reply");
+        assert!(confirmed.resize_notifications);
     }
 
     #[test]

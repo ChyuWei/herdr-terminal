@@ -296,6 +296,10 @@ impl Screen<'_> {
             let Some(link) = self.links.get_mut(&pane) else {
                 return Ok(());
             };
+            if link.observed {
+                // An observer never types: mouse reports are input too.
+                return Ok(());
+            }
             if !link.vt.mouse_tracking() {
                 return Ok(());
             }

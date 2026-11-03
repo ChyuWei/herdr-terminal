@@ -111,6 +111,9 @@ pub(super) struct Screen<'a> {
     finished: Option<Terminal>,
     /// A `removed` event (or a `not_found` attach) named this terminal.
     removed: bool,
+    /// This stream is an observer's: core sends it RESIZE, and it must send
+    /// no keys, RESIZE, FOCUS or FACTS back.
+    observed: bool,
 }
 
 impl<'a> Screen<'a> {
@@ -152,6 +155,7 @@ impl<'a> Screen<'a> {
             message: None,
             finished: None,
             removed: false,
+            observed: false,
         })
     }
 
@@ -185,6 +189,7 @@ impl<'a> Screen<'a> {
 
     fn attached(&mut self, attached: Attached) -> Result<Flow> {
         let channel = attached.channel;
+        self.observed = attached.resize_notifications;
         // A new attach gets a fresh VT: core's first paint is the whole truth
         // for the new stream, and stale cells from the old one must not leak.
         self.vt = Vt::new(self.cols, self.rows).map_err(super::vt_error)?;
@@ -223,6 +228,20 @@ impl<'a> Screen<'a> {
                             || drain_start.elapsed() >= DRAIN_TIME
                         {
                             break;
+                        }
+                    }
+                    Ok(StreamItem::Resize { cols, rows }) => {
+                        // Core sends this only to a confirmed observer, before
+                        // the paint that uses the grid. Applying it here means
+                        // the following DATA is already laid out for the new
+                        // size; it is not terminal data and costs no credit.
+                        if cols > 0 && rows > 0 {
+                            self.vt.resize(cols, rows).map_err(super::vt_error)?;
+                            self.cols = cols;
+                            self.rows = rows;
+                            self.observed = true;
+                            had_data = true;
+                            self.dirty = true;
                         }
                     }
                     Ok(StreamItem::Closed(reason)) => {
@@ -305,7 +324,8 @@ impl<'a> Screen<'a> {
                             return Ok(Flow::Done(Outcome::Quit));
                         }
                         let bytes = self.vt.encode_key(&key);
-                        if !bytes.is_empty()
+                        if !self.observed
+                            && !bytes.is_empty()
                             && let Err(error) = self.client.keys(channel, &bytes)
                         {
                             if session::is_lost(&error) {
@@ -320,7 +340,8 @@ impl<'a> Screen<'a> {
                     }
                     Event::Mouse(mouse) => {
                         let bytes = self.vt.encode_mouse(&mouse);
-                        if !bytes.is_empty()
+                        if !self.observed
+                            && !bytes.is_empty()
                             && let Err(error) = self.client.keys(channel, &bytes)
                         {
                             if session::is_lost(&error) {
@@ -333,15 +354,15 @@ impl<'a> Screen<'a> {
                             return Err(error);
                         }
                     }
-                    Event::Resize(cols, rows) if cols > 0 && rows > 0 => {
+                    Event::Resize(cols, rows) if cols > 0 && rows > 0 && !self.observed => {
                         self.vt.resize(cols, rows).map_err(super::vt_error)?;
                         self.cols = cols;
                         self.rows = rows;
                         self.client.resize(channel, cols, rows)?;
                         self.dirty = true;
                     }
-                    Event::FocusGained => self.client.focus(channel, true)?,
-                    Event::FocusLost => self.client.focus(channel, false)?,
+                    Event::FocusGained if !self.observed => self.client.focus(channel, true)?,
+                    Event::FocusLost if !self.observed => self.client.focus(channel, false)?,
                     _ => {}
                 }
             }
@@ -721,7 +742,10 @@ impl<'a> Screen<'a> {
             execute!(stdout(), shape).map_err(Error::Io)?;
             self.last_cursor_style = Some(shape);
         }
-        if send_facts && let Some(channel) = self.session.channel() {
+        if send_facts
+            && !self.observed
+            && let Some(channel) = self.session.channel()
+        {
             let facts = super::display(&screen);
             if self.last_facts.as_ref() != Some(&facts) {
                 self.client.facts(channel, &facts)?;

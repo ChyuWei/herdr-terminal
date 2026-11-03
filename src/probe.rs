@@ -170,6 +170,10 @@ fn play(
                 write_output(stdout, &bytes)?;
                 started.client().credit(channel, bytes.len())?;
             }
+            Ok(StreamItem::Resize { .. }) => {
+                // Only a confirmed observer receives this; the probe is a
+                // normal viewer and follows its own terminal size.
+            }
             Ok(StreamItem::Closed(reason)) => return Ok(Exit::Program(reason)),
             Ok(StreamItem::Lost) | Err(RecvTimeoutError::Disconnected) => {
                 started.lost();

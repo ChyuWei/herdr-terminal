@@ -220,6 +220,9 @@ impl Screen<'_> {
                 return Ok(());
             };
             self.links.get_mut(&pane).and_then(|link| {
+                if link.observed {
+                    return None;
+                }
                 let bytes = link.vt.encode_key(key);
                 link.session.channel().map(|channel| (channel, bytes))
             })
@@ -248,6 +251,7 @@ impl Screen<'_> {
         let Some(channel) = self
             .links
             .get(&pane)
+            .filter(|link| !link.observed)
             .and_then(|link| link.session.channel())
         else {
             return Ok(());

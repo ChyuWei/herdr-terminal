@@ -25,6 +25,8 @@ use std::process::{Command, Stdio};
 mod common;
 
 use common::{Capture, HT, Probe, secs};
+#[cfg(unix)]
+use herdr_terminal::core::{Attached, CoreClient, Error, StreamItem};
 
 const DATA: u8 = 0;
 const CLOSE: u8 = 2;
@@ -191,6 +193,24 @@ fn run_tests() {
     workspace_config_sets_theme_and_keys_and_malformed_config_warns();
     #[cfg(unix)]
     workspace_processes_a_large_output_burst();
+    #[cfg(unix)]
+    observer_attach_negotiates_resize_notifications_and_applies_them_in_order();
+    #[cfg(unix)]
+    observer_attach_is_unavailable_without_the_feature_and_normal_attach_is_unchanged();
+    #[cfg(unix)]
+    observer_attach_requires_a_confirmed_reply_and_leaves_no_channel();
+    #[cfg(unix)]
+    a_malformed_resize_ends_the_connection_without_a_panic();
+    #[cfg(unix)]
+    screen_applies_a_resize_before_its_data_and_sends_none_back();
+    #[cfg(unix)]
+    workspace_applies_a_resize_before_its_data_and_sends_none_back();
+    #[cfg(unix)]
+    an_early_resize_before_the_reply_keeps_the_live_route();
+    #[cfg(unix)]
+    a_screen_observer_sends_no_input_and_no_echo();
+    #[cfg(unix)]
+    a_workspace_observer_sends_no_keyboard_or_mouse_input();
     println!("fake-core tests passed");
 }
 
@@ -4490,6 +4510,511 @@ fn workspace_processes_a_large_output_burst() {
     );
 }
 
+// --- observer attach -------------------------------------------------------
+
+/// A client connected straight to the scripted core, without `ht` in the way.
+/// The wrapper is a small shell script so the scenario reaches the child
+/// `hc connect` without touching this process's environment.
+#[cfg(unix)]
+fn observer_client(scratch: &Scratch, scenario: &str) -> CoreClient {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::current_exe().expect("test executable");
+    let wrapper = scratch.dir.join("hc");
+    let script = format!(
+        "#!/bin/sh\nFAKE_SCENARIO='{scenario}'\nFAKE_LOG='{}'\nexport FAKE_SCENARIO FAKE_LOG\nexec '{}' \"$@\"\n",
+        scratch.log().display(),
+        exe.display()
+    );
+    std::fs::write(&wrapper, script).expect("write hc wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("make wrapper executable");
+    CoreClient::connect(Some(&wrapper)).expect("connect to the scripted core")
+}
+
+#[cfg(unix)]
+fn next_item(attached: &Attached) -> StreamItem {
+    attached
+        .stream
+        .recv_timeout(secs(10))
+        .expect("an attach stream item")
+}
+
+/// The fake core's JSON log, one record per line. A line still being written
+/// by the child is skipped; wait conditions decide when enough has arrived.
+#[cfg(unix)]
+fn log_records(scratch: &Scratch) -> Vec<Value> {
+    std::fs::read_to_string(scratch.log())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+#[cfg(unix)]
+fn logged_frames(scratch: &Scratch) -> Vec<Value> {
+    log_records(scratch)
+        .into_iter()
+        .filter_map(|record| record.get("frame").cloned())
+        .collect()
+}
+
+#[cfg(unix)]
+fn logged_credits(scratch: &Scratch) -> Vec<u64> {
+    logged_frames(scratch)
+        .iter()
+        .filter(|frame| frame["kind"] == json!(1))
+        .filter_map(|frame| frame["credit"].as_u64())
+        .collect()
+}
+
+/// The channel the fake core handed out for the first attach.
+#[cfg(unix)]
+fn attach_channel(scratch: &Scratch) -> u64 {
+    log_records(scratch)
+        .iter()
+        .find_map(|record| record["attached"].as_u64())
+        .expect("the fake core logged an attach")
+}
+
+/// A confirmed observer receives RESIZE before each paint; the grid is
+/// applied before the bytes it describes, and only DATA is credited.
+#[cfg(unix)]
+fn observer_attach_negotiates_resize_notifications_and_applies_them_in_order() {
+    let scratch = Scratch::new("observe-new");
+    let client = observer_client(&scratch, "observe-new");
+    let attached = client
+        .attach_observer("t1", 90, 30, 0)
+        .expect("observer attach is supported");
+    assert!(
+        attached.resize_notifications,
+        "the reply confirmed resize notifications"
+    );
+
+    let mut vt = herdr_terminal::vt::Vt::new(90, 30).expect("local VT");
+    let mut order = Vec::new();
+    loop {
+        match next_item(&attached) {
+            StreamItem::Resize { cols, rows } => {
+                vt.resize(cols, rows).expect("resize the local VT");
+                order.push(format!("resize {cols}x{rows}"));
+            }
+            StreamItem::Data(bytes) => {
+                vt.feed(&bytes);
+                client
+                    .credit(attached.channel, bytes.len())
+                    .expect("pay credit for data only");
+                order.push(format!("data {}", bytes.len()));
+            }
+            StreamItem::Closed(_) => break,
+            StreamItem::Lost => panic!("the stream was lost"),
+        }
+    }
+    assert_eq!(
+        order,
+        ["resize 40x12", "data 32", "resize 20x6", "data 20"],
+        "each RESIZE precedes the paint it describes"
+    );
+    let screen = vt.snapshot().expect("snapshot");
+    assert_eq!(
+        (screen.cols, screen.rows),
+        (20, 6),
+        "the VT ends at the new grid"
+    );
+    assert!(
+        screen.lines().join("\n").contains("BBBB"),
+        "the second paint was laid out for the new grid: {:?}",
+        screen.lines()
+    );
+
+    // The attach asked as an observer and the connection sent nothing back
+    // except DATA credit: no keys, RESIZE, FOCUS or FACTS.
+    let records = log_records(&scratch);
+    let attach = records
+        .iter()
+        .find(|record| record["call"] == "terminal.attach")
+        .expect("terminal.attach was called");
+    assert_eq!(attach["params"]["observe"], json!(true));
+    assert_eq!(attach["params"]["resize_notifications"], json!(true));
+    assert!(
+        common::wait_until(secs(5), || {
+            let credits = logged_credits(&scratch);
+            credits.contains(&32) && credits.contains(&20)
+        }),
+        "the client credited both DATA frames"
+    );
+    let frames = logged_frames(&scratch);
+    let channel = json!(attached.channel);
+    for kind in [0, 3, 4, 5] {
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame["channel"] == channel && frame["kind"] == json!(kind)),
+            "an observer sent frame kind {kind} on its stream: {frames:?}"
+        );
+    }
+    let mut credits = logged_credits(&scratch);
+    credits.sort_unstable();
+    assert_eq!(
+        credits,
+        [20, 32],
+        "RESIZE pays no credit; only the two DATA frames do"
+    );
+}
+
+/// Without the feature there is no observer path, and a normal attach still
+/// carries no observer fields.
+#[cfg(unix)]
+fn observer_attach_is_unavailable_without_the_feature_and_normal_attach_is_unchanged() {
+    let scratch = Scratch::new("observe-missing");
+    let client = observer_client(&scratch, "observe-missing");
+    assert!(!client.hello().supports("resize_notifications"));
+    let Err(error) = client.attach_observer("t1", 80, 24, 0) else {
+        panic!("an observer attach needs the feature");
+    };
+    assert!(
+        matches!(error, Error::Protocol(_)),
+        "clear protocol error, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("resize_notifications"),
+        "the error names the missing feature: {error}"
+    );
+    assert!(
+        !log_records(&scratch)
+            .iter()
+            .any(|record| record["call"] == "terminal.attach"),
+        "the client must not attach as a normal viewer instead"
+    );
+
+    let attached = client
+        .attach("t1", 80, 24, 0)
+        .expect("a normal attach still works");
+    assert!(!attached.resize_notifications);
+    assert!(
+        matches!(next_item(&attached), StreamItem::Data(bytes) if bytes.as_slice() == b"NORMAL\n")
+    );
+    assert!(matches!(next_item(&attached), StreamItem::Closed(_)));
+
+    let records = log_records(&scratch);
+    let attach = records
+        .iter()
+        .find(|record| record["call"] == "terminal.attach")
+        .expect("terminal.attach was called");
+    let params = attach["params"].as_object().expect("params");
+    assert!(
+        !params.contains_key("observe"),
+        "normal attach params are unchanged: {params:?}"
+    );
+    assert!(
+        !params.contains_key("resize_notifications"),
+        "normal attach params are unchanged: {params:?}"
+    );
+}
+
+/// A reply that does not confirm the ordering is refused, and the channel is
+/// closed instead of being left registered.
+#[cfg(unix)]
+fn observer_attach_requires_a_confirmed_reply_and_leaves_no_channel() {
+    let scratch = Scratch::new("observe-unconfirmed");
+    let client = observer_client(&scratch, "observe-unconfirmed");
+    let Err(error) = client.attach_observer("t1", 80, 24, 0) else {
+        panic!("an unconfirmed reply cannot be used");
+    };
+    assert!(
+        matches!(error, Error::Protocol(_)),
+        "clear protocol error, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("confirm"),
+        "the error says the reply did not confirm: {error}"
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            logged_frames(&scratch)
+                .iter()
+                .any(|frame| frame["kind"] == json!(2))
+        }),
+        "the abandoned channel was closed"
+    );
+    // The connection is still usable and nothing was registered for it.
+    assert!(
+        client.get("t1").is_ok(),
+        "the connection survived abandoning the channel"
+    );
+}
+
+/// A RESIZE that is not four bytes is a protocol error: the connection ends
+/// and the stream reports Lost, without a panic.
+#[cfg(unix)]
+fn a_malformed_resize_ends_the_connection_without_a_panic() {
+    let scratch = Scratch::new("observe-bad-resize");
+    let client = observer_client(&scratch, "observe-bad-resize");
+    let attached = client
+        .attach_observer("t1", 80, 24, 0)
+        .expect("the attach reply confirmed");
+    assert!(
+        matches!(next_item(&attached), StreamItem::Data(bytes) if bytes.as_slice() == b"READY\n")
+    );
+    client
+        .credit(attached.channel, 6)
+        .expect("credit the paint; this asks for the malformed frame");
+    match next_item(&attached) {
+        StreamItem::Lost => {}
+        other => panic!("expected the stream to end as lost, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            client.call("terminal.get", json!({"terminal": "t1"})),
+            Err(Error::Closed)
+        ),
+        "a malformed frame ends the connection"
+    );
+}
+
+/// A RESIZE on an attach stream is applied before the DATA after it: 30
+/// cells wrap at 20, and the client never echoes the frame or credits it.
+#[cfg(unix)]
+fn screen_applies_a_resize_before_its_data_and_sends_none_back() {
+    let scratch = Scratch::new("screen-resize-frames");
+    let screen = FakeScreen::spawn(
+        &scratch,
+        "screen-resize-frames",
+        &["--", "sh", "-c", "sleep 30"],
+    );
+    assert!(
+        screen.wait_text("AFTER", secs(10)),
+        "the paint arrived; log={:?}",
+        log_records(&scratch)
+    );
+    let rendered = screen.rendered();
+    assert!(
+        rendered.contains("xxxxxxxxxxxxxxxxxxxx\nxxxxxxxxxx\nAFTER"),
+        "the data was laid out for the RESIZE grid, not the outer one: {rendered:?}"
+    );
+    assert!(
+        common::wait_until(secs(5), || logged_credits(&scratch).contains(&38)),
+        "the screen credited the DATA bytes"
+    );
+    let frames = logged_frames(&scratch);
+    assert!(
+        !frames.iter().any(|frame| frame["kind"] == json!(3)),
+        "the screen echoed a RESIZE: {frames:?}"
+    );
+    assert!(
+        !logged_credits(&scratch).contains(&4),
+        "the RESIZE was credited: {:?}",
+        logged_credits(&scratch)
+    );
+}
+
+/// The workspace's pane drain applies a RESIZE to its pane VT before the
+/// following DATA, without sending RESIZE or credit for it.
+#[cfg(unix)]
+fn workspace_applies_a_resize_before_its_data_and_sends_none_back() {
+    let scratch = Scratch::new("workspace-resize-frames");
+    let workspace = FakeScreen::spawn_workspace(&scratch, "workspace-resize-frames");
+    assert!(
+        workspace.wait_text("AFTER", secs(10)),
+        "the pane painted; log={:?}",
+        log_records(&scratch)
+    );
+    let rendered = workspace.rendered();
+    let lines: Vec<&str> = rendered.lines().collect();
+    let first = lines
+        .iter()
+        .position(|line| line.contains('x'))
+        .expect("the paint is visible");
+    assert_eq!(
+        lines[first].matches('x').count(),
+        20,
+        "the first row wraps at the RESIZE grid: {rendered:?}"
+    );
+    assert_eq!(
+        lines[first + 1].matches('x').count(),
+        10,
+        "the remainder is on the next row: {rendered:?}"
+    );
+    assert!(
+        lines[first + 2].contains("AFTER"),
+        "the data after the wrap is present: {rendered:?}"
+    );
+    assert!(
+        common::wait_until(secs(5), || logged_credits(&scratch).contains(&38)),
+        "the pane credited the DATA bytes"
+    );
+    let frames = logged_frames(&scratch);
+    assert!(
+        !frames.iter().any(|frame| frame["kind"] == json!(3)),
+        "the pane echoed a RESIZE: {frames:?}"
+    );
+    assert!(
+        !logged_credits(&scratch).contains(&4),
+        "the RESIZE was credited: {:?}",
+        logged_credits(&scratch)
+    );
+}
+
+/// A resize and its paint that arrive before the attach reply are queued in
+/// order; once registered, the live route keeps delivering. The later pair is
+/// sent only after the client credits the early paint, so a client that
+/// treated the early RESIZE as an ending would never see it.
+#[cfg(unix)]
+fn an_early_resize_before_the_reply_keeps_the_live_route() {
+    let scratch = Scratch::new("observe-early-frames");
+    let client = observer_client(&scratch, "observe-early-frames");
+    let attached = client
+        .attach_observer("t1", 90, 30, 0)
+        .expect("observer attach");
+    assert!(attached.resize_notifications);
+
+    let mut vt = herdr_terminal::vt::Vt::new(90, 30).expect("local VT");
+    let mut order = Vec::new();
+    loop {
+        match next_item(&attached) {
+            StreamItem::Resize { cols, rows } => {
+                vt.resize(cols, rows).expect("resize the local VT");
+                order.push(format!("resize {cols}x{rows}"));
+            }
+            StreamItem::Data(bytes) => {
+                vt.feed(&bytes);
+                client
+                    .credit(attached.channel, bytes.len())
+                    .expect("credit the paint");
+                order.push(format!("data {}", bytes.len()));
+            }
+            StreamItem::Closed(_) => break,
+            StreamItem::Lost => panic!("the early RESIZE ended the stream"),
+        }
+    }
+    assert_eq!(
+        order,
+        ["resize 40x12", "data 6", "resize 20x6", "data 5"],
+        "early items keep their order and the live route keeps delivering"
+    );
+    let screen = vt.snapshot().expect("snapshot");
+    assert_eq!((screen.cols, screen.rows), (20, 6));
+}
+
+/// Once a workspace pane is observed, neither keyboard nor mouse input reaches
+/// it; a purely local command still works afterwards, which proves the input
+/// was processed.
+#[cfg(unix)]
+fn a_workspace_observer_sends_no_keyboard_or_mouse_input() {
+    let scratch = Scratch::new("workspace-resize-mouse");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "workspace-resize-mouse");
+    assert!(
+        wait_for_text(&workspace, "MOUSE-READY"),
+        "the tracking program painted; log={:?}",
+        log_records(&scratch)
+    );
+    let rendered = workspace.rendered();
+    let lines: Vec<&str> = rendered.lines().collect();
+    let first = lines
+        .iter()
+        .position(|line| line.contains('x'))
+        .expect("the paint is visible");
+    assert_eq!(lines[first].matches('x').count(), 20, "{rendered:?}");
+    assert_eq!(lines[first + 1].matches('x').count(), 10, "{rendered:?}");
+    // The paint's credit proves the RESIZE was drained and the link is
+    // observed before the input below. Frames already logged are startup
+    // traffic, not a response to it.
+    assert!(
+        common::wait_until(secs(5), || logged_credits(&scratch).contains(&68)),
+        "the pane credited its paint: {:?}",
+        logged_credits(&scratch)
+    );
+    let marker = logged_frames(&scratch).len();
+
+    // Wheel, press, drag with the button held, and release over the pane.
+    workspace.send(wheel_up(10, 5).as_bytes());
+    workspace.send(sgr(0, false, 10, 5).as_bytes());
+    workspace.send(sgr(32, false, 14, 5).as_bytes());
+    workspace.send(sgr(0, true, 14, 5).as_bytes());
+    workspace.send(b"k");
+    // The help overlay is handled locally, so seeing it proves the input
+    // above went through the loop before this point.
+    workspace.command(b'?');
+    assert!(
+        wait_for_text(&workspace, "any key closes help"),
+        "the local help overlay did not open: {:?}",
+        workspace.rendered()
+    );
+
+    assert!(
+        program_input(&scratch).is_empty(),
+        "an observed pane received input: {:?}",
+        program_input(&scratch)
+    );
+    let channel = attach_channel(&scratch);
+    let frames = logged_frames(&scratch);
+    for kind in [0, 3, 4, 5] {
+        assert!(
+            !frames[marker..].iter().any(|frame| {
+                frame["channel"] == json!(channel) && frame["kind"] == json!(kind)
+            }),
+            "an observed pane sent frame kind {kind} after the input: {:?}",
+            &frames[marker..]
+        );
+    }
+}
+
+/// The single-pane screen is observed after its RESIZE; a key and a mouse
+/// event must not be sent, and nothing is echoed back. Ctrl-] still detaches.
+#[cfg(unix)]
+fn a_screen_observer_sends_no_input_and_no_echo() {
+    let scratch = Scratch::new("screen-resize-input");
+    let mut screen = FakeScreen::spawn(
+        &scratch,
+        "screen-resize-input",
+        &["--", "sh", "-c", "sleep 30"],
+    );
+    assert!(
+        screen.wait_text("AFTER", secs(10)),
+        "the paint arrived; log={:?}",
+        log_records(&scratch)
+    );
+    assert!(
+        screen
+            .rendered()
+            .contains("xxxxxxxxxxxxxxxxxxxx\nxxxxxxxxxx\nAFTER"),
+        "the RESIZE grid was applied: {:?}",
+        screen.rendered()
+    );
+    // The paint's credit proves the RESIZE was drained and the screen is
+    // observed before the input below.
+    assert!(
+        common::wait_until(secs(5), || logged_credits(&scratch).contains(&62)),
+        "the screen credited its paint: {:?}",
+        logged_credits(&scratch)
+    );
+    let marker = logged_frames(&scratch).len();
+
+    screen.send(b"k");
+    screen.send(click(10, 5).as_bytes());
+    screen.send(&[0x1d]);
+    let status = screen
+        .wait_exit(secs(10))
+        .expect("ht screen exits after Ctrl-]");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+
+    assert!(
+        program_input(&scratch).is_empty(),
+        "an observed screen received input: {:?}",
+        program_input(&scratch)
+    );
+    let channel = attach_channel(&scratch);
+    let frames = logged_frames(&scratch);
+    for kind in [0, 3, 4, 5] {
+        assert!(
+            !frames[marker..].iter().any(|frame| {
+                frame["channel"] == json!(channel) && frame["kind"] == json!(kind)
+            }),
+            "an observed screen sent frame kind {kind} after the input: {:?}",
+            &frames[marker..]
+        );
+    }
+}
+
 fn fake_connect() -> io::Result<()> {
     let scenario = std::env::var("FAKE_SCENARIO").unwrap_or_else(|_| "finished".into());
     let log_path = std::env::var_os("FAKE_LOG").map(PathBuf::from);
@@ -4518,6 +5043,11 @@ fn fake_connect() -> io::Result<()> {
     let hello: serde_json::Value =
         serde_json::from_str(line.trim()).map_err(|error| invalid(error.to_string()))?;
     assert_eq!(hello["method"], "hello");
+    let mut features = vec!["framed", "attach", "events"];
+    if scenario.starts_with("observe") && scenario != "observe-missing" {
+        // A relay path can lose support; an old core simply never had it.
+        features.push("resize_notifications");
+    }
     let result = json!({
         "generation": 1,
         "version": "9.9.9-fake",
@@ -4528,7 +5058,7 @@ fn fake_connect() -> io::Result<()> {
             "terminal.get", "terminal.read", "terminal.rm", "terminal.kill",
             "terminal.label", "doc.get", "doc.set"
         ],
-        "features": ["framed", "attach", "events"],
+        "features": features,
     });
     writeln!(
         output,
@@ -4568,6 +5098,12 @@ fn fake_connect() -> io::Result<()> {
     // three exhaust one loop's retry budget, the fourth lands on the detach
     // flush so its merge-and-retry path is what writes the local change.
     let mut flush_conflicts = 4u32;
+    // `observe-bad-resize`: the malformed frame waits for the client to pay
+    // credit for the paint, which proves the attach stream is registered.
+    let mut bad_resize_sent = false;
+    // `observe-early-frames`: the later pair is sent only after the client
+    // credits the early paint, which proves the live route was registered.
+    let mut late_frames_sent = false;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         let mut frame = json!({"channel": channel, "kind": kind, "len": payload.len()});
@@ -4577,12 +5113,47 @@ fn fake_connect() -> io::Result<()> {
             frame["cols"] = json!(u16::from_le_bytes([payload[0], payload[1]]));
             frame["rows"] = json!(u16::from_le_bytes([payload[2], payload[3]]));
         }
+        // CREDIT says how many stream bytes the client consumed, which is how
+        // a test can tell RESIZE (never credited) from DATA.
+        if kind == 1 && payload.len() == 4 {
+            frame["credit"] = json!(u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3]
+            ]));
+        }
         log(log_path, json!({"frame": frame}));
 
         // The client closing its stream: forget the channel, so a later
         // attach is treated as a fresh paint.
         if kind == CLOSE {
             attached_channels.remove(&channel);
+            continue;
+        }
+
+        if kind == 1
+            && scenario == "observe-bad-resize"
+            && attached_channels.contains(&channel)
+            && !bad_resize_sent
+        {
+            bad_resize_sent = true;
+            write_frame(&mut output, channel, 3, &[1, 2])?;
+            write_frame(&mut output, channel, DATA, b"AFTER-BAD\n")?;
+            continue;
+        }
+
+        if kind == 1
+            && scenario == "observe-early-frames"
+            && attached_channels.contains(&channel)
+            && !late_frames_sent
+        {
+            late_frames_sent = true;
+            write_frame(&mut output, channel, 3, &resize_payload(20, 6))?;
+            write_frame(&mut output, channel, DATA, b"LATE\n")?;
+            write_frame(
+                &mut output,
+                channel,
+                CLOSE,
+                br#"{"reason":"exited","exit_code":0}"#,
+            )?;
             continue;
         }
 
@@ -4869,12 +5440,105 @@ fn fake_connect() -> io::Result<()> {
                     } else {
                         live_record(4242)
                     };
+                    let observe = message["params"]["observe"].as_bool().unwrap_or(false);
+                    let asked = message["params"]["resize_notifications"]
+                        .as_bool()
+                        .unwrap_or(false);
+                    let confirmed = observe && asked && scenario != "observe-unconfirmed";
+                    if scenario == "observe-early-frames" {
+                        // These reach the client before the attach reply does:
+                        // the reader must queue them and keep the stream live.
+                        write_frame(&mut output, channel, 3, &resize_payload(40, 12))?;
+                        write_frame(&mut output, channel, DATA, b"EARLY\n")?;
+                    }
                     reply(
                         &mut output,
                         &id,
-                        json!({"channel": channel, "terminal": attached_record}),
+                        json!({
+                            "channel": channel,
+                            "terminal": attached_record,
+                            "resize_notifications": confirmed,
+                        }),
                     )?;
                     match scenario.as_str() {
+                        // The early pair already went out before the reply;
+                        // the live pair waits for credit in the frame loop.
+                        "observe-early-frames" => {}
+                        // A confirmed observer gets the grid before each
+                        // paint: the initial one, then a changed one whose
+                        // paint supersedes pending output.
+                        "observe-new" => {
+                            write_frame(&mut output, channel, 3, &resize_payload(40, 12))?;
+                            write_frame(
+                                &mut output,
+                                channel,
+                                DATA,
+                                b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                            )?;
+                            write_frame(&mut output, channel, 3, &resize_payload(20, 6))?;
+                            write_frame(&mut output, channel, DATA, b"BBBBBBBBBBBBBBBBBBBB")?;
+                            write_frame(
+                                &mut output,
+                                channel,
+                                CLOSE,
+                                br#"{"reason":"exited","exit_code":0}"#,
+                            )?;
+                        }
+                        // The reply neither confirms nor supports the
+                        // ordering, so the client must not use the stream.
+                        "observe-unconfirmed" => {
+                            write_frame(&mut output, channel, DATA, b"LEAK\n")?;
+                        }
+                        // A RESIZE that is not two u16s is a frame error. It
+                        // waits for credit on the paint so the attach is
+                        // registered before the frame arrives.
+                        "observe-bad-resize" => {
+                            write_frame(&mut output, channel, DATA, b"READY\n")?;
+                        }
+                        // A normal attach on a core without the feature.
+                        "observe-missing" => {
+                            write_frame(&mut output, channel, DATA, b"NORMAL\n")?;
+                            write_frame(
+                                &mut output,
+                                channel,
+                                CLOSE,
+                                br#"{"reason":"exited","exit_code":0}"#,
+                            )?;
+                        }
+                        // RESIZE on an attach stream, then output that wraps
+                        // at the new grid. A viewer that ignores it would draw
+                        // one 30-cell line instead. The `-input`/`-mouse`
+                        // variants also enable mouse tracking so the client
+                        // has input it must still refuse for an observer.
+                        "screen-resize-frames" | "workspace-resize-frames" => {
+                            write_frame(&mut output, channel, 3, &resize_payload(20, 5))?;
+                            write_frame(
+                                &mut output,
+                                channel,
+                                DATA,
+                                b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nAFTER\n",
+                            )?;
+                        }
+                        "screen-resize-input" => {
+                            write_frame(&mut output, channel, 3, &resize_payload(20, 5))?;
+                            write_frame(
+                                &mut output,
+                                channel,
+                                DATA,
+                                b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\
+                                  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nAFTER\n",
+                            )?;
+                        }
+                        "workspace-resize-mouse" => {
+                            write_frame(&mut output, channel, 3, &resize_payload(20, 5))?;
+                            write_frame(
+                                &mut output,
+                                channel,
+                                DATA,
+                                b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\
+                                  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nMOUSE-READY\n",
+                            )?;
+                        }
                         // The whole ending arrives as one burst: two DATA
                         // frames and CLOSE, so the last text is only in the
                         // VT when the close is seen.
@@ -6028,6 +6692,13 @@ fn write_json(out: &mut impl Write, value: serde_json::Value) -> io::Result<()> 
     write_frame(out, 0, DATA, value.to_string().as_bytes())
 }
 
+fn resize_payload(cols: u16, rows: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4);
+    payload.extend_from_slice(&cols.to_le_bytes());
+    payload.extend_from_slice(&rows.to_le_bytes());
+    payload
+}
+
 fn write_frame(out: &mut impl Write, channel: u32, kind: u8, payload: &[u8]) -> io::Result<()> {
     let mut wire = Vec::with_capacity(9 + payload.len());
     wire.extend_from_slice(&channel.to_le_bytes());
@@ -6060,7 +6731,11 @@ fn log(path: Option<&Path>, record: serde_json::Value) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{record}");
+        // One write per record: a client that exits by killing this process
+        // must not leave a half-written line behind.
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
     }
 }
 

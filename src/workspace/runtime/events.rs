@@ -60,6 +60,21 @@ impl Screen<'_> {
                             break;
                         }
                     }
+                    Ok(StreamItem::Resize { cols, rows }) => {
+                        if cols > 0 && rows > 0 {
+                            // A confirmed observer's grid arrives before the
+                            // paint that uses it. Record it as the pane's
+                            // size so sizing never reverts or re-sends it;
+                            // RESIZE is not output, so it pays no credit.
+                            link.vt.resize(cols, rows).map_err(vt_error)?;
+                            link.vt_size = (cols, rows);
+                            // Only an observer receives RESIZE; it follows
+                            // core's grid and never resizes the program.
+                            link.observed = true;
+                            link.needs_facts = true;
+                            self.dirty = true;
+                        }
+                    }
                     Ok(StreamItem::Closed(reason)) => {
                         closed.push((pane, reason));
                         break;

@@ -146,9 +146,24 @@ pub fn decode_header(header: &[u8; HEADER]) -> Result<(u32, u8, usize), FrameErr
     Ok((channel, kind, len))
 }
 
+/// The `u16 cols, u16 rows` payload of a RESIZE frame. Any other length is a
+/// malformed frame, not a panicking decode.
+pub fn parse_resize(payload: &[u8]) -> Result<(u16, u16), FrameError> {
+    let [c0, c1, r0, r1] = payload
+        .try_into()
+        .map_err(|_| FrameError::BadResize { len: payload.len() })?;
+    Ok((u16::from_le_bytes([c0, c1]), u16::from_le_bytes([r0, r1])))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameError {
-    Oversized { len: usize },
+    Oversized {
+        len: usize,
+    },
+    /// A RESIZE frame whose payload is not exactly two `u16`s.
+    BadResize {
+        len: usize,
+    },
 }
 
 impl fmt::Display for FrameError {
@@ -159,6 +174,9 @@ impl fmt::Display for FrameError {
                     f,
                     "frame of {len} bytes exceeds the {MAX_PAYLOAD}-byte limit"
                 )
+            }
+            FrameError::BadResize { len } => {
+                write!(f, "RESIZE frame payload is {len} bytes; expected 4")
             }
         }
     }
@@ -295,6 +313,19 @@ mod tests {
         let batch: Vec<Frame> =
             std::iter::from_fn(|| decoder.next_frame().expect("valid frame")).collect();
         assert_eq!(batch, frames.to_vec());
+    }
+
+    #[test]
+    fn a_resize_payload_is_exactly_two_little_endian_u16s() {
+        assert_eq!(parse_resize(&[120, 0, 40, 0]), Ok((120, 40)));
+        assert_eq!(parse_resize(&[0xff, 0xff, 1, 0]), Ok((u16::MAX, 1)));
+        for payload in [&[][..], &[1, 2][..], &[1, 2, 3][..], &[1, 2, 3, 4, 5][..]] {
+            assert_eq!(
+                parse_resize(payload),
+                Err(FrameError::BadResize { len: payload.len() }),
+                "payload {payload:?} is malformed"
+            );
+        }
     }
 
     #[test]
