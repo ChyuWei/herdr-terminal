@@ -10,14 +10,15 @@ If `AGENTS.local.md` exists, read it too: the maintainer's local rules.
 local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
 `herdr-terminal` document with restore and multi-screen sync, agent awareness
 (status, sidebar, local-VT peek, seen/pin, alerts), the Core-wide terminal
-manager (`prefix t`; Show/Hide and a read-only Preview), and the daily-driver input
-surface: mouse routing and split drags, bounded local scrollback with search,
-selection with OSC 52/native copy and bracketed paste, the command palette,
-and startup settings with default/dark/light themes. The local VT enables
-grapheme clustering as Core does, and new terminals start at the grid they
-will attach at. Settings are read at startup only: there is no settings UI or
-live reload. The tests exist and pass. Machines, files, install scripts and
-accessibility remain planned.
+manager (`prefix t`; Show/Hide and a read-only Preview), the machine manager
+(`prefix m`; add/connect/rename/remove Core machines and start `machine/t7`
+terminals), and the daily-driver input surface: mouse routing and split drags,
+bounded local scrollback with search, selection with OSC 52/native copy and
+bracketed paste, the command palette, and startup settings with
+default/dark/light themes. The local VT enables grapheme clustering as Core
+does, and new terminals start at the grid they will attach at. Settings are
+read at startup only: there is no settings UI or live reload. The tests exist
+and pass. Files, install scripts and accessibility remain planned.
 The design intent is in the
 [core reference](docs/01-core-and-app-reference.md) and the
 [architecture](docs/02-architecture.md). Read both before proposing code; do
@@ -95,6 +96,42 @@ records, raw output, attach, events, status, documents and machines.
   Durable cross-screen hide needs a shared-document marker, which this feature
   does not have. A manager-shown pane restores by address as unowned: `x`/`e`
   detach, `X` kills.
+- **Core owns the machine line.** The machine manager (`prefix m`; palette
+  "machine manager", action `machines`) only calls `machine.list`, `add`,
+  `connect`, `rename` and `rm` on the one long-lived connection. Never dial,
+  implement SSH or a `via` path, retry a line, or add a private remote
+  reconnect loop: Core owns dialing, backoff, mirror replacement and relayed
+  streams. Never spawn `hc` per action. A core without `machine.list` is
+  reported inside the overlay; never call the missing method.
+- **Machine manager refreshes only while open.** It calls `machine.list` when
+  the overlay opens, after each action, and on a bounded timer while it stays
+  open; a closed manager never polls. Core has no machine-state event.
+  Selection, filter and scroll are `UiState`, not the document or the
+  per-screen view. Opening the terminal manager closes it, and every key is
+  consumed by the overlay, prompt or confirmation.
+- **Machine starts and remote addresses.** `machine.add` passes the typed
+  target unchanged, including `user@host:port`; never parse, rewrite or add a
+  `via` path. Only a start from the machine manager sends `terminal.run` `on`;
+  it keeps this client's normal labels. The returned `machine/t7` address is
+  stored unchanged, attaches through the local Core, and is an ordinary pane:
+  input, resize, focus, FACTS, terminal-manager Show/Hide and Preview all
+  apply. Persist the full qualified address in the local document and show
+  the machine in pane/status names; never assume a short `t7` is unique
+  across machines.
+- **Renames follow the pane label.** Core renames a machine as
+  `removed`+`created` or in a `missed` snapshot. Re-address the existing pane
+  by its `herdr.terminal.pane` label, keep its stream and final screen, and
+  write the new qualified address; never spawn a replacement. On `missed`,
+  refetch and merge the document before reconciling the snapshot. If the new
+  address is already shown, do not create a second pane: refuse the move, let
+  the old pane leave only after Core no longer has its old address, and keep
+  the pane that holds the address.
+- **Local documents only.** Workspace state, including remote panes, stays in
+  the local `herdr-terminal` document. This feature reads and writes no remote
+  document (any later remote document use must call `doc.get`/`doc.set` with
+  `on`), and never touches the App document or `herdr.space`/`herdr.tab`.
+- **Files remain planned.** Machine work adds no `file.*` calls, diff, editor
+  or file picker.
 - **Reconnect semantics.** A dropped connection is not a dead program. On
   `missed`, resnapshot; on `lost`/`restarted`, reattach; on `finished`, drop
   the stream. Never assume the program died.
@@ -119,8 +156,8 @@ records, raw output, attach, events, status, documents and machines.
 The Cargo workspace builds and tests. The suites cover the protocol, VT,
 single-pane lifecycle, workspace, persistence, agents, the daily-driver input
 layer (mouse, scrollback/search, clipboard, palette, config and themes),
-grapheme width, initial terminal size, the terminal manager, and observer
-attach/resize ordering.
+grapheme width, initial terminal size, the terminal manager, the machine
+manager and remote recovery, and observer attach/resize ordering.
 
 ```sh
 cargo build --locked
@@ -176,8 +213,10 @@ src/
     palette.rs          # pure palette entries and filtering
     agents.rs           # pure agent facts, ordering, alerts
     manager.rs          # pure Core-wide inventory, sort/filter, labels
-    runtime/            # event loop, attach, input, mouse, overlays, reconnect, agents, manager
+    machines.rs         # pure machine rows, sort/filter, remote addresses
+    runtime/            # event loop, attach, input, mouse, overlays, reconnect, agents, manager, machines
     ui.rs               # ratatui composition
+    ui/machine_ui.rs    # machine manager panel, prompt and confirmation
     startup.rs          # document claim and restore
     local.rs, state.rs  # local view and UI state
     sync.rs             # document CAS state
@@ -225,6 +264,6 @@ edit it.
 ## Next step
 
 Pick up the remaining planned features in `docs/02-architecture.md` §5:
-machines, files, install scripts and CLI docs, accessibility, mods, and a
-settings UI or live reload if one is designed. Keep the same rule: prove
-protocol, VT, input and recovery behavior with tests before UI chrome.
+files, install scripts and CLI docs, accessibility, mods, and a settings UI or
+live reload if one is designed. Keep the same rule: prove protocol, VT, input
+and recovery behavior with tests before UI chrome.
