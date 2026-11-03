@@ -243,6 +243,7 @@ pub enum Overlay {
     Search,
     Manager,
     Machines,
+    Files,
     Preview,
     Sidebar,
     Peek(PaneId),
@@ -268,6 +269,7 @@ pub fn visible_panes(
         | Overlay::Search
         | Overlay::Manager
         | Overlay::Machines
+        | Overlay::Files
         | Overlay::Preview
         | Overlay::Sidebar => {
             return visible;

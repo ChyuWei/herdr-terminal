@@ -16,6 +16,9 @@ pub const REQUIRED_METHODS: &[&str] = &[
     "terminal.label",
     "doc.get",
     "doc.set",
+    "file.read",
+    "file.write",
+    "file.edit",
 ];
 /// The feature that lets an observer receive RESIZE before paints. Observer
 /// attach has no fallback, so this feature is required.
@@ -165,6 +168,107 @@ pub fn machine_rename_params(machine: &str, new_name: &str) -> Value {
     serde_json::json!({"machine": machine, "new_name": new_name})
 }
 
+/// A file here or on a machine. `on` and `cwd` are omitted when unknown, so a
+/// local relative path resolves exactly as core's own default.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FileAt {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl FileAt {
+    pub fn new(path: impl Into<String>) -> FileAt {
+        FileAt {
+            path: path.into(),
+            on: None,
+            cwd: None,
+        }
+    }
+}
+
+/// `file.read` params: a window of whole lines, `offset` from 1 and at most
+/// `limit`. `None` lets core give all of it, up to its 8 MB cap.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FileRead {
+    #[serde(flatten)]
+    pub at: FileAt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl FileRead {
+    /// A window starting at line `offset` (from 1).
+    pub fn at_line(at: FileAt, offset: usize, limit: usize) -> FileRead {
+        FileRead {
+            at,
+            offset: Some(offset),
+            limit: Some(limit),
+        }
+    }
+
+    /// The whole file, bounded only by core's reply cap.
+    pub fn whole(at: FileAt) -> FileRead {
+        FileRead {
+            at,
+            offset: None,
+            limit: None,
+        }
+    }
+}
+
+/// `file.read`'s reply: whole lines with their ends kept, the range given, and
+/// the file's total line count. `last < first` means the range is empty.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct FileReadResult {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub first: usize,
+    #[serde(default)]
+    pub last: usize,
+    #[serde(default)]
+    pub lines: usize,
+}
+
+/// `file.write` params: the new content, base64, at most 8 MB raw.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FileWrite {
+    #[serde(flatten)]
+    pub at: FileAt,
+    pub data: String,
+}
+
+/// `file.edit` params: exact replacements, all or none.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct FileEdit {
+    #[serde(flatten)]
+    pub at: FileAt,
+    pub edits: Vec<FileEditOp>,
+}
+
+/// One exact text replacement for `file.edit`. `old` must occur exactly once
+/// in the file as it was; edits are applied together or not at all.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileEditOp {
+    pub old: String,
+    pub new: String,
+}
+
+/// `file.write` and `file.edit`'s reply: the absolute path written and its
+/// size.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct FileResult {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub bytes: usize,
+}
+
 /// The `hello` reply: what this core is and what it can do.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Hello {
@@ -282,9 +386,11 @@ impl fmt::Display for Mismatch {
                 "core reported an unreadable version \"{have}\"; this client needs herdr-core \
                  {want} or newer (update with `hc update`)"
             ),
-            Mismatch::MissingMethods(methods) => {
-                write!(f, "core lacks required methods: {}", methods.join(", "))
-            }
+            Mismatch::MissingMethods(methods) => write!(
+                f,
+                "core lacks required methods: {}; update herdr-core (for example with `hc update`)",
+                methods.join(", ")
+            ),
             Mismatch::MissingFeatures(features) => {
                 write!(f, "core lacks required features: {}", features.join(", "))
             }
@@ -773,7 +879,15 @@ mod tests {
         };
         assert_eq!(
             methods,
-            ["terminal.attach", "terminal.label", "doc.get", "doc.set"]
+            [
+                "terminal.attach",
+                "terminal.label",
+                "doc.get",
+                "doc.set",
+                "file.read",
+                "file.write",
+                "file.edit",
+            ]
         );
         assert!(
             missing
@@ -788,5 +902,99 @@ mod tests {
             panic!("missing feature not detected")
         };
         assert_eq!(features, ["events", RESIZE_NOTIFICATIONS]);
+    }
+
+    #[test]
+    fn file_requests_omit_unknown_context_and_unbounded_windows() {
+        let local = FileRead::whole(FileAt::new("notes.txt"));
+        assert_eq!(
+            serde_json::to_value(&local).expect("params"),
+            serde_json::json!({"path": "notes.txt"}),
+            "a local whole-file read sends no on, cwd, offset or limit"
+        );
+
+        let mut at = FileAt::new("src/main.rs");
+        at.on = Some("rohan".into());
+        at.cwd = Some("/srv/app".into());
+        let window = FileRead::at_line(at.clone(), 41, 200);
+        assert_eq!(
+            serde_json::to_value(&window).expect("params"),
+            serde_json::json!({
+                "path": "src/main.rs",
+                "on": "rohan",
+                "cwd": "/srv/app",
+                "offset": 41,
+                "limit": 200,
+            })
+        );
+
+        let write = FileWrite {
+            at: at.clone(),
+            data: "payload".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&write).expect("params"),
+            serde_json::json!({
+                "path": "src/main.rs",
+                "on": "rohan",
+                "cwd": "/srv/app",
+                "data": "payload",
+            })
+        );
+
+        let edit = FileEdit {
+            at,
+            edits: vec![FileEditOp {
+                old: "old\n".into(),
+                new: "new\n".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&edit).expect("params"),
+            serde_json::json!({
+                "path": "src/main.rs",
+                "on": "rohan",
+                "cwd": "/srv/app",
+                "edits": [{"old": "old\n", "new": "new\n"}],
+            })
+        );
+    }
+
+    #[test]
+    fn file_results_keep_the_documented_facts_and_ignore_more() {
+        let read: FileReadResult = serde_json::from_value(serde_json::json!({
+            "text": "one\ntwo\n",
+            "first": 1,
+            "last": 2,
+            "lines": 9,
+            "etag": "no such thing",
+        }))
+        .expect("read result");
+        assert_eq!(
+            read,
+            FileReadResult {
+                text: "one\ntwo\n".into(),
+                first: 1,
+                last: 2,
+                lines: 9,
+            }
+        );
+
+        let empty: FileReadResult = serde_json::from_value(serde_json::json!({})).expect("partial");
+        assert_eq!(empty, FileReadResult::default());
+        assert_eq!(
+            (empty.first, empty.last),
+            (0, 0),
+            "missing fields default; an empty text is what makes the window empty"
+        );
+
+        let written: FileResult = serde_json::from_value(serde_json::json!({
+            "path": "/srv/app/src/main.rs",
+            "bytes": 12,
+            "mode": "0644",
+        }))
+        .expect("file result");
+        assert_eq!(written.path, "/srv/app/src/main.rs");
+        assert_eq!(written.bytes, 12);
     }
 }

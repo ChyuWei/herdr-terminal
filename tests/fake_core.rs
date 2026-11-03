@@ -102,6 +102,26 @@ fn run_tests() {
     #[cfg(unix)]
     workspace_remote_pane_survives_a_rename_in_a_missed_snapshot();
     #[cfg(unix)]
+    workspace_views_a_local_file_through_core_and_scrolls();
+    #[cfg(unix)]
+    workspace_opens_a_remote_file_with_machine_and_remote_cwd();
+    #[cfg(unix)]
+    workspace_editor_edits_diffs_and_writes_through_core();
+    #[cfg(unix)]
+    workspace_discarded_editor_changes_are_never_written();
+    #[cfg(unix)]
+    workspace_conflict_requires_an_explicit_overwrite();
+    #[cfg(unix)]
+    workspace_write_failure_keeps_the_diff_and_buffer();
+    #[cfg(unix)]
+    workspace_editor_failure_restores_the_terminal_and_keeps_the_viewer();
+    #[cfg(unix)]
+    workspace_refuses_to_edit_a_truncated_whole_read();
+    #[cfg(unix)]
+    workspace_refuses_to_write_a_truncated_recheck();
+    #[cfg(unix)]
+    workspace_force_overwrite_refuses_a_truncated_read();
+    #[cfg(unix)]
     workspace_claims_a_new_document_and_labels_its_terminal();
     #[cfg(unix)]
     workspace_sends_each_new_terminals_attach_size_to_run();
@@ -299,6 +319,25 @@ impl FakeScreen {
         cols: u16,
         rows: u16,
     ) -> FakeScreen {
+        Self::spawn_parts_size_env(scratch, scenario, leading, args, screen, cols, rows, &[])
+    }
+
+    /// The default workspace with extra environment (an editor, a temp cwd).
+    fn spawn_workspace_env(scratch: &Scratch, scenario: &str, env: &[(&str, &str)]) -> FakeScreen {
+        Self::spawn_parts_size_env(scratch, scenario, &[], &[], None, 100, 30, env)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_parts_size_env(
+        scratch: &Scratch,
+        scenario: &str,
+        leading: &[&str],
+        args: &[&str],
+        screen: Option<&str>,
+        cols: u16,
+        rows: u16,
+        env: &[(&str, &str)],
+    ) -> FakeScreen {
         let exe = std::env::current_exe().expect("test executable");
         let pty = common::pty::Pty::open(cols, rows);
         let (stdin, stdout) = pty.stdio();
@@ -316,7 +355,13 @@ impl FakeScreen {
             .env("XDG_CONFIG_HOME", scratch.config_root())
             // Deterministic chrome colors in the captured frames.
             .env("COLORTERM", "truecolor")
-            .env("TERM", "xterm-256color");
+            .env("TERM", "xterm-256color")
+            // Never let a real editor from this environment leak into a test.
+            .env_remove("VISUAL")
+            .env_remove("EDITOR");
+        for (key, value) in env {
+            command.env(key, value);
+        }
         if let Some(screen) = screen {
             command.env("HERDR_TERMINAL_SCREEN", screen);
         }
@@ -361,6 +406,11 @@ impl FakeScreen {
     fn send(&mut self, bytes: &[u8]) {
         self.input.write_all(bytes).expect("write to the screen");
         self.input.flush().expect("flush the screen");
+    }
+
+    /// Types printable ASCII into the client as separate key events.
+    fn type_text(&mut self, text: &str) {
+        self.send(text.as_bytes());
     }
 
     /// The workspace prefix (Ctrl-b) followed by one command key.
@@ -5902,6 +5952,770 @@ fn workspace_processes_a_large_output_burst() {
     );
 }
 
+// --- file viewer and editor ------------------------------------------------
+
+/// A POSIX shell editor for the fake `$VISUAL`: it runs `body`, records the
+/// temp path it was given, and prints a marker on the outer screen.
+#[cfg(unix)]
+fn editor_script(scratch: &Scratch, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = scratch.dir.join("editor.sh");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' \"$1\" > \"$FAKE_EDITOR_LOG\"\n{body}\nprintf 'EDITOR-RAN\\n'\n"
+    );
+    std::fs::write(&path, script).expect("write editor script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make editor executable");
+    path
+}
+
+#[cfg(unix)]
+fn file_calls(scratch: &Scratch, method: &str) -> Vec<Value> {
+    scratch
+        .entries()
+        .into_iter()
+        .filter(|entry| entry["call"] == json!(method))
+        .collect()
+}
+
+/// Opens the overlay, types the path after the prefilled cwd and reads it.
+#[cfg(unix)]
+fn open_file(workspace: &mut FakeScreen, name: &str) {
+    workspace.command(b'o');
+    assert!(
+        workspace.wait_text("file · Enter read · Esc close", secs(5)),
+        "the file prompt did not open; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    workspace.type_text(name);
+    workspace.send(b"\r");
+}
+
+#[cfg(unix)]
+fn workspace_views_a_local_file_through_core_and_scrolls() {
+    let scratch = Scratch::new("files-view");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    let text: String = (0..500).map(|line| format!("line-{line:03}\n")).collect();
+    scratch.seed_file(None, &path_text, &text);
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let mut workspace =
+        FakeScreen::spawn_workspace_env(&scratch, "files", &[("FAKE_FILES_CWD", &cwd)]);
+    assert!(
+        workspace.wait_text("shared / main / t1", secs(10)),
+        "the restored pane did not appear; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    open_file(&mut workspace, "notes.txt");
+    assert!(
+        workspace.wait_text("lines 1-400 of 500", secs(5))
+            && workspace.wait_text("line-000", secs(5)),
+        "the first window was not drawn; screen={:?}",
+        workspace.rendered()
+    );
+    let reads = file_calls(&scratch, "file.read");
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!(reads[0]["params"]["path"], json!(path_text));
+    assert_eq!(reads[0]["params"]["cwd"], json!(cwd));
+    assert_eq!(reads[0]["params"]["offset"], json!(1));
+    assert_eq!(
+        reads[0]["params"]["limit"],
+        json!(herdr_terminal::workspace::file::PAGE)
+    );
+    assert!(
+        reads[0]["params"].get("on").is_none(),
+        "a local read sends no on: {:?}",
+        reads[0]["params"]
+    );
+
+    // G is End: it fetches the last page instead of loading the whole file.
+    workspace.type_text("G");
+    assert!(
+        workspace.wait_text("lines 101-500 of 500", secs(5))
+            && workspace.wait_text("line-499", secs(5)),
+        "the last page was not drawn; screen={:?}",
+        workspace.rendered()
+    );
+    let reads = file_calls(&scratch, "file.read");
+    assert_eq!(reads.len(), 2, "{reads:?}");
+    assert_eq!(reads[1]["params"]["offset"], json!(101));
+    assert_eq!(
+        reads[1]["params"]["limit"],
+        json!(herdr_terminal::workspace::file::PAGE)
+    );
+
+    workspace.type_text("g");
+    assert!(
+        workspace.wait_text("lines 1-400 of 500", secs(5)),
+        "Home did not return to the first page; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(file_calls(&scratch, "file.read").len(), 3);
+
+    workspace.send(&[0x1b]);
+    assert!(
+        workspace.wait_text("^b ? help", secs(5)),
+        "Esc did not close the viewer; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !file_calls(&scratch, "doc.set")
+            .iter()
+            .any(|call| call["params"]["value"].to_string().contains("line-")),
+        "file contents must stay out of the workspace document"
+    );
+    assert!(
+        file_calls(&scratch, "terminal.read").is_empty(),
+        "the viewer never reads a screen"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_opens_a_remote_file_with_machine_and_remote_cwd() {
+    let scratch = Scratch::new("files-remote");
+    scratch.seed_file(Some("alpha"), "/srv/app/notes.txt", "REMOTE-FILE\n");
+    scratch.seed_doc(one_tab_doc(&[(4, "alpha/t7")]), 2);
+    let mut workspace = FakeScreen::spawn_workspace_env(&scratch, "files-remote", &[]);
+    assert!(
+        workspace.wait_text("alpha/t7", secs(10)),
+        "the remote pane did not appear; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.command(b'o');
+    assert!(
+        workspace.wait_text("alpha · cwd /srv/app", secs(5)),
+        "the prompt must show the remote machine and cwd; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.type_text("notes.txt");
+    workspace.send(b"\r");
+    assert!(
+        workspace.wait_text("file · alpha · /srv/app/notes.txt", secs(5))
+            && workspace.wait_text("REMOTE-FILE", secs(5)),
+        "the remote file was not read through core; screen={:?}",
+        workspace.rendered()
+    );
+    let reads = file_calls(&scratch, "file.read");
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!(reads[0]["params"]["on"], json!("alpha"));
+    assert_eq!(reads[0]["params"]["cwd"], json!("/srv/app"));
+    assert_eq!(reads[0]["params"]["path"], json!("/srv/app/notes.txt"));
+
+    workspace.send(&[0x1b]);
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_editor_edits_diffs_and_writes_through_core() {
+    let scratch = Scratch::new("files-edit");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\nTITLE=old\nomega\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(
+        &scratch,
+        "tmp=\"$1.ht\"\nwhile IFS= read -r line || [ -n \"$line\" ]; do\n\
+         case \"$line\" in TITLE=old) printf '%s\\n' 'TITLE=new' ;; \
+         *) printf '%s\\n' \"$line\" ;; esac\ndone < \"$1\" > \"$tmp\"\nmv \"$tmp\" \"$1\"",
+    );
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(
+        workspace.wait_text("shared / main / t1", secs(10)),
+        "screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    open_file(&mut workspace, "notes.txt");
+    assert!(workspace.wait_text("TITLE=old", secs(5)));
+
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("file diff · w write · q discard · Esc close", secs(10))
+            && workspace.wait_text("-     2 TITLE=old", secs(10))
+            && workspace.wait_text("+     2 TITLE=new", secs(10))
+            && workspace.wait_text("1 added, 1 removed", secs(10)),
+        "the editor diff was not shown; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
+        workspace.raw().contains("EDITOR-RAN"),
+        "the editor did not run on the outer terminal: {:?}",
+        workspace.raw()
+    );
+    let temp = std::fs::read_to_string(&editor_log).expect("editor temp path");
+    assert!(
+        temp.contains("-notes.txt") && temp.ends_with("notes.txt"),
+        "the temp file keeps the source extension: {temp:?}"
+    );
+
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text(&format!("wrote {path_text}"), secs(10)),
+        "the write was not reported; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\nTITLE=new\nomega\n"),
+        "core received the edited content"
+    );
+    let edits = file_calls(&scratch, "file.edit");
+    assert_eq!(
+        edits.len(),
+        1,
+        "one exact replacement fits file.edit: {edits:?}"
+    );
+    assert_eq!(edits[0]["params"]["edits"][0]["old"], json!("old"));
+    assert_eq!(edits[0]["params"]["edits"][0]["new"], json!("new"));
+    assert!(
+        edits[0]["params"].get("on").is_none(),
+        "a local edit sends no on"
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty(),
+        "a single exact replacement is an edit"
+    );
+    assert!(
+        !scratch.doc_value().to_string().contains("TITLE=new"),
+        "file contents must stay out of the workspace document"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_discarded_editor_changes_are_never_written() {
+    let scratch = Scratch::new("files-discard");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\nbeta\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'discarded\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    assert!(workspace.wait_text("alpha", secs(5)));
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("file diff · w write · q discard · Esc close", secs(10))
+            && workspace.wait_text("+     3 discarded", secs(10)),
+        "the diff was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.type_text("q");
+    assert!(
+        workspace.wait_text("file changes discarded", secs(5)),
+        "q did not discard; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "a discard must never write: {:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\nbeta\n")
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_conflict_requires_an_explicit_overwrite() {
+    let scratch = Scratch::new("files-conflict");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\nbeta\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'gamma\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-conflict",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    assert!(workspace.wait_text("alpha", secs(5)));
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("+     3 gamma", secs(10)),
+        "the diff was not shown; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text("changed since it was read", secs(10)),
+        "the conflict was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.rendered().contains("changed on disk"),
+        "the conflict title is missing; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "a changed file must not be written silently: {:?}",
+        scratch.entries()
+    );
+
+    workspace.type_text("o");
+    assert!(
+        workspace.wait_text(&format!("wrote {path_text}"), secs(10)),
+        "the explicit overwrite was not reported; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\nbeta\ngamma\n"),
+        "the explicit overwrite writes the edited buffer"
+    );
+    let writes = file_calls(&scratch, "file.write");
+    assert_eq!(writes.len(), 1, "{writes:?}");
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_write_failure_keeps_the_diff_and_buffer() {
+    let scratch = Scratch::new("files-write-fail");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'beta\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-write-fail",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    workspace.type_text("e");
+    assert!(workspace.wait_text("+     2 beta", secs(10)));
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text("disk is full", secs(10)),
+        "the write refusal was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.rendered().contains("file diff") && workspace.rendered().contains("+     2 beta"),
+        "the diff and buffer must survive a failed write; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\n"),
+        "a failed write changes nothing"
+    );
+    workspace.type_text("q");
+    assert!(workspace.wait_text("file changes discarded", secs(5)));
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_editor_failure_restores_the_terminal_and_keeps_the_viewer() {
+    let scratch = Scratch::new("files-editor-fail");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "alpha\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'EDITOR-FAIL\\n'\nexit 3");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    assert!(workspace.wait_text("alpha", secs(5)));
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("exited (exit status: 3)", secs(10)),
+        "the editor failure was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(workspace.raw().contains("EDITOR-FAIL"));
+    assert!(
+        workspace.rendered().contains("file · local ·"),
+        "the viewer stays after a failed editor; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty()
+    );
+
+    // The TUI was restored, not only drawn once: a normal command works.
+    workspace.send(&[0x1b]);
+    assert!(
+        workspace.wait_text("^b ? help", secs(5)),
+        "Esc did not close the viewer; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.command(b':');
+    assert!(
+        workspace.wait_text("palette · Enter run · Esc close", secs(5)),
+        "the TUI did not recover after the editor; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.send(&[0x1b]);
+    assert_eq!(
+        scratch.file_text(None, &path_text).as_deref(),
+        Some("alpha\n"),
+        "a failed editor changes nothing"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// Editor temp files this client left in the scratch temp directory.
+#[cfg(unix)]
+fn temp_files(scratch: &Scratch) -> Vec<String> {
+    std::fs::read_dir(&scratch.dir)
+        .expect("scratch dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("ht-"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn workspace_refuses_to_edit_a_truncated_whole_read() {
+    let scratch = Scratch::new("files-truncated-edit");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "one\ntwo\nthree\nfour\nfive\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'ran\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-truncated",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("TMPDIR", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(
+        workspace.wait_text("shared / main / t1", secs(10)),
+        "screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    open_file(&mut workspace, "notes.txt");
+    assert!(
+        workspace.wait_text("lines 1-5 of 5", secs(5)),
+        "the bounded viewer page is unaffected by the cap; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("too large to edit through Core's inline read", secs(5)),
+        "the truncated whole read was not refused; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !editor_log.exists(),
+        "no editor may run for a truncated read"
+    );
+    assert!(
+        !workspace.raw().contains("EDITOR-RAN"),
+        "the editor process never ran"
+    );
+    assert!(
+        temp_files(&scratch).is_empty(),
+        "no temp file may be left behind: {:?}",
+        temp_files(&scratch)
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "a refused edit writes nothing: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        workspace.rendered().contains("file · local ·") && workspace.rendered().contains("five"),
+        "the viewer stays usable; screen={:?}",
+        workspace.rendered()
+    );
+    workspace.send(&[0x1b]);
+    assert!(
+        workspace.wait_text("^b ? help", secs(5)),
+        "Esc did not close the viewer; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_refuses_to_write_a_truncated_recheck() {
+    let scratch = Scratch::new("files-truncated-recheck");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "one\ntwo\nthree\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'four\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-truncated-recheck",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("TMPDIR", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    workspace.type_text("e");
+    assert!(
+        workspace.wait_text("+     4 four", secs(10)),
+        "the complete first whole read still edits; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text("too large to edit through Core's inline read", secs(10)),
+        "a truncated re-read must refuse `w`; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "a truncated re-read writes nothing: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        workspace.rendered().contains("file diff") && workspace.rendered().contains("+     4 four"),
+        "the diff and buffer stay; screen={:?}",
+        workspace.rendered()
+    );
+
+    workspace.send(b"\r");
+    assert!(
+        workspace.wait_text("too large to edit through Core's inline read", secs(5)),
+        "Enter is the same write path; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "Enter writes nothing either: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        !scratch.doc_value().to_string().contains("four"),
+        "file contents must stay out of the workspace document"
+    );
+
+    workspace.type_text("q");
+    assert!(workspace.wait_text("file changes discarded", secs(5)));
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+#[cfg(unix)]
+fn workspace_force_overwrite_refuses_a_truncated_read() {
+    let scratch = Scratch::new("files-truncated-overwrite");
+    let cwd = scratch.dir.to_string_lossy().into_owned();
+    let path = scratch.dir.join("notes.txt");
+    let path_text = path.to_string_lossy().into_owned();
+    scratch.seed_file(None, &path_text, "one\ntwo\nthree\n");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1")]), 2);
+    let editor = editor_script(&scratch, "printf 'four\\n' >> \"$1\"");
+    let editor_log = scratch.dir.join("editor.log");
+    let mut workspace = FakeScreen::spawn_workspace_env(
+        &scratch,
+        "files-truncated-overwrite",
+        &[
+            ("FAKE_FILES_CWD", &cwd),
+            ("TMPDIR", &cwd),
+            ("VISUAL", editor.to_str().expect("editor path")),
+            ("FAKE_EDITOR_LOG", editor_log.to_str().expect("editor log")),
+        ],
+    );
+    assert!(workspace.wait_text("shared / main / t1", secs(10)));
+    open_file(&mut workspace, "notes.txt");
+    workspace.type_text("e");
+    assert!(workspace.wait_text("+     4 four", secs(10)));
+
+    workspace.type_text("w");
+    assert!(
+        workspace.wait_text("changed since it was read", secs(10)),
+        "the complete changed re-read is a conflict; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.rendered().contains("changed on disk"),
+        "the conflict state is visible; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty()
+    );
+
+    workspace.type_text("o");
+    assert!(
+        workspace.wait_text("too large to edit through Core's inline read", secs(10)),
+        "the explicit overwrite must refuse a truncated re-read; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        file_calls(&scratch, "file.write").is_empty()
+            && file_calls(&scratch, "file.edit").is_empty(),
+        "the overwrite wrote nothing: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        workspace.rendered().contains("file diff")
+            && workspace.rendered().contains("+     4 four")
+            && workspace.rendered().contains("changed on disk"),
+        "the diff and conflict state stay; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !scratch.doc_value().to_string().contains("four"),
+        "file contents must stay out of the workspace document"
+    );
+
+    workspace.type_text("q");
+    assert!(workspace.wait_text("file changes discarded", secs(5)));
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
 // --- observer attach -------------------------------------------------------
 
 /// A client connected straight to the scripted core, without `ht` in the way.
@@ -6413,6 +7227,8 @@ fn fake_connect() -> io::Result<()> {
     let doc_path = doc_path.as_deref();
     let label_path = log_path.map(|path| path.with_file_name("labels.json"));
     let label_path = label_path.as_deref();
+    let file_path = log_path.map(|path| path.with_file_name("files.json"));
+    let file_path = file_path.as_deref();
     let generation = bump_generation(log_path);
     log(log_path, json!({"generation": generation}));
     // The name of the start whose reply will be dropped, so the next
@@ -6453,6 +7269,7 @@ fn fake_connect() -> io::Result<()> {
             "events.subscribe", "terminal.run", "terminal.attach",
             "terminal.get", "terminal.read", "terminal.rm", "terminal.kill",
             "terminal.label", "doc.get", "doc.set",
+            "file.read", "file.write", "file.edit",
             "machine.list", "machine.add", "machine.connect", "machine.rename",
             "machine.rm"
         ],
@@ -6533,6 +7350,13 @@ fn fake_connect() -> io::Result<()> {
     // `machines-missed-rename`: the fresh `missed` snapshot has the machine's
     // new prefix while the stored document still names the old one.
     let mut missed_rename_sent = false;
+    // `files-conflict`: every read after the first two returns text another
+    // writer produced. The first read opens the viewer, the second is the
+    // editor's full read, the third is the write-time conflict check.
+    let mut file_reads = 0u32;
+    // Whole (unbounded) reads drive the truncation modes below; paged reads
+    // stay complete because the viewer asks by offset and limit.
+    let mut whole_reads = 0u32;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         let mut frame = json!({"channel": channel, "kind": kind, "len": payload.len()});
@@ -7298,6 +8122,8 @@ fn fake_connect() -> io::Result<()> {
                         } else {
                             doc_record_for(&scenario, &target)
                         }
+                    } else if scenario.starts_with("files") {
+                        file_pane_record(&target)
                     } else if target.contains('/') {
                         // A mirrored remote terminal keeps its qualified
                         // address; the client stores it verbatim.
@@ -7661,6 +8487,9 @@ fn fake_connect() -> io::Result<()> {
                         "screen-reconnect" => {
                             write_frame(&mut output, channel, DATA, b"RECONNECTED\n")?;
                         }
+                        scenario if scenario.starts_with("files") => {
+                            write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
+                        }
                         _ => {
                             // The probe cannot write this anywhere: its stdout
                             // is broken.
@@ -7681,7 +8510,9 @@ fn fake_connect() -> io::Result<()> {
                     )?;
                     continue;
                 }
-                let record = if doc_scenario(&scenario) {
+                let record = if scenario.starts_with("files") {
+                    file_pane_record(target)
+                } else if doc_scenario(&scenario) {
                     if target == last_run_address && target != "t1" {
                         let mut record = live_record(8000);
                         record["address"] = json!(target);
@@ -7877,6 +8708,167 @@ fn fake_connect() -> io::Result<()> {
                     notify(&mut output, doc_event_message(version))?;
                 }
             }
+            // Files live in one store next to the log, keyed by machine and
+            // resolved path, like core's own local/remote resolution.
+            "file.read" => {
+                file_reads += 1;
+                let params = message.get("params").cloned().unwrap_or_default();
+                let key = file_key(&params);
+                let Some(stored) = read_files(file_path).get(&key).cloned() else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "not_found",
+                        &format!("no file {}", file_display(&params)),
+                        "check the path",
+                    )?;
+                    continue;
+                };
+                let text = if scenario == "files-conflict" && file_reads > 2 {
+                    "changed by another writer\n".to_owned()
+                } else {
+                    stored
+                };
+                let first = params["offset"].as_u64().unwrap_or(1) as usize;
+                let limit = params["limit"]
+                    .as_u64()
+                    .map(|limit| limit as usize)
+                    .unwrap_or(usize::MAX);
+                let whole = params.get("offset").is_none() && params.get("limit").is_none();
+                if whole {
+                    whole_reads += 1;
+                }
+                // Core caps an unbounded read at ~8 MB and answers a
+                // whole-line prefix with `last < lines`; these scenarios model
+                // that without allocating 8 MB.
+                let text = if scenario == "files-truncated-overwrite" && whole && whole_reads == 2 {
+                    "changed by another writer\n".to_owned()
+                } else {
+                    text
+                };
+                let truncated = match scenario.as_str() {
+                    "files-truncated" => whole,
+                    "files-truncated-recheck" => whole && whole_reads > 1,
+                    "files-truncated-overwrite" => whole && whole_reads > 2,
+                    _ => false,
+                };
+                let total = text.split_inclusive('\n').count();
+                if first == 0 || (first > total && first > 1) {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "invalid_params",
+                        &format!("offset {first}: the file has {total} lines"),
+                        "",
+                    )?;
+                    continue;
+                }
+                let limit = if truncated { limit.min(2) } else { limit };
+                let window: String = text
+                    .split_inclusive('\n')
+                    .skip(first - 1)
+                    .take(limit)
+                    .collect();
+                let given = window.split_inclusive('\n').count();
+                reply(
+                    &mut output,
+                    &id,
+                    json!({
+                        "text": window,
+                        "first": first,
+                        "last": first + given - 1,
+                        "lines": total,
+                    }),
+                )?;
+            }
+            "file.write" => {
+                let params = message.get("params").cloned().unwrap_or_default();
+                if scenario == "files-write-fail" {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "io",
+                        "disk is full",
+                        "free some space and retry",
+                    )?;
+                    continue;
+                }
+                let Some(bytes) = params["data"].as_str().and_then(decode_base64) else {
+                    reply_error(&mut output, &id, "invalid_params", "data is not base64", "")?;
+                    continue;
+                };
+                let Ok(text) = String::from_utf8(bytes) else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "not_text",
+                        "the file is not UTF-8 text",
+                        "",
+                    )?;
+                    continue;
+                };
+                let key = file_key(&params);
+                let mut files = read_files(file_path);
+                files.insert(key, text.clone());
+                write_files(file_path, &files);
+                reply(
+                    &mut output,
+                    &id,
+                    json!({
+                        "path": file_resolved(&params).display().to_string(),
+                        "bytes": text.len(),
+                    }),
+                )?;
+            }
+            "file.edit" => {
+                let params = message.get("params").cloned().unwrap_or_default();
+                let key = file_key(&params);
+                let Some(text) = read_files(file_path).get(&key).cloned() else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "not_found",
+                        &format!("no file {}", file_display(&params)),
+                        "check the path",
+                    )?;
+                    continue;
+                };
+                let edits: Vec<(String, String)> = params["edits"]
+                    .as_array()
+                    .map(|edits| {
+                        edits
+                            .iter()
+                            .map(|edit| {
+                                (
+                                    edit["old"].as_str().unwrap_or_default().to_owned(),
+                                    edit["new"].as_str().unwrap_or_default().to_owned(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let Some(edited) = apply_file_edits(&text, &edits) else {
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "edit_failed",
+                        "an edit no longer matches the file",
+                        "read it again: exact text",
+                    )?;
+                    continue;
+                };
+                let mut files = read_files(file_path);
+                files.insert(key, edited.clone());
+                write_files(file_path, &files);
+                reply(
+                    &mut output,
+                    &id,
+                    json!({
+                        "path": file_resolved(&params).display().to_string(),
+                        "bytes": edited.len(),
+                    }),
+                )?;
+            }
             _ => reply(&mut output, &id, json!({}))?,
         }
     }
@@ -7977,6 +8969,13 @@ fn snapshot_for(
             doc_terminal("t1", 1, 2, 3),
             finished_doc_terminal("alpha/t7", 1, 2, 4),
         ],
+        "files"
+        | "files-conflict"
+        | "files-write-fail"
+        | "files-truncated"
+        | "files-truncated-recheck"
+        | "files-truncated-overwrite" => vec![file_pane_record("t1")],
+        "files-remote" => vec![file_pane_record("alpha/t7")],
         "doc-restore"
         | "doc-remove"
         | "doc-deleted-recover"
@@ -8217,6 +9216,20 @@ fn doc_terminal(address: &str, space: u64, tab: u64, pane: u64) -> Value {
     record
 }
 
+/// The file scenarios' terminal: its cwd is where the path prompt starts,
+/// from the test's scratch directory (or a remote working directory).
+fn file_pane_record(address: &str) -> Value {
+    let mut record = live_record(4242);
+    record["address"] = json!(address);
+    if address.contains('/') {
+        record["cwd"] = json!("/srv/app");
+    } else {
+        record["cwd"] =
+            json!(std::env::var("FAKE_FILES_CWD").unwrap_or_else(|_| "/var/tmp".to_owned()));
+    }
+    record
+}
+
 /// The same pane's record after its program exited normally.
 fn finished_doc_terminal(address: &str, space: u64, tab: u64, pane: u64) -> Value {
     let mut record = doc_terminal(address, space, tab, pane);
@@ -8434,6 +9447,113 @@ fn replace_doc(path: Option<&Path>, value: Value) -> u64 {
     let version = current + 1;
     write_doc(path, &value, version);
     version
+}
+
+// --- file store ------------------------------------------------------------
+
+fn read_files(path: Option<&Path>) -> BTreeMap<String, String> {
+    path.and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_files(path: Option<&Path>, files: &BTreeMap<String, String>) {
+    let Some(path) = path else { return };
+    let _ = std::fs::write(path, json!(files).to_string());
+}
+
+/// Where core would resolve a request: an absolute path stays, a relative one
+/// joins `cwd` (or `.`). The machine is part of the key, never the local disk.
+fn file_resolved(params: &Value) -> PathBuf {
+    let path = params["path"].as_str().unwrap_or_default();
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    Path::new(params["cwd"].as_str().unwrap_or(".")).join(path)
+}
+
+fn file_key(params: &Value) -> String {
+    format!(
+        "{}|{}",
+        params["on"].as_str().unwrap_or(""),
+        file_resolved(params).display()
+    )
+}
+
+fn file_display(params: &Value) -> String {
+    match params["on"].as_str().filter(|on| !on.is_empty()) {
+        Some(on) => format!("{on}:{}", file_resolved(params).display()),
+        None => file_resolved(params).display().to_string(),
+    }
+}
+
+/// The standard base64 alphabet with padding, as the client's encoder emits.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut chunk = 0u32;
+    let mut bits = 0u32;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32;
+        chunk = (chunk << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((chunk >> bits) as u8);
+            chunk &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Core's all-or-none edit rule: each old occurs exactly once in the original
+/// and the spans do not overlap.
+fn apply_file_edits(text: &str, edits: &[(String, String)]) -> Option<String> {
+    if edits.is_empty() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for (index, (old, _new)) in edits.iter().enumerate() {
+        if old.is_empty() {
+            return None;
+        }
+        let step = old.chars().next().map_or(1, char::len_utf8);
+        let (mut first, mut count, mut from) = (0usize, 0usize, 0usize);
+        while let Some(at) = text[from..].find(old) {
+            if count == 0 {
+                first = from + at;
+            }
+            count += 1;
+            from += at + step;
+        }
+        if count != 1 {
+            return None;
+        }
+        spans.push((first, first + old.len(), index));
+    }
+    spans.sort();
+    if spans.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    for (start, end, index) in spans {
+        out.push_str(&text[done..start]);
+        out.push_str(&edits[index].1);
+        done = end;
+    }
+    out.push_str(&text[done..]);
+    Some(out)
 }
 
 fn doc_event_message(version: u64) -> Value {
@@ -8904,6 +10024,23 @@ impl Scratch {
 
     fn doc_version(&self) -> u64 {
         self.doc().1
+    }
+
+    fn files(&self) -> PathBuf {
+        self.dir.join("files.json")
+    }
+
+    /// Seeds a file core can read, on a machine (`Some("alpha")`) or locally.
+    fn seed_file(&self, on: Option<&str>, path: &str, text: &str) {
+        let mut files = read_files(Some(&self.files()));
+        files.insert(format!("{}|{path}", on.unwrap_or("")), text.to_owned());
+        write_files(Some(&self.files()), &files);
+    }
+
+    fn file_text(&self, on: Option<&str>, path: &str) -> Option<String> {
+        read_files(Some(&self.files()))
+            .get(&format!("{}|{path}", on.unwrap_or("")))
+            .cloned()
     }
 
     /// Writes the core label store as if the terminals already carried these

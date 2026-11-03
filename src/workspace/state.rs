@@ -92,6 +92,8 @@ pub struct UiState {
     pub manager: ManagerState,
     /// The machine manager and its local selection/filter/prompt.
     pub machines: MachineState,
+    /// The file viewer/editor overlay: open, its path prompt and its error.
+    pub files: FileState,
     /// The read-only observer preview, when open.
     pub preview: Option<PreviewState>,
     /// The agent being peeked, when the peek overlay is open.
@@ -114,6 +116,7 @@ impl Default for UiState {
             sidebar: Sidebar::default(),
             manager: ManagerState::default(),
             machines: MachineState::default(),
+            files: FileState::default(),
             preview: None,
             peek: None,
             keymap: KeyMap::default(),
@@ -141,6 +144,8 @@ impl UiState {
             Overlay::Manager
         } else if self.machines.open {
             Overlay::Machines
+        } else if self.files.open {
+            Overlay::Files
         } else if self.sidebar.open {
             Overlay::Sidebar
         } else {
@@ -159,6 +164,7 @@ impl UiState {
             || self.peek.is_some()
             || self.manager.open
             || self.machines.open
+            || self.files.open
             || self.preview.is_some()
             || self.sidebar.open
     }
@@ -260,6 +266,21 @@ pub struct MachineState {
     /// The machine waiting for the second `d`/Enter of a removal.
     pub confirm: Option<String>,
     /// Core's refusal or a connection problem, shown inside the overlay.
+    pub error: Option<String>,
+}
+
+/// The file overlay's local state. The path prompt is shown before a read;
+/// an error stays visible inside the overlay while the person corrects the
+/// path. The viewer, diff and buffers are runtime state, not UI state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileState {
+    pub open: bool,
+    /// Where the overlay's path prompt points: the focused pane's machine and
+    /// cwd at the moment it opened.
+    pub context: super::file::Context,
+    /// The path prompt, prefilled from the focused pane's cwd.
+    pub prompt: Option<Line>,
+    /// Core's refusal or a local IO problem, shown inside the overlay.
     pub error: Option<String>,
 }
 

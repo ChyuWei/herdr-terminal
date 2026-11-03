@@ -18,6 +18,7 @@
 
 mod agents;
 mod events;
+mod file;
 mod input;
 mod machines;
 mod manager;
@@ -164,6 +165,19 @@ struct PendingStart {
     on: Option<String>,
 }
 
+/// One open file, its pre-editor text and the local temp file an editor may
+/// still be using. Contents live only in memory here: they never enter the
+/// workspace document or a label.
+struct FileSession {
+    pane: super::file::Pane,
+    /// The full text first read, for the content-based conflict check.
+    original: String,
+    /// The editor's buffer, while a diff is pending.
+    edited: Option<String>,
+    /// The local temp file, until the editor returns and it is removed.
+    temp: Option<PathBuf>,
+}
+
 pub(super) struct Screen<'a> {
     size: (u16, u16),
     hc: Option<PathBuf>,
@@ -197,6 +211,10 @@ pub(super) struct Screen<'a> {
     machine_next_refresh: Option<Instant>,
     /// The read-only observer preview, when one is open.
     preview: Option<ManagerPreview>,
+    /// The open file overlay's contents, when a path was read.
+    file: Option<FileSession>,
+    /// Names this screen's editor temp files uniquely.
+    file_serial: u64,
     terminal: ScreenTerminal,
     guard: &'a mut ScreenGuard,
     reconn: Option<Reconnect>,
@@ -266,6 +284,8 @@ impl<'a> Screen<'a> {
             machine_rows: Vec::new(),
             machine_next_refresh: None,
             preview: None,
+            file: None,
+            file_serial: 0,
             terminal,
             guard,
             reconn: None,
@@ -498,6 +518,7 @@ impl<'a> Screen<'a> {
         let machine_rows = &self.machine_rows;
         let theme = &self.theme;
         let scroll_hint = self.scroll_hint();
+        let file_pane = self.file.as_ref().map(|session| &session.pane);
         // A finished pane has no prompt to type into; its final cursor would
         // suggest otherwise.
         let finished: Vec<PaneId> = self
@@ -524,6 +545,7 @@ impl<'a> Screen<'a> {
                     manager: manager_rows,
                     machines: machine_rows,
                     preview: preview_screen.as_ref(),
+                    files: file_pane,
                 };
                 let rendered =
                     ui::render_with(frame.buffer_mut(), area, workspace, &ui_state, &view);

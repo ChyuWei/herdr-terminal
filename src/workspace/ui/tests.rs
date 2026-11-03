@@ -133,6 +133,7 @@ fn render_agents(
         manager: &[],
         machines: &[],
         preview: None,
+        files: None,
     };
     let rendered = render_with(&mut buffer, area, workspace, ui, &view);
     (buffer, rendered)
@@ -266,7 +267,7 @@ fn help_is_an_overlay_listing_the_prefix_keys() {
         help: true,
         ..UiState::default()
     };
-    let (buffer, rendered) = render_ws(&workspace, &ui, 100, 26);
+    let (buffer, rendered) = render_ws(&workspace, &ui, 100, 30);
     let text = lines(&buffer).join("\n");
     assert!(text.contains("help"), "{text}");
     assert!(text.contains("prefix Ctrl-b"), "{text}");
@@ -533,6 +534,7 @@ fn a_local_selection_paints_its_cells_with_the_theme_selection_color() {
         manager: &[],
         machines: &[],
         preview: None,
+        files: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -564,6 +566,7 @@ fn the_scroll_hint_replaces_the_idle_status_hint() {
         manager: &[],
         machines: &[],
         preview: None,
+        files: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -594,6 +597,7 @@ fn explicit_themes_style_the_chrome_consistently() {
             manager: &[],
             machines: &[],
             preview: None,
+            files: None,
         };
         let mut buffer = Buffer::empty(area);
         render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -632,6 +636,7 @@ fn the_terminal_grid_is_not_painted_by_the_theme() {
         manager: &[],
         machines: &[],
         preview: None,
+        files: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -665,6 +670,7 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
         manager: &[],
         machines: &[],
         preview: None,
+        files: None,
     };
     let mut buffer = Buffer::empty(area);
     let started = std::time::Instant::now();
@@ -696,6 +702,7 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
         manager: &[],
         machines: &[],
         preview: None,
+        files: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &stopped);
@@ -734,6 +741,7 @@ fn render_manager(ui: &UiState, rows: &[ManagerRow], width: u16, height: u16) ->
         manager: rows,
         machines: &[],
         preview: None,
+        files: None,
     };
     let mut buffer = Buffer::empty(area);
     let rendered = render_with(&mut buffer, area, &workspace, ui, &view);
@@ -850,6 +858,7 @@ fn the_preview_draws_a_read_only_border_title_and_terminal() {
         manager: &[],
         machines: &[],
         preview: Some(&screen),
+        files: None,
     };
     let mut buffer = Buffer::empty(area);
     let rendered = render_with(&mut buffer, area, &workspace, &ui, &view);
@@ -860,4 +869,185 @@ fn the_preview_draws_a_read_only_border_title_and_terminal() {
     assert!(text.contains("PREVIEW"), "the observer VT is drawn: {text}");
     assert!(rendered.focused.is_none());
     assert!(rendered.prompt_cursor.is_none());
+}
+
+// --- file overlay ----------------------------------------------------------
+
+fn file_view<'a>(
+    workspace: &'a Workspace,
+    ui: &'a UiState,
+    pane: Option<&'a crate::workspace::file::Pane>,
+) -> (Buffer, Render) {
+    let area = Rect::new(0, 0, 100, 30);
+    let theme = Theme::default();
+    let selections = BTreeMap::new();
+    let screens = BTreeMap::new();
+    let view = View {
+        screens: &screens,
+        rows: &[],
+        theme: &theme,
+        selections: &selections,
+        scroll_hint: None,
+        manager: &[],
+        machines: &[],
+        preview: None,
+        files: pane,
+    };
+    let mut buffer = Buffer::empty(area);
+    let rendered = render_with(&mut buffer, area, workspace, ui, &view);
+    (buffer, rendered)
+}
+
+fn file_pane(
+    path: &str,
+    text: &str,
+    first: usize,
+    last: usize,
+    lines: usize,
+) -> crate::workspace::file::Pane {
+    use crate::workspace::file::{Context, Pane, Window};
+    Pane::viewing(
+        path,
+        Context::default(),
+        Window {
+            text: text.into(),
+            first,
+            last,
+            lines,
+        },
+    )
+}
+
+#[test]
+fn the_file_prompt_names_the_machine_cwd_and_path() {
+    use crate::workspace::file::Context;
+    use crate::workspace::state::FileState;
+    let (workspace, _) = one_pane();
+    let ui = UiState {
+        files: FileState {
+            open: true,
+            context: Context {
+                on: Some("alpha".into()),
+                cwd: Some("/srv/app".into()),
+            },
+            prompt: Some(Line::new("/srv/app/")),
+            error: None,
+        },
+        ..UiState::default()
+    };
+    let (buffer, rendered) = file_view(&workspace, &ui, None);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("file · Enter read · Esc close"), "{text}");
+    assert!(text.contains("alpha · cwd /srv/app"), "{text}");
+    assert!(text.contains("path: /srv/app/"), "{text}");
+    assert!(
+        text.contains("a path, not a directory"),
+        "the prompt explains itself: {text}"
+    );
+    let (_, y) = rendered
+        .prompt_cursor
+        .expect("the path prompt has a cursor");
+    assert_eq!(y, file_rect(Rect::new(0, 0, 100, 30)).y + 2);
+}
+
+#[test]
+fn the_file_viewer_shows_the_path_range_and_lines() {
+    use crate::workspace::state::FileState;
+    let (workspace, _) = one_pane();
+    let pane = file_pane("notes.txt", "one\ntwo\n", 1, 2, 10);
+    let ui = UiState {
+        files: FileState {
+            open: true,
+            ..FileState::default()
+        },
+        ..UiState::default()
+    };
+    let (buffer, rendered) = file_view(&workspace, &ui, Some(&pane));
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("file · local · notes.txt"), "{text}");
+    assert!(text.contains("lines 1-2 of 10"), "{text}");
+    assert!(text.contains("one") && text.contains("two"), "{text}");
+    assert!(
+        text.contains("file · e edit · Esc close"),
+        "the viewer offers the editor: {text}"
+    );
+    assert_eq!(rendered.prompt_cursor, None, "the viewer has no cursor");
+}
+
+#[test]
+fn the_diff_draws_add_and_remove_marks_with_a_summary() {
+    use crate::workspace::file::{Context, Pane, diff};
+    use crate::workspace::state::FileState;
+    let (workspace, _) = one_pane();
+    let mut pane = Pane::viewing(
+        "notes.txt",
+        Context::default(),
+        crate::workspace::file::Window::default(),
+    );
+    pane.viewer = None;
+    pane.diff = Some(diff("a\nb\n", "a\nc\n"));
+    let ui = UiState {
+        files: FileState {
+            open: true,
+            ..FileState::default()
+        },
+        ..UiState::default()
+    };
+    let (buffer, _) = file_view(&workspace, &ui, Some(&pane));
+    let text = lines(&buffer).join("\n");
+    assert!(
+        text.contains("file diff · w write · q discard · Esc close"),
+        "{text}"
+    );
+    assert!(text.contains("1 added, 1 removed"), "{text}");
+    assert!(text.contains("+     2 c"), "the added line: {text}");
+    assert!(text.contains("-     2 b"), "the removed line: {text}");
+}
+
+#[test]
+fn a_conflict_is_a_title_and_an_error_that_keeps_the_overlay() {
+    use crate::workspace::file::{Context, Pane, diff};
+    use crate::workspace::state::FileState;
+    let (workspace, _) = one_pane();
+    let mut pane = Pane::viewing(
+        "notes.txt",
+        Context::default(),
+        crate::workspace::file::Window::default(),
+    );
+    pane.viewer = None;
+    pane.diff = Some(diff("a\n", "b\n"));
+    pane.conflict = true;
+    let ui = UiState {
+        files: FileState {
+            open: true,
+            error: Some("notes.txt changed since it was read; o overwrite or q discard".into()),
+            ..FileState::default()
+        },
+        ..UiState::default()
+    };
+    let (buffer, _) = file_view(&workspace, &ui, Some(&pane));
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("changed on disk"), "{text}");
+    assert!(text.contains("o overwrite"), "{text}");
+    assert!(text.contains("changed since it was read"), "{text}");
+}
+
+#[test]
+fn an_empty_file_or_a_read_error_stays_inside_the_overlay() {
+    use crate::workspace::state::FileState;
+    let (workspace, _) = one_pane();
+    let pane = file_pane("notes.txt", "", 1, 0, 0);
+    let ui = UiState {
+        files: FileState {
+            open: true,
+            error: Some("notes.txt: not_found".into()),
+            ..FileState::default()
+        },
+        ..UiState::default()
+    };
+    let (buffer, _) = file_view(&workspace, &ui, Some(&pane));
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("empty file"), "{text}");
+    assert!(text.contains("notes.txt: not_found"), "{text}");
+    assert!(text.contains("file · e edit · Esc close"), "{text}");
 }

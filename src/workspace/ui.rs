@@ -6,6 +6,7 @@
 //! uses its inner rectangle. No core, VT or terminal is touched here.
 
 use super::agents::{self, AgentRow};
+use super::file::{DiffTag, Pane};
 use super::geometry::{self, Rects};
 mod machine_ui;
 
@@ -20,7 +21,7 @@ use crate::theme::Theme;
 use crate::vt::Screen as VtScreen;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use std::collections::BTreeMap;
@@ -41,6 +42,8 @@ pub const HELP: &[&str] = &[
     "/ filter  p preview (read-only)  Esc close manager",
     "m machine manager · Enter connect · a add · r rename · d remove",
     "machines: n new terminal there · / filter · Esc close · add takes target only",
+    "o file viewer       e edit in $VISUAL/$EDITOR, diff before write",
+    "file: Enter read · e edit · w write · q discard · Esc close",
     "sidebar: j/k move  g/G first/last  Enter jump",
     "p pin / unpin  u mark unread  i peek  Esc/a close  any key closes peek",
     "Ctrl-] detach      prefix twice sends Ctrl-b",
@@ -82,6 +85,8 @@ pub struct View<'a> {
     pub machines: &'a [MachineRow],
     /// The read-only observer preview's local VT snapshot.
     pub preview: Option<&'a VtScreen>,
+    /// The file overlay's viewer or pending diff.
+    pub files: Option<&'a Pane>,
 }
 
 impl Default for View<'_> {
@@ -102,6 +107,7 @@ impl Default for View<'_> {
             manager: &MANAGER_ROWS,
             machines: &MACHINE_ROWS,
             preview: None,
+            files: None,
         }
     }
 }
@@ -153,15 +159,7 @@ pub fn render_with(
     if rects.panes.is_empty() && area.height > 0 {
         draw_empty(buffer, rects.workspace);
     }
-    rendered.prompt_cursor = draw_status(
-        buffer,
-        workspace,
-        ui,
-        rects.status,
-        view.rows,
-        theme,
-        view.scroll_hint,
-    );
+    rendered.prompt_cursor = draw_status(buffer, workspace, ui, rects.status, theme, view);
     if ui.search.is_some() {
         // The search bar owns the status row; the program's cursor would
         // suggest the keys are still typing into it.
@@ -183,6 +181,10 @@ pub fn render_with(
     }
     if ui.machines.open {
         rendered.prompt_cursor = machine_ui::draw_machines(buffer, area, ui, view.machines, theme);
+        rendered.focused = None;
+    }
+    if ui.files.open {
+        rendered.prompt_cursor = draw_file(buffer, area, ui, view.files, theme);
         rendered.focused = None;
     }
     if let Some(preview) = &ui.preview {
@@ -405,10 +407,11 @@ fn draw_status(
     workspace: &Workspace,
     ui: &UiState,
     area: Rect,
-    rows: &[AgentRow],
     theme: &Theme,
-    scroll_hint: Option<&str>,
+    view: &View<'_>,
 ) -> Option<(u16, u16)> {
+    let rows = view.rows;
+    let scroll_hint = view.scroll_hint;
     if area.width == 0 || area.height == 0 {
         return None;
     }
@@ -490,6 +493,7 @@ fn draw_status(
         Connection::Live if ui.machines.open => {
             "machines · Enter connect · a add · n terminal · Esc close".to_owned()
         }
+        Connection::Live if ui.files.open => file_hint(ui, view.files).to_owned(),
         Connection::Live if ui.peek.is_some() => "peek · any key closes".to_owned(),
         Connection::Live if ui.sidebar.open => "agents · Esc closes".to_owned(),
         Connection::Live => "^b ? help".to_owned(),
@@ -1002,6 +1006,192 @@ fn draw_manager(
         .saturating_add(Span::raw(before.as_str()).width() as u16)
         .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
     Some((x, inner.y))
+}
+
+/// The file overlay's rectangle. The viewer, diff and prompt share it.
+pub fn file_rect(area: Rect) -> Rect {
+    if area.width < 8 || area.height < 5 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let width = area.width.saturating_sub(4).min(100);
+    let height = area.height.saturating_sub(2);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + 1,
+        width,
+        height,
+    )
+}
+
+/// Rows available to file text inside the overlay, below the facts line.
+pub fn file_body_height(area: Rect) -> usize {
+    file_rect(area).height.saturating_sub(2).saturating_sub(1) as usize
+}
+
+/// The status-bar hint for the file overlay.
+fn file_hint(ui: &UiState, pane: Option<&Pane>) -> &'static str {
+    if ui.files.prompt.is_some() {
+        return "files · Enter read · Esc close";
+    }
+    match pane {
+        Some(pane) if pane.conflict => "changed on disk · o overwrite · q discard",
+        Some(pane) if pane.diff.is_some() => "diff · w write · q discard · Esc close",
+        Some(pane) if pane.viewer.is_some() => "file · e edit · Esc close",
+        _ => "files · Enter read · Esc close",
+    }
+}
+
+/// The modal file overlay: the path prompt, the read-only viewer, or the
+/// pending editor diff. It never writes the workspace document and never
+/// contains terminal input.
+fn draw_file(
+    buffer: &mut Buffer,
+    area: Rect,
+    ui: &UiState,
+    pane: Option<&Pane>,
+    theme: &Theme,
+) -> Option<(u16, u16)> {
+    if !ui.files.open {
+        return None;
+    }
+    let rect = file_rect(area);
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    Clear.render(rect, buffer);
+    let title = if ui.files.prompt.is_some() {
+        " file · Enter read · Esc close "
+    } else if pane.is_some_and(|pane| pane.conflict) {
+        " file diff · changed on disk · o overwrite · q discard "
+    } else if pane.is_some_and(|pane| pane.diff.is_some()) {
+        " file diff · w write · q discard · Esc close "
+    } else {
+        " file · e edit · Esc close "
+    };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.overlay))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.overlay)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(rect);
+    block.render(rect, buffer);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let mut rows: Vec<Line> = Vec::new();
+    if let Some(line) = &ui.files.prompt {
+        let context = &ui.files.context;
+        let mut facts = context.machine_label().to_owned();
+        if let Some(cwd) = context.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+            facts.push_str(" · cwd ");
+            facts.push_str(cwd);
+        }
+        rows.push(Line::from(Span::styled(
+            facts,
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+        let label = " path: ";
+        let text = line.text();
+        rows.push(Line::from(vec![
+            Span::styled(label, Style::default().fg(theme.highlight)),
+            Span::styled(text, Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+        let before = line.before();
+        let cursor = (
+            inner
+                .x
+                .saturating_add(Span::raw(label).width() as u16)
+                .saturating_add(Span::raw(before.as_str()).width() as u16)
+                .min(inner.x.saturating_add(inner.width.saturating_sub(1))),
+            inner.y + 1,
+        );
+        if let Some(error) = &ui.files.error {
+            rows.push(Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        rows.push(Line::from(Span::styled(
+            "a path, not a directory; local or a machine's path",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+        Paragraph::new(rows).render(inner, buffer);
+        return Some(cursor);
+    }
+
+    let Some(pane) = pane else {
+        Paragraph::new(Line::from(Span::styled(
+            "no file open",
+            Style::default().add_modifier(Modifier::DIM),
+        )))
+        .render(inner, buffer);
+        return None;
+    };
+
+    let mut facts = pane.title();
+    if let Some(diff) = &pane.diff {
+        facts.push_str(" · ");
+        facts.push_str(&diff.summary());
+        if diff.truncated {
+            facts.push_str(" (large change shown whole)");
+        }
+    } else if let Some(viewer) = &pane.viewer {
+        facts.push_str(" · ");
+        facts.push_str(&viewer.range_label());
+        facts.push_str(" · e edit");
+    }
+    if pane.conflict {
+        facts.push_str(" · the file changed since it was read");
+    }
+    rows.push(Line::from(Span::styled(
+        facts,
+        Style::default()
+            .fg(theme.highlight)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if let Some(error) = &ui.files.error {
+        rows.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    if pane.diff.is_some() {
+        for row in pane.visible_diff(inner.height.saturating_sub(rows.len() as u16) as usize) {
+            let (mark, number, style) = match row.tag {
+                DiffTag::Same => (
+                    " ",
+                    row.new.or(row.old).unwrap_or(0),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                DiffTag::Add => ("+", row.new.unwrap_or(0), Style::default().fg(Color::Green)),
+                DiffTag::Remove => ("-", row.old.unwrap_or(0), Style::default().fg(Color::Red)),
+            };
+            rows.push(Line::from(Span::styled(
+                format!("{mark} {number:>5} {}", row.text),
+                style,
+            )));
+        }
+    } else if let Some(viewer) = &pane.viewer {
+        let height = inner.height.saturating_sub(rows.len() as u16) as usize;
+        if viewer.window.is_empty() {
+            rows.push(Line::from(Span::styled(
+                "empty file",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        } else {
+            for (number, text) in viewer.visible(height) {
+                rows.push(Line::from(format!("  {number:>5} {text}")));
+            }
+        }
+    }
+    Paragraph::new(rows).render(inner, buffer);
+    None
 }
 
 /// The read-only observer preview: a border and title, a facts line, and the

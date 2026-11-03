@@ -36,6 +36,8 @@ pub enum Command {
     Terminals,
     /// Open the machine manager.
     Machines,
+    /// Open the Core-backed file viewer.
+    Files,
     /// Peek the focused (or sidebar-selected) agent.
     Peek,
     /// Jump to the next or previous agent in sidebar order.
@@ -79,6 +81,8 @@ pub enum Effect {
     Terminals,
     /// Open the machine manager; the runtime lists core's machines.
     Machines,
+    /// Open the file overlay for the focused pane's machine and cwd.
+    Files,
     /// Open the peek overlay for the focused or selected agent.
     Peek,
     /// Jump to the next or previous agent.
@@ -123,6 +127,7 @@ impl Workspace {
             Command::Agents => Effect::Agents,
             Command::Terminals => Effect::Terminals,
             Command::Machines => Effect::Machines,
+            Command::Files => Effect::Files,
             Command::Peek => Effect::Peek,
             Command::JumpAgent(jump) => Effect::JumpAgent(jump),
             Command::Palette => Effect::Palette,

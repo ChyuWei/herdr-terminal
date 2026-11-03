@@ -17,6 +17,7 @@
 
 pub mod agents;
 pub mod commands;
+pub mod file;
 pub mod geometry;
 pub mod keys;
 mod local;

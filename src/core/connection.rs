@@ -9,9 +9,9 @@ use super::discovery;
 use super::events::{self, EventStream, Notification};
 use super::frames::{Frame, FrameDecoder, FrameError, parse_resize};
 use super::rpc::{
-    AttachResult, DocGetResult, DocSetResult, Hello, Machine, MachineAdd, MachineListResult,
-    RESIZE_NOTIFICATIONS, ReadResult, RpcError, Snapshot, Terminal, machine_params,
-    machine_rename_params,
+    AttachResult, DocGetResult, DocSetResult, FileEdit, FileRead, FileReadResult, FileResult,
+    FileWrite, Hello, Machine, MachineAdd, MachineListResult, RESIZE_NOTIFICATIONS, ReadResult,
+    RpcError, Snapshot, Terminal, machine_params, machine_rename_params,
 };
 use super::{Error, Result};
 use serde_json::{Value, json};
@@ -36,6 +36,11 @@ pub const LABEL_TIMEOUT: Duration = Duration::from_secs(2);
 /// The machine manager refreshes its inventory while open; a slow or wedged
 /// core must not hold the UI for the full call default.
 pub const MACHINE_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A file call can cross to another machine and write up to 8 MB; it gets
+/// longer than a local terminal call but still has a deadline the UI can
+/// recover from.
+pub const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const READ_CHUNK: usize = 64 * 1024;
 const MAX_HELLO_LINE: usize = 1 << 20;
@@ -554,6 +559,28 @@ impl CoreClient {
     pub fn machine_rm(&self, machine: &str) -> Result<()> {
         self.call("machine.rm", machine_params(machine))?;
         Ok(())
+    }
+
+    /// Reads a window of whole lines from a file here or on a machine. Core
+    /// resolves the path and does the IO; this client never opens a remote
+    /// path itself.
+    pub fn file_read(&self, params: &FileRead) -> Result<FileReadResult> {
+        let value = self.call_timeout("file.read", serde_json::to_value(params)?, FILE_TIMEOUT)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Replaces a file's content through core. `data` is base64; core decodes
+    /// it and caps the raw size.
+    pub fn file_write(&self, params: &FileWrite) -> Result<FileResult> {
+        let value = self.call_timeout("file.write", serde_json::to_value(params)?, FILE_TIMEOUT)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Applies exact replacements through core, all or none. Each `old` must
+    /// occur exactly once in the file as it was.
+    pub fn file_edit(&self, params: &FileEdit) -> Result<FileResult> {
+        let value = self.call_timeout("file.edit", serde_json::to_value(params)?, FILE_TIMEOUT)?;
+        Ok(serde_json::from_value(value)?)
     }
 
     /// Reads a versioned opaque document. An absent document is

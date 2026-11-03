@@ -98,6 +98,10 @@ impl Screen<'_> {
             self.swallow = Some(key.code);
             return self.machine_key(&key);
         }
+        if self.ui.files.open {
+            self.swallow = Some(key.code);
+            return self.file_key(&key);
+        }
         if self.ui.selecting.is_some() {
             if self.selection_key(&key)? {
                 // A selection key is handled locally; its release must not
@@ -319,6 +323,7 @@ impl Screen<'_> {
             Effect::Agents => self.toggle_sidebar(),
             Effect::Terminals => self.toggle_manager(),
             Effect::Machines => self.toggle_machines(),
+            Effect::Files => self.toggle_files(),
             Effect::Peek => self.peek_focused(),
             Effect::JumpAgent(jump) => self.jump_agent(jump),
             Effect::Palette => self.open_palette(),
