@@ -11,3 +11,4 @@ under `## [<version>] - YYYY-MM-DD`; normal work does not edit this file. The
 - Adds GitHub Actions CI and a tag-triggered macOS release build.
 - Adds a Core-wide terminal manager with Show, Hide and a read-only Preview.
 - Adds a machine manager for Core machines and remote terminals, with rename recovery.
+- Adds a paged Core-backed file viewer, external editor, line diff and content-checked write-back.

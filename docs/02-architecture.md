@@ -62,7 +62,7 @@ Rules:
 - **Core never sends draw commands.** The TUI runs its own VT and composes its own cells.
 - **Status is only OSC 7501.** No screen scraping, no agent registry, no vendor logic.
 - **A client owns its document and label namespace.** Do not read another client's private state as yours.
-- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar flag stay in the per-screen view; scrollback, search, selection, theme and terminal- and machine-manager state stay in memory.
+- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar flag stay in the per-screen view; scrollback, search, selection, theme and terminal-/machine-manager state stay in memory, and open file contents stay out of the document and labels (only the editor's temp copy is local).
 - **Feature-gate on `hello`.** Check generation, version, methods and features; generation 1 only grows.
 
 ## 4. Architecture
@@ -87,7 +87,8 @@ Start with threads and channels; introduce an async runtime only if a measured n
 | `model` | Pure event and terminal model shared by the screen and workspace |
 | `screen` | Single-pane lifecycle, attach playback, pointer and view |
 | `vt` | libghostty-vt binding: cells and grapheme clusters, keys, mouse, scrollback, search, selection |
-| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, terminal manager, machine manager, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect, manager, machine and agent handling; `ui/machine_ui.rs` draws the machine panel |
+| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, terminal manager, machine manager, file viewer, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect, manager, machine, file and agent handling; `ui/machine_ui.rs` draws the machine panel |
+| `workspace::file`, `workspace::runtime::file` | Pure file context, 400-line paging, line diff, editor selection/temp rules and write-back rules; runtime file IO through Core and the editor session |
 | `workspace::state`, `workspace::local` | Runtime UI state and per-screen view |
 | `config` | Startup settings: theme, scrollback, mouse, clipboard, prefix keys |
 | `theme` | Chrome colors, default/dark/light, 16/256/truecolor mapping |
@@ -129,9 +130,10 @@ placement, selection and search consistent with Core.
 
 1. An in-progress split resize or selection drag owns every mouse event.
 2. An open overlay (help, prompt, palette, search, manager, machine manager
-   with its add/rename prompt and removal confirmation, preview, peek,
-   sidebar) consumes every mouse event. A selection is not in that list: a
-   fresh press leaves selection and is routed as if none existed.
+   with its add/rename prompt and removal confirmation, file overlay with its
+   path prompt, viewer, diff and conflict states, preview, peek, sidebar)
+   consumes every mouse event. A selection is not in that list: a fresh press
+   leaves selection and is routed as if none existed.
 3. Chrome: a tab-bar click selects a tab, a status-bar click is consumed, and
    a split-gap press starts a resize. Chrome never reaches a program.
 4. A pane-grid press focuses the pane; a border press only focuses it. With
@@ -408,7 +410,68 @@ or spawns a replacement.
 (any later remote document use must call `doc.get`/`doc.set` with `on`), and
 never touches Herdr App's document or `herdr.space`/`herdr.tab` labels.
 
-### 4.9 Core client and lifecycle
+### 4.9 Files: viewer, editor and write-back
+
+**Overlay and context.** `prefix o` (palette "file viewer", action `files`)
+opens a modal file overlay and closes the other overlays. While it or its
+prompt, viewer, diff or conflict state is open, every key is consumed and none
+reaches a program. The context comes from the focused pane when the overlay
+opens: a qualified `machine/t7` address sends `on` and the terminal's cwd; a
+local pane omits `on` but still sends its cwd; with no pane both are omitted,
+so Core's default applies. The path prompt starts at that cwd with a trailing
+separator, or empty. There is no directory listing or file picker: the path
+prompt is the picker, and a trailing `/` or `\` is refused before any read;
+other directory paths surface Core's IO error. Esc closes the prompt.
+
+**Viewer.** The viewer is read-only and paged. It calls `file.read` with
+`offset` and `limit` for a 400-line window and never loads the whole file for
+display. A header names the machine (`local` or its name), the path, the
+loaded range and the file's total line count (`lines 1-400 of 900`,
+`line 3 of 5`, or `empty file`). `j`/`k` or the arrows move a line, PgUp/PgDn
+move a screen, and `g`/`G` or Home/End go to the first/last line; leaving the
+loaded window fetches the next or previous 400-line page. Esc closes. Read
+errors stay in the overlay, under a heading that names the machine and path,
+and leave the TUI usable.
+
+**Editor and diff.** `e` makes one unbounded `file.read` and requires a
+complete reply before it looks up an editor or creates a temp. It chooses
+`$VISUAL`, else `$EDITOR`; the value is split on whitespace (no shell
+quoting) and the temp path is appended, with no `vi` fallback. The client
+writes a unique local temp file `ht-<pid>-<serial>-<basename>` with
+create-new, mode 0600 where supported, and the source basename and extension
+preserved, then suspends the TUI: it leaves the alternate screen and raw mode
+and restores keyboard enhancement, paste, focus and mouse on return, even when
+the editor fails or exits nonzero. The temp is read back and removed. An
+unchanged buffer returns to the viewer; a changed one becomes a line diff
+(LCS, `+`/`-` marks, an added/removed summary; a large alignment is shown as
+one changed block and the row list is capped). The diff is a display aid only:
+there is no merge or three-way resolution.
+
+**Write-back.** `w`/Enter re-reads the whole file and compares it with the
+first full read; Core has no file version or etag. A difference shows a
+conflict and refuses to write; `o` in that state is the explicit overwrite.
+`q`/Esc discards without writing. Without a conflict, one exact contiguous
+replacement uses `file.edit`; every other change, and the explicit overwrite,
+uses `file.write` with base64 data. A failed write keeps the diff and buffer
+with the error. A whole read that Core truncates at its inline cap (about
+8 MB of estimated JSON bytes; `last < lines`) is refused before the editor
+starts and again on the write re-read, before any comparison or write, so a
+partial buffer is never edited, compared or saved. The viewer can still page
+through such a file. The refusal names the machine, path and read/known line
+counts.
+
+**Boundary.** Core reads and writes the file, local or remote, through this
+client's one long-lived connection; the client never opens a remote path and
+does no direct path IO for the file itself. Contents stay in the in-memory
+file session: they never enter the `herdr-terminal` document, labels,
+another client's document or a Core document. Only the editor's temp copy is
+local.
+`file.read`, `file.write` and `file.edit` are required at connect; the minimum
+Core stays 0.1.17, and the existing `hello` check refuses a core without them,
+with no fallback. There is no directory listing, embedded editor, merge,
+three-way resolution or direct local/remote path IO.
+
+### 4.10 Core client and lifecycle
 
 **Supported Core**
 
@@ -489,7 +552,7 @@ no keys, mouse reports, RESIZE, FOCUS or FACTS. Normal attaches are unchanged.
   same bounded conflict/merge budget as a normal write, and save the local
   view; do not stop core unless the user explicitly asks.
 
-### 4.10 Scrollback, search, palette, settings and themes
+### 4.11 Scrollback, search, palette, settings and themes
 
 **Scrollback** is Ghostty's own bounded history per pane. Attach asks core for
 history above the screen, so output printed before a screen attached is
@@ -556,6 +619,7 @@ Statuses:
 | Workspace | Spaces, tabs, panes, split/close/move, focus, zoom |
 | Terminal manager | Core-wide live-terminal inventory, Show/Hide, read-only Preview |
 | Machine manager | `machine.list` machines, connect/add/rename/remove, remote `machine/t7` terminals |
+| Files | Paged read-only viewer, `$VISUAL`/`$EDITOR`, line diff, content-checked write-back |
 | Terminals | New/close/rename, labels, keep, kill/rm, shell/command |
 | Agents | Status, turn, title, foreground, list/sidebar, peek, seen/pinned |
 | UI | Tab bar, pane borders, status bar, command palette, help, toast/confirm/prompt |
@@ -570,8 +634,7 @@ Statuses:
 | Feature | Notes |
 |---|---|
 | Tab reorder | Mouse and keyboard |
-| Files: read/write/edit, diff, external editor | Core `file.*`; no embedded editor |
-| File picker | Simple list; use `machine.exec`/`file.*` |
+| File picker / directory listing | Simple list; the path prompt is the picker today |
 | Custom layouts, accessibility | Settings and config |
 | Install, `--skill`, CLI docs | Distribution |
 | Non-macOS packaging | When those platforms become release targets |
@@ -635,6 +698,12 @@ currently implements.
   panes, streams and final screens across a Core rename or `missed` snapshot,
   without duplicates or replacement spawns. The list refreshes only while the
   overlay is open; Core has no machine-state event.
+- **Files:** a modal `prefix o` path prompt (no directory listing), a read-only
+  400-line paged `file.read` viewer, `$VISUAL`/`$EDITOR` on a local temp with
+  full TUI suspend/restore, a line diff, content-checked write-back with an
+  explicit `o` overwrite, and a refusal to edit or write a whole read
+  truncated at Core's inline cap; contents stay out of the document and
+  labels.
 - **Persistence:** the `herdr-terminal` document, restore, multi-screen
   compare-and-set, and terminal rediscovery by labels.
 - **Agents:** status, turn, title and foreground from core; the agent
@@ -679,14 +748,15 @@ The implemented set covers the connection and terminal foundation, the
 workspace and its persistence, agent awareness, the daily-driver input layer
 (mouse, history, search, selection, clipboard, palette, settings and themes),
 the local VT's grapheme clustering, initial terminal sizes, the Core-wide
-terminal manager and its read-only Preview, and the machine manager with its
-remote terminals and rename recovery. Packaging, notices, CI and versioning
-are also implemented; the package is macOS Apple Silicon. Still planned: tab
-reorder, custom layouts, accessibility, general confirm/toast prompts, files,
-install scripts, `ht status` and mods. Scrollback, search, selection, theme,
-terminal-manager and machine-manager state stay in memory and are never
-written to the shared document or the per-screen view. Settings are read at
-startup; there is no settings UI and no live reload.
+terminal manager and its read-only Preview, the machine manager with its
+remote terminals and rename recovery, and the Core-backed file viewer, editor,
+line diff and write-back. Packaging, notices, CI and versioning are also
+implemented; the package is macOS Apple Silicon. Still planned: tab reorder,
+custom layouts, accessibility, general confirm/toast prompts, the file picker
+and directory listing, install scripts, `ht status` and mods. Scrollback,
+search, selection, theme, terminal- and machine-manager state, and open file
+contents stay out of the shared document and the per-screen view. Settings are
+read at startup; there is no settings UI and no live reload.
 
 The implementation is unreleased: the macOS package and CI exist, but no
 version has been tagged yet. See §3 for the boundary rules, §7 for conventions,
@@ -704,9 +774,9 @@ Current status is §5.5. The remaining work, grouped by capability:
 - General confirm/toast prompts.
 - Performance tuning for many panes.
 
-### Files and future remote state
+### File picker and future remote state
 
-- File read/write/edit; diff; external editor; simple file picker.
+- File picker and directory listing; the path prompt is the picker today.
 - Remote documents remain unimplemented: the workspace document is local.
   Any future remote document access must use `doc.get`/`doc.set` with `on`.
 

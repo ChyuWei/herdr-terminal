@@ -6,7 +6,7 @@ Herdr Core 的终端客户端。
 
 HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 runtime）的终端 UI（TUI）客户端。它和 Herdr App 桌面客户端平级，用来替代旧的 Herdr 1.x TUI。HerdR Terminal 负责屏幕和工作区组织；Herdr Core 负责程序和程序的事实。
 
-**状态：** 已实现，还未发布。客户端连接 Herdr Core，用本地 VT 渲染终端，提供带恢复和 agent 感知的 spaces/tabs/panes 工作区，并具备日常使用的输入能力：鼠标、有上限的 scrollback 和搜索、选择与复制/粘贴、命令面板，以及带 default/dark/light 主题的启动配置；此外还有 Core 范围内的终端管理器和机器管理器，远程终端位于同一工作区中。文件及其余后续功能见下方计划。
+**状态：** 已实现，还未发布。客户端连接 Herdr Core，用本地 VT 渲染终端，提供带恢复和 agent 感知的 spaces/tabs/panes 工作区，并具备日常使用的输入能力：鼠标、有上限的 scrollback 和搜索、选择与复制/粘贴、命令面板，以及带 default/dark/light 主题的启动配置；此外还有 Core 范围内的终端管理器、面向 Core 机器的机器管理器（远程终端位于同一工作区中），以及由 Core 读取和写入的文件查看器、外部编辑器、行级 diff 和写回。文件选择器及其余后续功能见下方计划。
 
 **兼容性：** 支持 Herdr Core 0.1.17 及更新版本，协议 generation 1。连接时若 Core 更旧或版本无法解析，客户端会给出更新提示并拒绝连接；缺少必需方法或 feature 的 Core 也会被拒绝。`resize_notifications` 是连接必需的能力，并非可选（observer attach 没有回退路径）；其余能力根据 Core 在 `hello` 中声明的 features 启用，而不是检查版本字符串。
 
@@ -22,6 +22,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 - **终端操作**：labels、keep、kill/rm、shell 或命令。
 - **终端管理器**：`prefix t` 打开 Core 范围内所有 live 终端的列表，包含已显示标记、OSC 7501 状态（未报告时为 `unknown`）、存活时间、地址，以及可选的名称/标题/父终端/机器/cwd；按 blocked/error、working、done、idle、unknown 排序，并支持大小写不敏感的子串过滤。`Enter` 通过采用现有地址显示未显示的终端（不会启动新程序），或隐藏已显示的终端（detach 并移除 pane，绝不 kill/rm）；`p` 通过 observer attach 只读预览，和 agent peek 不同。选择和过滤属于本地 UI 状态。
 - **机器管理器**：`prefix m` 打开 Core 已知机器的模态列表，数据来自 `machine.list`，包含名称、状态（connecting、connected、needs_login、needs_update、unreachable 或 unknown）、处于当前状态的时长和 Core 给出的原因（如有）、target、host/version、session，以及 temporary/via 标记；按 connected、connecting、needs_login、needs_update、unreachable、unknown 排序，同状态中永久机器在前，并支持大小写不敏感的子串过滤。`Enter` 连接或重试，`a` 按 target 添加（原样交给 Core），`r` 重命名，`d` 经确认后移除，`n` 在所选机器上启动终端。远程终端使用 `machine/t7` 地址，像本地 pane 一样位于当前工作区，并从本地文档恢复；机器连接（SSH 或 via 命令）、拨号、退避和中继流由 Core 负责，客户端按 pane label 跟随机器重命名并保留 pane 和 stream。列表只在浮层打开时、每次操作后和定时器中刷新；Core 没有机器状态事件。
+- **文件**：`prefix o` 打开模态文件浮层。文件通过 Core 读写，使用当前 pane 的机器（存在时作为 `on`）和 cwd；路径输入从该 cwd 开始，不提供目录列表或选择器（以 `/` 或 `\` 结尾的输入会被直接拒绝）。查看器只读，用 `file.read` 每次读取 400 行，显示机器、路径、已加载范围和总行数；j/k 或方向键、PgUp/PgDn、g/G 或 Home/End 滚动并在跨越页时读取下一页/上一页；Esc 关闭。`e` 通过 Core 读取整个文件，写入唯一的本地临时副本并用 `$VISUAL` 或 `$EDITOR` 打开（按空白拆分，不回退到 `vi`），期间挂起并恢复 TUI；返回后显示 `+`/`-` 行级 diff。`w`/Enter 写入，`q`/Esc 丢弃。写入前会重新读取并与首次读取比较；文件已变化时显示冲突，`o` 是显式覆盖。没有冲突时，单个连续替换使用 `file.edit`，否则使用 `file.write`（包括显式覆盖）。Core 因内联读取上限而截断的整文件读取不能编辑或写回，但查看器仍可分页浏览。文件内容不进入文档或 labels；只有编辑器的临时副本会写到本地。`file.read`、`file.write`、`file.edit` 是连接必需的方法。
 - **Agent**：status、turn、title、foreground、agent 侧栏、本地 VT peek、跳转、seen/pinned、blocked/finished 提醒。
 - **状态**：自己的 `herdr-terminal` 文档、恢复、多屏同步；按 labels 找回终端。
 - **恢复**：detach 不结束程序；重连、reattach，`missed` 后重新获取快照。
@@ -39,7 +40,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 
 - **UI**：通用 confirm/toast。
 - **工作区打磨**：tab 重排、自定义布局、无障碍（accessibility）。
-- **文件**：read/write/edit、diff、外部编辑器、简单文件选择器。
+- **文件**：目录列表和简单文件选择器。
 - **发布**：安装脚本、`--skill`、CLI 文档、`ht status` 和 Core/日志诊断。
 - **Mods/plugins（postponed）**：后续走 manifest + 外部命令模型，不用 JS/GPUI。
 - **Kitty 图片（postponed）**：有需求时再支持。

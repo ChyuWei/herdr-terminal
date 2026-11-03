@@ -12,13 +12,15 @@ local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
 (status, sidebar, local-VT peek, seen/pin, alerts), the Core-wide terminal
 manager (`prefix t`; Show/Hide and a read-only Preview), the machine manager
 (`prefix m`; add/connect/rename/remove Core machines and start `machine/t7`
-terminals), and the daily-driver input surface: mouse routing and split drags,
-bounded local scrollback with search, selection with OSC 52/native copy and
-bracketed paste, the command palette, and startup settings with
-default/dark/light themes. The local VT enables grapheme clustering as Core
-does, and new terminals start at the grid they will attach at. Settings are
-read at startup only: there is no settings UI or live reload. The tests exist
-and pass. Files, install scripts and accessibility remain planned.
+terminals), the file viewer/editor (`prefix o`; paged reads, `$VISUAL`/`$EDITOR`,
+line diff and content-checked write-back), and the daily-driver input surface:
+mouse routing and split drags, bounded local scrollback with search, selection
+with OSC 52/native copy and bracketed paste, the command palette, and startup
+settings with default/dark/light themes. The local VT enables grapheme
+clustering as Core does, and new terminals start at the grid they will attach
+at. Settings are read at startup only: there is no settings UI or live reload.
+The tests exist and pass. A file picker, install scripts and accessibility
+remain planned.
 The design intent is in the
 [core reference](docs/01-core-and-app-reference.md) and the
 [architecture](docs/02-architecture.md). Read both before proposing code; do
@@ -130,8 +132,42 @@ records, raw output, attach, events, status, documents and machines.
   the local `herdr-terminal` document. This feature reads and writes no remote
   document (any later remote document use must call `doc.get`/`doc.set` with
   `on`), and never touches the App document or `herdr.space`/`herdr.tab`.
-- **Files remain planned.** Machine work adds no `file.*` calls, diff, editor
-  or file picker.
+- **Core owns file IO.** `file.read`, `file.write` and `file.edit` go over the
+  one long-lived connection, for local and remote paths alike. Never open a
+  remote path directly, never fall back to local path IO, and never spawn
+  `hc` per action. The three methods are required at connect; the minimum
+  Core stays 0.1.17 and a missing method is refused by the `hello` check,
+  with no fallback.
+- **File contents stay in the session.** The viewer window, the first full read,
+  the editor buffer and the diff live only in the runtime file session; the
+  editor's temp file is the one local copy. Never write file contents to the
+  `herdr-terminal` document, a label, another client's document or a Core
+  document.
+- **The viewer pages.** `prefix o` reads through `file.read` with `offset` and
+  `limit`; one page is 400 lines. Never call an unbounded read for the viewer
+  or load a large file whole. An unbounded read is only for `e` and the
+  write-back check; it must pass the completeness predicate. A truncated
+  reply (`last < lines`) may be paged, but it is never edited, compared or
+  written.
+- **Editor temp and TUI restoration.** `e` reads the whole file through Core,
+  writes a unique local temp (`ht-<pid>-<serial>-<basename>`, create-new,
+  0600 where supported, basename and extension preserved), and runs `$VISUAL`
+  then `$EDITOR` with the temp path appended. Split the value on whitespace;
+  do not shell-quote it and do not add a `vi` fallback. Suspend the TUI and
+  restore the alternate screen, raw mode, keyboard enhancement, paste, focus
+  and mouse, including when the editor fails or exits nonzero. Remove the
+  temp on every path.
+- **Write-back is content-checked.** Core has no file version or etag. Re-read
+  the whole file before writing and compare it with the first read; a
+  difference requires the explicit `o` overwrite, never a silent overwrite.
+  `w`/Enter and `o` both refuse a truncated re-read before comparing or
+  writing. A failed write keeps the diff and buffer. Use `file.edit` only for
+  one exact contiguous replacement; otherwise use `file.write` with base64
+  data.
+- **No directory listing.** The path prompt is the picker. Refuse a trailing
+  `/` or `\` without a read; other directory errors come from Core. A file
+  picker/list remains planned. There is no embedded editor, merge or
+  three-way resolution, and no direct path IO for the file itself.
 - **Reconnect semantics.** A dropped connection is not a dead program. On
   `missed`, resnapshot; on `lost`/`restarted`, reattach; on `finished`, drop
   the stream. Never assume the program died.
@@ -157,7 +193,8 @@ The Cargo workspace builds and tests. The suites cover the protocol, VT,
 single-pane lifecycle, workspace, persistence, agents, the daily-driver input
 layer (mouse, scrollback/search, clipboard, palette, config and themes),
 grapheme width, initial terminal size, the terminal manager, the machine
-manager and remote recovery, and observer attach/resize ordering.
+manager and remote recovery, the file viewer/editor and write-back, and
+observer attach/resize ordering.
 
 ```sh
 cargo build --locked
@@ -214,7 +251,10 @@ src/
     agents.rs           # pure agent facts, ordering, alerts
     manager.rs          # pure Core-wide inventory, sort/filter, labels
     machines.rs         # pure machine rows, sort/filter, remote addresses
+    file.rs             # pure file context, paging, diff, editor and write rules
+    file/tests.rs       # file model tests
     runtime/            # event loop, attach, input, mouse, overlays, reconnect, agents, manager, machines
+    runtime/file.rs     # file reads, editor, diff and write-back
     ui.rs               # ratatui composition
     ui/machine_ui.rs    # machine manager panel, prompt and confirmation
     startup.rs          # document claim and restore
@@ -264,6 +304,7 @@ edit it.
 ## Next step
 
 Pick up the remaining planned features in `docs/02-architecture.md` §5:
-files, install scripts and CLI docs, accessibility, mods, and a settings UI or
-live reload if one is designed. Keep the same rule: prove protocol, VT, input
-and recovery behavior with tests before UI chrome.
+the file picker and directory listing, install scripts and CLI docs,
+accessibility, mods, and a settings UI or live reload if one is designed. Keep
+the same rule: prove protocol, VT, input and recovery behavior with tests
+before UI chrome.
