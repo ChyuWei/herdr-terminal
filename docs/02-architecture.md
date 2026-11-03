@@ -1,6 +1,6 @@
 # HerdR Terminal — Architecture
 
-**Status:** design draft; current implementation status in §5.5, 2026-11-02
+**Status:** design draft; current implementation status in §5.5, 2026-11-03
 **Product:** HerdR Terminal
 **Code:** `herdr-terminal` (repo, package, core document); binary `ht`
 **Tagline:** The terminal client for Herdr Core.
@@ -62,6 +62,7 @@ Rules:
 - **Core never sends draw commands.** The TUI runs its own VT and composes its own cells.
 - **Status is only OSC 7501.** No screen scraping, no agent registry, no vendor logic.
 - **A client owns its document and label namespace.** Do not read another client's private state as yours.
+- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar flag stay in the per-screen view; scrollback, search, selection and theme stay in memory.
 - **Feature-gate on `hello`.** Check generation, version, methods and features; generation 1 only grows.
 
 ## 4. Architecture
@@ -81,20 +82,22 @@ Start with threads and channels; introduce an async runtime only if a measured n
 
 | Module | Responsibility |
 |---|---|
-| `main` | Terminal setup/restore, event loop, shutdown |
+| `main`, `lib` | CLI entry, terminal setup/restore, event loop, shutdown |
 | `core` | Core discovery, framed connection, calls, attach streams, events, reconnect |
-| `model` | Pure workspace state: spaces, tabs, panes, layout, focus, zoom, agents; no IO |
-| `layout` | Split tree, geometry, pane frames, hit testing, resize |
-| `vt` | libghostty-vt binding: terminal state, render state, cells, key/mouse encoding |
-| `ui` | ratatui composition: tab bar, pane borders, status bar, sidebar, palette, dialogs, toast, peek |
-| `input` | crossterm events, keybindings, mouse, paste, focus, resize |
-| `state` | App state, per-screen view, document schema and sync |
-| `commands` | Single command table used by keys, palette, menus and CLI |
-| `theme` | Colors, styles, default palette, 16/256/truecolor mapping |
-| `config` | Local settings, keybindings, core path |
-| `cli` | `ht` subcommands: status, commands, `--skill`, version |
+| `model` | Pure event and terminal model shared by the screen and workspace |
+| `screen` | Single-pane lifecycle, attach playback, pointer and view |
+| `vt` | libghostty-vt binding: cells, keys, mouse, scrollback, search, selection |
+| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect and agent handling |
+| `workspace::state`, `workspace::local` | Runtime UI state and per-screen view |
+| `config` | Startup settings: theme, scrollback, mouse, clipboard, prefix keys |
+| `theme` | Chrome colors, default/dark/light, 16/256/truecolor mapping |
+| `clipboard` | OSC 52 encoding and native helper fallback |
+| `tui`, `term`, `session`, `probe` | Terminal backend, process/session ownership, `ht screen` and `ht probe` |
 
-The model/layout/commands modules must be pure and unit-testable without a PTY. IO lives in `core`, `vt`, `ui` and `main`.
+The workspace model, geometry, commands, keys, palette and agents are pure and
+unit-testable without a PTY. IO lives in `core`, `screen`, `vt`,
+`workspace/runtime`, `tui` and `main`. `ht` has no `status`, `commands` or
+`--skill` subcommand yet; those remain planned.
 
 ### 4.3 Rendering pipeline
 
@@ -114,21 +117,45 @@ The TUI owns the screen. It does not ask core for frames or scrape `terminal.rea
 - Enable keyboard enhancement flags and bracketed paste; restore on exit.
 - Encode keys through the local VT so kitty keyboard protocol and Windows win32-input-mode are honored.
 - Send keys as **DATA** on the terminal's attach channel.
-- Mouse: chrome first, then panes. A click focuses the pane or selects a tab;
-  a click without a drag only focuses and never starts selecting. Dragging on
-  a grid selects locally (Shift-drag even over a tracking program); a
-  Shift-press and release without a drag is local too and sends no report. A
-  split gap drags; the wheel scrolls local history unless the program tracks
-  the mouse; a tracking program receives pane-local events. A fresh press
-  leaves an active selection and is routed normally. Chrome is never
-  forwarded. Mouse reporting is terminal-dependent and can be disabled.
-- Clipboard: OSC 52 by default, with a configurable native helper, both, or
-  off. An empty selection copies nothing. Paste is bracketed only when the
-  focused program enabled DEC 2004, and an overlay consumes it (a selection
-  counts as an overlay for paste). Selection keys are y/Enter (copy), Esc
-  (cancel) and h/j/k/l/arrows (extend); any other key leaves selection and
-  reaches the focused program, so selecting never traps typing. A forwarded
-  key also forwards its release when the program requested kitty key events.
+
+**Mouse precedence**, in order:
+
+1. An in-progress split resize or selection drag owns every mouse event.
+2. An open overlay (help, prompt, palette, search, peek, sidebar) consumes
+   every mouse event. A selection is not in that list: a fresh press leaves
+   selection and is routed as if none existed.
+3. Chrome: a tab-bar click selects a tab, a status-bar click is consumed, and
+   a split-gap press starts a resize. Chrome never reaches a program.
+4. A pane-grid press focuses the pane; a border press only focuses it. With
+   Shift, or when the program does not track the mouse, the press arms a local
+   selection whose release stays local even without a drag. Selection starts
+   only when the pointer reaches another cell, so press-and-release in one cell
+   is a plain focus click (with Shift, a local click that sends nothing).
+5. Without Shift, a tracking program receives press, drag and release in
+   pane-local coordinates. Shift-drag selects locally instead.
+6. The wheel is forwarded only to a tracking program with no active selection;
+   otherwise it scrolls that pane's local history. A wheel over chrome is
+   consumed.
+
+RESIZE is sent only when a pane's grid actually changes. Overlays and chrome
+never change pane geometry.
+
+**Selection, copy and paste**
+
+- `prefix [` starts a keyboard selection at the focused cursor; h/j/k/l or the
+  arrows extend it, `y` or Enter copies, Esc cancels. Mouse click-drag selects
+  on a non-tracking grid; Shift-drag selects over a tracking program. Selection
+  is cell-based; word and line selection are not provided.
+- Copied text strips cell padding: wide cells are copied once and row ends are
+  trimmed. An empty selection copies nothing.
+- Copy uses OSC 52 by default. `clipboard` selects OSC 52, a native helper
+  (`pbcopy` on macOS, `wl-copy`/`xclip` on Linux), both, or off; a native
+  failure falls back to OSC 52.
+- Any other key leaves selection, snaps the pane to the live bottom and reaches
+  the focused program, so selection never traps typing. A forwarded key also
+  forwards its release when the program requested kitty key events.
+- Paste goes only to the focused program when no overlay or selection is open.
+  It is framed with bracketed paste only when the program enabled DEC 2004.
 
 ### 4.5 State and persistence
 
@@ -169,7 +196,9 @@ version 1:
 history and whether the agent sidebar is open. The screen id comes from
 `HERDR_TERMINAL_SCREEN` (1–64 characters of
 `[A-Za-z0-9._-]`, default `default`). A missing or malformed view is a warning,
-not an error; ids that no longer exist are ignored.
+not an error; ids that no longer exist are ignored. Scrollback, search,
+selection and theme are runtime-only: they are not stored here or in the
+shared document.
 
 **Labels** identify the TUI's own terminals after a restart:
 
@@ -288,6 +317,55 @@ must never dirty the layout document.
   same bounded conflict/merge budget as a normal write, and save the local
   view; do not stop core unless the user explicitly asks.
 
+### 4.8 Scrollback, search, palette, settings and themes
+
+**Scrollback** is Ghostty's own bounded history per pane. Attach asks core for
+history above the screen, so output printed before a screen attached is
+scrollable. The line limit comes from config (default 10,000, maximum
+1,000,000), paired with a byte budget capped at 64 MiB. Ghostty prunes complete
+pages, so the retained rows can exceed the line limit by about one page, but
+memory stays bounded. Wheel (when not forwarded), Shift-PgUp/PgDn (half a page),
+Shift-Home (top) and Shift-End (live bottom) move the viewport; any ordinary key
+returns to the live bottom before it is forwarded. The focused cursor is drawn
+only at the live bottom. Reattach builds a fresh VT from core's paint, so
+history is never duplicated. Scrollback is not written to the document or the
+per-screen view.
+
+**Search** (`prefix f`) runs a literal, ASCII-case-insensitive substring search
+(no regex) over the focused pane's local history. It shows a match count, Enter or Down
+moves to the next match, Up to the previous, and Esc closes. Search runs in
+bounded steps from the live loop, so a large history cannot block input. It
+never calls `terminal.read` and never affects the program.
+
+**Palette** (`prefix :`) is a modal view over the existing command table,
+filtered by a case-insensitive substring of the label and action name. Up/Down
+move the selection, Enter runs it, Esc closes, and other typed characters —
+including `j` and `k` — edit the filter. Each row shows the command and its
+current configured key hint. A view-only command writes no document; a layout
+command behaves exactly as its key does.
+
+**Settings** are read once at startup from
+`$XDG_CONFIG_HOME/herdr-terminal/config.json`, falling back to
+`$HOME/.config/herdr-terminal/config.json` when the variable is unset or empty.
+The fields are `theme` (`default`, `dark`, `light`), `scrollback` lines,
+`mouse` on/off, `clipboard` (`osc52`, `native`, `both`, `off`) and `keys`
+prefix-binding overrides. A missing file is normal. Malformed JSON, unknown
+settings and bad values warn and fall back to defaults, so the TUI still starts.
+Key overrides reject unknown actions, control keys, multi-character keys and
+collisions, keeping the default binding. There is no settings UI and no live
+reload.
+
+**Themes** style only the chrome: tab bar, pane borders, status bar, sidebar,
+peek, help, palette, search and local selection. Terminal cells always keep the
+program's colors. `default` uses the outer terminal's palette; `dark` and
+`light` use explicit colors mapped down for 16- and 256-color terminals, chosen
+from `COLORTERM` and `TERM`.
+
+**Performance.** Input handling, command dispatch, scrollback and search are
+bounded per loop iteration, and output is drained in bounded batches with the
+existing credit flow. A large output burst therefore does not block palette,
+search or redraw input.
+
 ## 5. Feature scope
 
 Statuses:
@@ -394,18 +472,26 @@ currently implements.
   mouse, clipboard and prefix key overrides. The default, dark and light
   themes style chrome only, mapped to 16, 256 and truecolor; terminal cells
   keep their own colors.
+- **Performance:** bounded per-loop work, bounded output batches and bounded
+  scrollback/search keep palette, search and redraw responsive under large
+  output.
 
 This implements the Phase 0 and Phase 1 scope, the agent-facing part of
 Phase 2, and the daily-driver input, history, clipboard, palette and settings
 work of Phase 4. Still planned: tab reorder, machines, files,
-packaging/install, `ht status`, accessibility and mods. Settings are read at
-startup; there is no settings UI and no live reload.
+packaging/install, `ht status`, accessibility and mods. Scrollback, search,
+selection and theme stay in memory and are never written to the shared
+document or the per-screen view. Settings are read at startup; there is no
+settings UI and no live reload.
 
 The implementation is unreleased: there is no release, packaging or install
 procedure yet. See §3 for the boundary rules, §7 for conventions, and
 [AGENTS.md](../AGENTS.md) for the traps and the source layout.
 
 ## 6. Phases
+
+The lists below are the original roadmap. Current status is §5.5: several
+Phase 2 and Phase 4 items are implemented, and the rest remain planned.
 
 ### Phase 0 — Foundation
 
@@ -491,12 +577,17 @@ procedure yet. See §3 for the boundary rules, §7 for conventions, and
 
 ## 8. Open questions
 
-1. **VT binding:** extract a shared `ghostty-vt` crate, reuse Herdr App's `ghostty-sys`, or create a TUI-local binding? The TUI needs styled cells and key/mouse encoding, which core's minimal binding does not expose. A pure-Rust VT (for example `alacritty_terminal`) would remove the Zig build dependency but diverge from App/Core behavior; decide before Phase 0.
+1. **VT binding:** resolved for v1: a TUI-local binding over the vendored VT
+   library, because the TUI needs styled cells and key/mouse encoding that
+   core's minimal binding does not expose. Extracting a shared crate or a
+   pure-Rust VT remains a future option.
 2. **Async runtime:** threads + channels vs tokio. Start simple; measure.
 3. **Document layout:** one `herdr-terminal` document per core with machine-qualified ids, or one document per machine like Herdr App? Start local, revisit for Phase 3.
 4. **Clipboard:** resolved for v1: OSC 52 by default, with a configured native
    helper, both, or off; a native failure falls back to OSC 52.
-5. **Notifications:** bell/OSC 9/777 vs platform notifications; what is portable?
+5. **Notifications:** resolved for v1: one in-app status-bar notice and one
+   BEL, with no OS notification. OSC 9/777 and platform notifications remain
+   future options.
 6. **Kitty graphics:** is it a real requirement or a demo feature?
 7. **Mods:** when, and how closely to follow Herdr 1.x's manifest? v1 has none.
 8. **Name styling:** product name is **HerdR Terminal** (capital R); code identifiers are `herdr-terminal`. Confirm the stylization before public docs.

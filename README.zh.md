@@ -6,7 +6,7 @@ Herdr Core 的终端客户端。
 
 HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 runtime）的终端 UI（TUI）客户端。它和 Herdr App 桌面客户端平级，用来替代旧的 Herdr 1.x TUI。HerdR Terminal 负责屏幕和工作区组织；Herdr Core 负责程序和程序的事实。
 
-**状态：** 已实现，还未发布。客户端连接 Herdr Core，用本地 VT 渲染终端，提供带恢复和 agent 感知的 spaces/tabs/panes 工作区；detach 或重连后程序继续运行。后续功能见下方计划。
+**状态：** 已实现，还未发布。客户端连接 Herdr Core，用本地 VT 渲染终端，提供带恢复和 agent 感知的 spaces/tabs/panes 工作区，并具备日常使用的输入能力：鼠标、有上限的 scrollback 和搜索、选择与复制/粘贴、命令面板，以及带 default/dark/light 主题的启动配置。后续功能见下方计划。
 
 ## 功能
 
@@ -19,13 +19,19 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 - **Agent**：status、turn、title、foreground、agent 侧栏、peek、跳转、seen/pinned、blocked/finished 提醒。
 - **状态**：自己的 `herdr-terminal` 文档、恢复、多屏同步；按 labels 找回终端。
 - **恢复**：detach 不结束程序；重连、reattach，`missed` 后重新获取快照。
-- **UI**：tab bar、pane 边框、status bar、help 浮层、重命名输入；`Ctrl-b` 前缀键位，`?` 打开帮助。
+- **鼠标**：点击聚焦 pane 或选择 tab；拖动 split 边界调整大小；chrome 不会发送给程序。程序不跟踪鼠标时滚轮滚动本地历史；Shift 拖动在程序跟踪鼠标时也做本地选择。
+- **Scrollback 和搜索**：每个 pane 保存有上限的历史，attach 时向 Core 请求历史；滚轮和 Shift-PgUp/PgDn/Home/End 滚动，普通按键回到 live 底部。`prefix f` 做字面、大小写不敏感的子串搜索（不支持正则），显示匹配数并支持下一个/上一个。历史按行数封顶并有字节预算；VT 按页裁剪，保留的行数可能比上限多约一页。
+- **选择和剪贴板**：`prefix [` 或拖动选择；`y`/Enter 复制；默认 OSC 52，可配置原生 helper（`pbcopy`、`wl-copy` 或 `xclip`）和 bracketed paste。选择以单元格为单位，不提供按词/按行选择。
+- **命令面板**：`prefix :` 对现有命令表做大小写不敏感过滤，显示当前键位提示；Up/Down 移动选择，Enter 执行；`j`/`k` 输入到过滤器。
+- **UI**：tab bar、pane 边框、status bar、help 浮层、重命名输入、搜索栏，以及 default/dark/light chrome 主题；`Ctrl-b` 前缀键位，`?` 打开帮助；终端单元格保留程序颜色。
+- **设置**：启动时读取 `$XDG_CONFIG_HOME/herdr-terminal/config.json`（HOME 回退），支持 theme、scrollback、mouse、clipboard 和前缀键位；坏值会警告并回退。设置只在启动时读取，没有设置 UI 或热重载。
+- **性能**：每帧的处理量、scrollback 和搜索都有上限，大输出时输入仍保持响应。
 - **CLI**：`ht` 打开工作区，`ht screen` 运行或重新 attach 单个终端，`ht probe` 输出原始 attach 字节；`--version`、`--help`、`--hc`、`--cols`、`--rows`、`-v`。
 
 **计划中**
 
-- **UI**：命令面板、可配置快捷键、设置、主题；通用 confirm/toast。
-- **工作区打磨**：鼠标 resize/drag、tab 重排、scrollback 搜索、复制/粘贴、自定义布局。
+- **UI**：通用 confirm/toast。
+- **工作区打磨**：tab 重排、自定义布局、无障碍（accessibility）。
 - **多机器**：add/connect/list/rename/rm、远程终端和事件。
 - **文件**：read/write/edit、diff、外部编辑器、简单文件选择器。
 - **发布**：打包、安装、`--skill`、CLI 文档、`ht status` 和 Core/日志诊断。
@@ -44,6 +50,7 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 - **状态只来自 OSC 7501。** 客户端只显示程序通过 Program Status Protocol 报告的状态，不抓屏，也不根据进程名猜测。
 - **单条长连接。** 连接断开不代表程序结束：客户端会重连并重新 attach。
 - **各自的状态。** 工作区保存在客户端的 `herdr-terminal` 文档中；不会读写 Herdr App 的文档和 `herdr.space`/`herdr.tab` labels。
+- **本地 UI 状态。** scrollback、搜索、选择和主题只留在客户端，不写入共享文档或每屏视图；设置从本地文件在启动时读取一次，没有热重载。
 
 ## 文档
 

@@ -12,8 +12,9 @@ local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
 (status, sidebar, peek, seen/pin, alerts), and the daily-driver input surface:
 mouse routing and split drags, bounded local scrollback with search, selection
 with OSC 52/native copy and bracketed paste, the command palette, and startup
-settings with default/dark/light themes. The tests exist and pass. Machines,
-files and packaging remain planned. The design intent is in
+settings with default/dark/light themes. Settings are read at startup only:
+there is no settings UI or live reload. The tests exist and pass. Machines,
+files, packaging and accessibility remain planned. The design intent is in
 [docs/01-core-and-app-reference.md](docs/01-core-and-app-reference.md) and
 [docs/02-architecture.md](docs/02-architecture.md). Read both before proposing
 code; do not invent a build or scaffolding that contradicts them.
@@ -39,6 +40,11 @@ records, raw output, attach, events, status, documents and machines.
   `herdr.terminal.*`. Do not read or write Herdr App's `herdr-app` document,
   `herdr.space` or `herdr.tab`. Share only the cross-client `herdr.seen` and
   `herdr.pinned` conventions.
+- **Local daily-use state.** Scrollback, search, selection and theme stay in
+  memory. Never write them to the shared `herdr-terminal` document or the
+  per-screen view; those hold layout and view state only.
+- **Settings are startup-only.** Read `config.json` once at launch. Do not add
+  live reload or a settings UI without a separate design.
 - **Local VT.** Core sends raw bytes and a first paint, not draw commands.
   Run libghostty-vt locally; render cells yourself; encode keys locally.
 - **Reconnect semantics.** A dropped connection is not a dead program. On
@@ -63,7 +69,8 @@ records, raw output, attach, events, status, documents and machines.
 ## Commands
 
 The Cargo workspace builds and tests. The suites cover the protocol, VT,
-single-pane lifecycle, workspace, persistence and agents.
+single-pane lifecycle, workspace, persistence, agents, and the daily-driver
+input layer (mouse, scrollback/search, clipboard, palette, config and themes).
 
 ```sh
 cargo build --locked
@@ -154,5 +161,6 @@ edit it.
 ## Next step
 
 Pick up the remaining planned features in `docs/02-architecture.md` §5:
-machines, files, distribution, accessibility and mods. Keep the same rule:
-prove protocol, VT, input and recovery behavior with tests before UI chrome.
+machines, files, distribution, accessibility, mods, and a settings UI or live
+reload if one is designed. Keep the same rule: prove protocol, VT, input and
+recovery behavior with tests before UI chrome.
