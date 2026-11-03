@@ -14,6 +14,8 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 
 - **连接**：发现 Core、单条长连接、`hello` 检查、断线重连，运行中的程序不丢。
 - **终端**：运行、attach、本地 VT 渲染、键盘和鼠标输入、resize、focus、display facts、基于 credit 的流控，以及 `lost`/`restarted`/`finished` 生命周期。
+- **文本渲染**：默认开启 grapheme clustering，与 Core 和 Herdr App 一致，因此 `✍️`、`❤️` 等带 variation selector 的 emoji 是一个宽两格的 cluster，后面紧跟一个零宽占位格，不会拆成不同单元格。
+- **初始终端尺寸**：启动新终端时会带上 attach 时将使用的网格（初始 shell、split/tab/space、显式程序、`ht screen`、重连后的替换终端和 `ht probe`），因此只读取一次尺寸的程序也能以正确的布局启动。早于该字段的 Core 会忽略它并继续工作。
 - **工作区**：创建 spaces、tabs、panes；split/close/move；focus、zoom；重命名 tab 和 space。
 - **终端管理**：labels、keep、kill/rm、shell 或命令。
 - **Agent**：status、turn、title、foreground、agent 侧栏、peek、跳转、seen/pinned、blocked/finished 提醒。

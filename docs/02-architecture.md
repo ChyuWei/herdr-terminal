@@ -86,7 +86,7 @@ Start with threads and channels; introduce an async runtime only if a measured n
 | `core` | Core discovery, framed connection, calls, attach streams, events, reconnect |
 | `model` | Pure event and terminal model shared by the screen and workspace |
 | `screen` | Single-pane lifecycle, attach playback, pointer and view |
-| `vt` | libghostty-vt binding: cells, keys, mouse, scrollback, search, selection |
+| `vt` | libghostty-vt binding: cells and grapheme clusters, keys, mouse, scrollback, search, selection |
 | `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect and agent handling |
 | `workspace::state`, `workspace::local` | Runtime UI state and per-screen view |
 | `config` | Startup settings: theme, scrollback, mouse, clipboard, prefix keys |
@@ -110,6 +110,13 @@ unit-testable without a PTY. IO lives in `core`, `screen`, `vt`,
 7. Send **FACTS** when colors or cell size change, **RESIZE** when a pane changes size, **FOCUS** when focus changes.
 
 The TUI owns the screen. It does not ask core for frames or scrape `terminal.read`.
+
+Grapheme clustering (DEC mode 2027) is a VT reset default, matching Core and
+Herdr App; it is client-local and needs no Core version gate. A
+variation-selector emoji such as `✍️` or `❤️` is one cluster two cells wide,
+followed by a zero-width spacer cell, not a base cell plus a separate
+combining cell, and RIS keeps the default. This keeps cell width, cursor
+placement, selection and search consistent with Core.
 
 ### 4.4 Input
 
@@ -304,6 +311,18 @@ must never dirty the layout document.
    a won deleted-document claim with no recovered pane, or an explicit
    PROGRAM.
 
+**Initial size**
+
+Every spawn path sends `terminal.run`'s optional `size` when it knows the grid
+the terminal will attach at: the initial shell, a new pane/split/tab/space, an
+explicit PROGRAM after restore, `ht screen`, a replacement after reconnect, and
+`ht probe`. Workspace starts use the pending pane's exact inner grid, previewed
+on a clone of the deterministic insertion so a failed run leaves no empty tab.
+A path that cannot know the size omits the field and core's default applies.
+Older cores ignore the unknown field; no version gate is used. This matters
+because a program that reads its size once at startup, before a viewer
+attaches, would otherwise draw its first frame at core's default size.
+
 **Reconnect**
 
 - A dropped connection does **not** mean the programs died.
@@ -456,6 +475,11 @@ currently implements.
   workspace, `ht screen` runs or reattaches to one terminal and `ht probe`
   copies the raw attach bytes. `Ctrl-]` detaches and the programs keep
   running.
+- **Cell width and startup size:** the local VT enables grapheme clustering
+  (DEC mode 2027) by default like Core and Herdr App, so variation-selector
+  emoji form one cluster two cells wide, followed by a zero-width spacer cell,
+  and RIS keeps it on. Every spawn path sends the optional `terminal.run` size
+  when the attach grid is known; older cores ignore the field and still work.
 - **Mouse and history:** clicks focus panes and select tabs, split gaps drag,
   and chrome never reaches a program. Programs that track the mouse receive
   pane-local events; otherwise the wheel scrolls local history, requested

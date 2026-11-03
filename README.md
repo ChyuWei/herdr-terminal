@@ -14,6 +14,8 @@ HerdR Terminal is a terminal UI (TUI) client of **Herdr Core**, the runtime that
 
 - **Connection:** Core discovery, one long-lived framed connection, `hello` check, reconnect without losing running programs.
 - **Terminals:** Run, attach, local VT rendering, keyboard and mouse input, resize, focus, display facts, credit-based flow control, and the `lost`/`restarted`/`finished` lifecycle.
+- **Text rendering:** Grapheme clustering is on by default, matching Core and Herdr App, so variation-selector emoji such as `✍️` and `❤️` form one cluster two cells wide, followed by a zero-width spacer cell, instead of splitting across cells.
+- **Terminal sizing:** New terminals are spawned with the grid they will attach at — the initial shell, splits/tabs/spaces, explicit programs, `ht screen`, reconnect replacements and `ht probe` — so a program that reads its size once starts with the right layout. Cores that predate the field ignore it and still work.
 - **Workspace:** Create spaces, tabs and panes; split/close/move; focus, zoom; rename tabs and spaces.
 - **Terminal management:** Labels, keep, kill/rm, shell or command.
 - **Agents:** Status, turn, title, foreground, agent sidebar, peek, jump, seen/pinned, blocked/finished alerts.

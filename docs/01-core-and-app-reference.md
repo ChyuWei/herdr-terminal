@@ -53,7 +53,7 @@ Framed frame: `[channel u32 LE][kind u8][len u32 LE][payload]`.
 | 4 | FOCUS | Viewer → core: 1 gained, 0 lost |
 | 5 | FACTS | Viewer → core: JSON display facts (`fg`, `bg`, `cursor`, `cell`) |
 
-### 2.3 Attach streams
+### 2.3 Attach streams and terminal sizes
 
 `terminal.attach` returns a channel. Core sends:
 
@@ -61,6 +61,8 @@ Framed frame: `[channel u32 LE][kind u8][len u32 LE][payload]`.
 2. the program's raw output, minus queries core already answered.
 
 The viewer sends keys as DATA, plus RESIZE, FOCUS and FACTS as they change. Core never encodes keys. A stream starts with 256 KiB of credit; a viewer more than 4 MiB behind gets a fresh repaint. The last active viewer sets the terminal size.
+
+`terminal.run` also accepts an optional `size: {cols, rows}`. A core that supports it starts the program at that grid before any viewer attaches; a core that predates the field ignores it and uses its configured default. A client should send the grid the terminal will attach at when it knows it, and omit the field otherwise. This lets a program that reads its terminal size once at startup draw its first frame at the right size; the size still changes when a viewer attaches and sends RESIZE.
 
 ### 2.4 Events
 

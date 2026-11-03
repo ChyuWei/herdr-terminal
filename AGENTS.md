@@ -12,12 +12,14 @@ local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
 (status, sidebar, peek, seen/pin, alerts), and the daily-driver input surface:
 mouse routing and split drags, bounded local scrollback with search, selection
 with OSC 52/native copy and bracketed paste, the command palette, and startup
-settings with default/dark/light themes. Settings are read at startup only:
-there is no settings UI or live reload. The tests exist and pass. Machines,
-files, packaging and accessibility remain planned. The design intent is in
-[docs/01-core-and-app-reference.md](docs/01-core-and-app-reference.md) and
-[docs/02-architecture.md](docs/02-architecture.md). Read both before proposing
-code; do not invent a build or scaffolding that contradicts them.
+settings with default/dark/light themes. The local VT enables grapheme clustering
+as Core does, and new terminals start at the grid they will attach at. Settings
+are read at startup only: there is no settings UI or live reload. The tests
+exist and pass. Machines, files, packaging and accessibility remain planned.
+The design intent is in the
+[core reference](docs/01-core-and-app-reference.md) and the
+[architecture](docs/02-architecture.md). Read both before proposing code; do
+not invent a build or scaffolding that contradicts them.
 
 Read the code. This file holds the rules, the traps, and the decisions that are
 easy to get wrong.
@@ -47,6 +49,16 @@ records, raw output, attach, events, status, documents and machines.
   live reload or a settings UI without a separate design.
 - **Local VT.** Core sends raw bytes and a first paint, not draw commands.
   Run libghostty-vt locally; render cells yourself; encode keys locally.
+- **Match Core on cell width.** Enable DEC mode 2027 (grapheme clustering) as
+  a reset default in the local VT, as Core and Herdr App do. Variation-selector
+  emoji must form one cluster two cells wide, followed by a zero-width spacer
+  cell; a disagreement in cell width shifts cursor placement, selection and
+  search. RIS keeps the default because it is a reset default.
+- **Send the attach size at spawn.** Every `terminal.run` path sends the
+  optional `size` when it knows the grid the terminal will attach at, so a
+  program that reads its size once starts with the right layout. Use the exact
+  grid the terminal will attach at, not a guess, and omit the field when it is
+  unknown. Older cores ignore it; do not add a version gate.
 - **Reconnect semantics.** A dropped connection is not a dead program. On
   `missed`, resnapshot; on `lost`/`restarted`, reattach; on `finished`, drop
   the stream. Never assume the program died.
@@ -69,8 +81,9 @@ records, raw output, attach, events, status, documents and machines.
 ## Commands
 
 The Cargo workspace builds and tests. The suites cover the protocol, VT,
-single-pane lifecycle, workspace, persistence, agents, and the daily-driver
-input layer (mouse, scrollback/search, clipboard, palette, config and themes).
+single-pane lifecycle, workspace, persistence, agents, the daily-driver input
+layer (mouse, scrollback/search, clipboard, palette, config and themes), and
+grapheme width and initial terminal size.
 
 ```sh
 cargo build --locked
@@ -104,7 +117,7 @@ src/
   main.rs, lib.rs       # CLI; terminal setup and restore
   core/                 # discovery, framed client, events, reconnect
   screen/               # single-pane screen: lifecycle, play, pointer, view
-  vt/                   # VT binding: screen, keys, mouse, scroll, search, selection
+  vt/                   # VT binding: screen, graphemes, keys, mouse, scroll, search, selection
   model.rs              # pure event/terminal model
   workspace/
     model.rs            # pure workspace state
