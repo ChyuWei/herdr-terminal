@@ -448,17 +448,21 @@ one changed block and the row list is capped). The diff is a display aid only:
 there is no merge or three-way resolution.
 
 **Write-back.** `w`/Enter re-reads the whole file and compares it with the
-first full read; Core has no file version or etag. A difference shows a
-conflict and refuses to write; `o` in that state is the explicit overwrite.
-`q`/Esc discards without writing. Without a conflict, one exact contiguous
-replacement uses `file.edit`; every other change, and the explicit overwrite,
-uses `file.write` with base64 data. A failed write keeps the diff and buffer
-with the error. A whole read that Core truncates at its inline cap (about
-8 MB of estimated JSON bytes; `last < lines`) is refused before the editor
-starts and again on the write re-read, before any comparison or write, so a
-partial buffer is never edited, compared or saved. The viewer can still page
-through such a file. The refusal names the machine, path and read/known line
-counts.
+first full read; Core has no file version or etag. The re-read and the write
+are separate Core requests, so the check is best-effort, not a transaction: a
+change made between them is not detected. The shared workspace document is
+different: `doc.get` returns a version and `doc.set` takes the expected
+version, so its updates are optimistic compare-and-set. A detected difference
+shows a conflict and refuses to write; `o` in that state is the explicit
+overwrite. `q`/Esc discards without writing. Without a conflict, one exact
+contiguous replacement uses `file.edit`; every other change, and the explicit
+overwrite, uses `file.write` with base64 data. A failed write keeps the diff
+and buffer with the error. A whole read that Core truncates at its inline cap
+(about 8 MB of estimated JSON bytes; `last < lines`) is refused before the
+editor starts and again on the write re-read, before any comparison or write,
+so a partial buffer is never edited, compared or saved. The viewer can still
+page through such a file. The refusal names the machine, path and read/known
+line counts.
 
 **Boundary.** Core reads and writes the file, local or remote, through this
 client's one long-lived connection; the client never opens a remote path and
@@ -619,7 +623,7 @@ Statuses:
 | Workspace | Spaces, tabs, panes, split/close/move, focus, zoom |
 | Terminal manager | Core-wide live-terminal inventory, Show/Hide, read-only Preview |
 | Machine manager | `machine.list` machines, connect/add/rename/remove, remote `machine/t7` terminals |
-| Files | Paged read-only viewer, `$VISUAL`/`$EDITOR`, line diff, content-checked write-back |
+| Files | Paged read-only viewer, `$VISUAL`/`$EDITOR`, line diff, content-checked (non-atomic) write-back |
 | Terminals | New/close/rename, labels, keep, kill/rm, shell/command |
 | Agents | Status, turn, title, foreground, list/sidebar, peek, seen/pinned |
 | UI | Tab bar, pane borders, status bar, command palette, help, toast/confirm/prompt |
@@ -700,10 +704,10 @@ currently implements.
   overlay is open; Core has no machine-state event.
 - **Files:** a modal `prefix o` path prompt (no directory listing), a read-only
   400-line paged `file.read` viewer, `$VISUAL`/`$EDITOR` on a local temp with
-  full TUI suspend/restore, a line diff, content-checked write-back with an
-  explicit `o` overwrite, and a refusal to edit or write a whole read
-  truncated at Core's inline cap; contents stay out of the document and
-  labels.
+  full TUI suspend/restore, a line diff, content-checked (non-atomic)
+  write-back with an explicit `o` overwrite, and a refusal to edit or write a
+  whole read truncated at Core's inline cap; contents stay out of the document
+  and labels.
 - **Persistence:** the `herdr-terminal` document, restore, multi-screen
   compare-and-set, and terminal rediscovery by labels.
 - **Agents:** status, turn, title and foreground from core; the agent
