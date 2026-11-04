@@ -7,7 +7,8 @@ fn add(workspace: &mut Workspace, kind: StartKind, name: &str) -> PaneId {
 }
 
 fn viewport() -> Rect {
-    Rect::new(0, 0, 80, 24)
+    // A wide viewport: split drags only exist where the full layout is drawn.
+    Rect::new(0, 0, 120, 40)
 }
 
 fn panes(workspace: &Workspace) -> Vec<PaneId> {
@@ -70,21 +71,21 @@ fn dragging_a_split_boundary_moves_it_by_exact_cells() {
     add(&mut workspace, StartKind::Split(Axis::Columns), "t2");
     let viewport = viewport();
     let before = geometry::compute(workspace.active_tab(), viewport);
-    assert_eq!(before.panes[0].1.width, 30);
-    assert_eq!(before.panes[1].1.width, 29);
+    assert_eq!(before.panes[0].1.width, 45);
+    assert_eq!(before.panes[1].1.width, 44);
 
     assert!(workspace.resize_gap(viewport, &[], 0, 4));
     let after = geometry::compute(workspace.active_tab(), viewport);
-    assert_eq!(after.panes[0].1.width, 34, "{after:?}");
-    assert_eq!(after.panes[1].1.width, 25, "{after:?}");
-    assert_eq!(after.panes[1].1.x, 55, "the one-cell gap moved with it");
-    assert_eq!(after.panes[0].1.width + 1 + after.panes[1].1.width, 60);
+    assert_eq!(after.panes[0].1.width, 49, "{after:?}");
+    assert_eq!(after.panes[1].1.width, 40, "{after:?}");
+    assert_eq!(after.panes[1].1.x, 80, "the one-cell gap moved with it");
+    assert_eq!(after.panes[0].1.width + 1 + after.panes[1].1.width, 90);
 
     // The new spans become the ratio, so the next drag is equally exact.
     assert!(workspace.resize_gap(viewport, &[], 0, -2));
     let after = geometry::compute(workspace.active_tab(), viewport);
-    assert_eq!(after.panes[0].1.width, 32);
-    assert_eq!(after.panes[1].1.width, 27);
+    assert_eq!(after.panes[0].1.width, 47);
+    assert_eq!(after.panes[1].1.width, 42);
 }
 
 #[test]

@@ -34,6 +34,7 @@ fn render_manager(ui: &UiState, rows: &[ManagerRow], width: u16, height: u16) ->
         machines: &[],
         preview: None,
         files: None,
+        identity: None,
     };
     let mut buffer = Buffer::empty(area);
     let rendered = render_with(&mut buffer, area, &workspace, ui, &view);
@@ -151,6 +152,7 @@ fn the_preview_draws_a_read_only_border_title_and_terminal() {
         machines: &[],
         preview: Some(&screen),
         files: None,
+        identity: None,
     };
     let mut buffer = Buffer::empty(area);
     let rendered = render_with(&mut buffer, area, &workspace, &ui, &view);
@@ -184,6 +186,7 @@ fn file_view<'a>(
         machines: &[],
         preview: None,
         files: pane,
+        identity: None,
     };
     let mut buffer = Buffer::empty(area);
     let rendered = render_with(&mut buffer, area, workspace, ui, &view);
@@ -345,88 +348,55 @@ fn an_empty_file_or_a_read_error_stays_inside_the_overlay() {
 }
 
 #[test]
-fn the_mode_strips_use_theme_chips_and_leave_the_panes_alone() {
+fn the_mode_chips_live_on_the_single_bottom_line_and_never_cover_a_pane() {
     let (workspace, first) = one_pane();
-    let (plain, _) = render_ws(&workspace, &UiState::default(), 60, 12);
-    let plain_rows = lines(&plain);
+    let theme = Theme::default();
 
-    // PREFIX: accent chip, and the status bar stays underneath.
+    // PREFIX: accent chip on the bottom line; the pane keeps its last row.
     let ui = UiState {
         prefix: true,
         ..UiState::default()
     };
     let (buffer, _) = render_ws(&workspace, &ui, 60, 12);
     let rows = lines(&buffer);
-    assert!(rows[10].starts_with(" PREFIX "), "{rows:?}");
-    assert!(rows[10].contains("? keybinds"), "{rows:?}");
-    assert_eq!(buffer[(0, 10)].bg, Color::Rgb(137, 180, 250));
-    assert_eq!(buffer[(0, 10)].fg, Color::Rgb(24, 24, 37));
-    assert!(buffer[(0, 10)].modifier.contains(Modifier::BOLD));
+    assert!(rows[11].starts_with(" PREFIX"), "{rows:?}");
+    assert!(rows[11].contains("esc cancel"), "{rows:?}");
+    assert!(rows[11].contains("? keys"), "{rows:?}");
+    assert_eq!(buffer[(0, 11)].bg, theme.accent);
+    assert_eq!(buffer[(0, 11)].fg, theme.panel_bg);
+    assert!(buffer[(0, 11)].modifier.contains(Modifier::BOLD));
+    assert!(
+        rows[10].starts_with('└'),
+        "the pane keeps its bottom border"
+    );
 
-    // COPY: mauve chip, motions and copy/search hints.
+    // COPY: motions and the copy key on the bottom line.
     let ui = UiState {
         selecting: Some(first),
         ..UiState::default()
     };
-    let (buffer, _) = render_ws(&workspace, &ui, 60, 12);
+    let (buffer, _) = render_ws(&workspace, &ui, 120, 12);
     let rows = lines(&buffer);
-    assert!(rows[10].starts_with(" COPY "), "{rows:?}");
-    assert!(rows[10].contains("h/j/k/l"), "{rows:?}");
-    assert_eq!(buffer[(0, 10)].bg, Color::Rgb(203, 166, 247));
-    assert_eq!(buffer[(0, 10)].fg, Color::Rgb(24, 24, 37));
-
-    // The whole hint line needs a wider workspace: at 120 columns the strip
-    // starts after the sidebar and shows every hint.
-    let (wide, _) = render_ws(&workspace, &ui, 120, 12);
-    let wide_rows = lines(&wide);
-    assert!(wide_rows[10].contains(" COPY "), "{wide_rows:?}");
-    for hint in [
-        "h/j/k/l",
-        "w/b/e",
-        "v/space select",
-        "y/enter copy",
-        "/? search",
-        "esc cancel",
-    ] {
-        assert!(
-            wide_rows[10].contains(hint),
-            "missing {hint:?}: {wide_rows:?}"
-        );
+    assert!(rows[11].starts_with(" COPY"), "{rows:?}");
+    for hint in ["h/j/k/l move", "y copy", "Esc cancel"] {
+        assert!(rows[11].contains(hint), "missing {hint:?}: {rows:?}");
     }
+    assert!(rows[11].starts_with(" COPY"), "the mode chip comes first");
 
-    // RESIZE: yellow chip, width/height hints.
+    // RESIZE: width/height hints; the strip no longer takes a pane row.
     let ui = UiState {
         resize: true,
         ..UiState::default()
     };
-    let (buffer, _) = render_ws(&workspace, &ui, 60, 12);
+    let (buffer, _) = render_ws(&workspace, &ui, 120, 12);
     let rows = lines(&buffer);
-    assert!(rows[10].starts_with(" RESIZE "), "{rows:?}");
+    assert!(rows[11].starts_with(" RESIZE"), "{rows:?}");
     assert!(
-        rows[10].contains("h/l width") && rows[10].contains("j/k height"),
+        rows[11].contains("h/l width") && rows[11].contains("j/k height"),
         "{rows:?}"
     );
-    assert!(rows[10].contains("esc done"), "{rows:?}");
-    assert_eq!(buffer[(0, 10)].bg, Color::Rgb(249, 226, 175));
-    assert_eq!(buffer[(0, 10)].fg, Color::Rgb(24, 24, 37));
-
-    // The status bar is still the last row in every mode.
-    assert!(
-        rows[11].contains("space 1 / tab 1 / t1"),
-        "status bar under the strip: {rows:?}"
-    );
-    assert!(!rows[11].contains("RESIZE"));
-
-    // Closing the strip restores the pane's bottom border and keeps its text.
-    let (restored, _) = render_ws(&workspace, &UiState::default(), 60, 12);
-    let restored_rows = lines(&restored);
-    assert_eq!(restored_rows[8], plain_rows[8]);
-    assert_ne!(restored_rows[10], rows[10]);
-    assert!(restored_rows[2].contains("hi"), "{restored_rows:?}");
-    assert!(
-        restored_rows[10].starts_with('└'),
-        "the bottom border returns: {restored_rows:?}"
-    );
+    assert!(rows[11].contains("Esc done"), "{rows:?}");
+    assert_eq!(rows.len(), 12, "one line only");
 }
 
 #[test]
@@ -440,8 +410,8 @@ fn the_search_and_rename_chips_are_colored_prompt_markers() {
     let (buffer, rendered) = render_ws(&workspace, &ui, 60, 12);
     let row: String = (0..60).map(|x| buffer[(x, 11)].symbol()).collect();
     assert!(row.starts_with(" search: hi"), "{row:?}");
-    assert_eq!(buffer[(0, 11)].bg, Color::Rgb(203, 166, 247));
-    assert_eq!(buffer[(0, 11)].fg, Color::Rgb(24, 24, 37));
+    assert_eq!(buffer[(0, 11)].bg, Color::Rgb(0x99, 0xbd, 0xde));
+    assert_eq!(buffer[(0, 11)].fg, Color::Rgb(0x17, 0x1c, 0x1f));
     assert_eq!(rendered.prompt_cursor, Some((11, 11)));
 
     let space = workspace.active_space_id();
@@ -453,8 +423,8 @@ fn the_search_and_rename_chips_are_colored_prompt_markers() {
     let (buffer, _) = render_ws(&workspace, &ui, 60, 12);
     let row: String = (0..60).map(|x| buffer[(x, 11)].symbol()).collect();
     assert!(row.starts_with("rename tab: "), "{row:?}");
-    assert_eq!(buffer[(0, 11)].bg, Color::Rgb(137, 180, 250));
-    assert_eq!(buffer[(0, 11)].fg, Color::Rgb(24, 24, 37));
+    assert_eq!(buffer[(0, 11)].bg, Color::Rgb(0x9d, 0xdb, 0xc6));
+    assert_eq!(buffer[(0, 11)].fg, Color::Rgb(0x17, 0x1c, 0x1f));
 }
 
 #[test]
@@ -479,10 +449,10 @@ fn the_selected_palette_row_is_the_accent_block() {
         - 1;
     assert_eq!(
         buffer[(x, y)].bg,
-        Color::Rgb(137, 180, 250),
+        Color::Rgb(0x9d, 0xdb, 0xc6),
         "accent background on the selected row"
     );
-    assert_eq!(buffer[(x, y)].fg, Color::Rgb(24, 24, 37));
+    assert_eq!(buffer[(x, y)].fg, Color::Rgb(0x17, 0x1c, 0x1f));
     assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
     let below = rows
         .iter()
@@ -490,7 +460,7 @@ fn the_selected_palette_row_is_the_accent_block() {
         .expect("an unselected row") as u16;
     assert_ne!(
         buffer[(x, below)].bg,
-        Color::Rgb(137, 180, 250),
+        Color::Rgb(0x9d, 0xdb, 0xc6),
         "unselected rows are not the accent block"
     );
 }

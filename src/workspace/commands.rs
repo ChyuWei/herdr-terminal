@@ -40,6 +40,8 @@ pub enum Command {
     Machines,
     /// Open the Core-backed file viewer.
     Files,
+    /// Open the on-demand tab selector for the active space.
+    TabSelector,
     /// Peek the focused (or sidebar-selected) agent.
     Peek,
     /// Jump to the next or previous agent in sidebar order.
@@ -87,6 +89,8 @@ pub enum Effect {
     Machines,
     /// Open the file overlay for the focused pane's machine and cwd.
     Files,
+    /// Open the tab selector; the runtime lists the active space's tabs.
+    TabSelector,
     /// Open the peek overlay for the focused or selected agent.
     Peek,
     /// Jump to the next or previous agent.
@@ -133,6 +137,7 @@ impl Workspace {
             Command::Terminals => Effect::Terminals,
             Command::Machines => Effect::Machines,
             Command::Files => Effect::Files,
+            Command::TabSelector => Effect::TabSelector,
             Command::Peek => Effect::Peek,
             Command::JumpAgent(jump) => Effect::JumpAgent(jump),
             Command::Palette => Effect::Palette,

@@ -9,16 +9,17 @@ If `AGENTS.local.md` exists, read it too: the maintainer's local rules.
 **Status: implemented, unreleased.** The client implements the core connection,
 local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
 `herdr-terminal` document with restore and multi-screen sync, agent awareness
-(status, a persistent spaces-and-agents sidebar, local-VT peek, seen/pin,
-alerts), the Core-wide terminal manager (`prefix t`; Show/Hide and a read-only
-Preview), the machine manager (`prefix m`; add/connect/rename/remove Core
-machines and start `machine/t7` terminals), the file viewer/editor
-(`prefix o`; paged reads, `$VISUAL`/`$EDITOR`, line diff and content-checked
-write-back), and the daily-driver input surface: mouse routing and split drags,
-bounded local scrollback with search, selection with copy-mode motion and OSC
-52/native copy, bracketed paste, the command palette, PREFIX/COPY/RESIZE mode
-strips with keyboard resize, and startup settings with Catppuccin Mocha/Latte
-chrome (and a named-color `terminal` theme). The local VT enables grapheme
+(status, a spaces-and-agents rail, local-VT peek, seen/pin, alerts), the
+Core-wide terminal manager (`prefix t`; Show/Hide and a read-only Preview), the
+machine manager (`prefix m`; add/connect/rename/remove Core machines and start
+`machine/t7` terminals), the file viewer/editor (`prefix o`; paged reads,
+`$VISUAL`/`$EDITOR`, line diff and content-checked write-back), and the
+daily-driver input surface: a Space → Pane screen with no tab bar, mouse routing
+and split drags, bounded local scrollback with search, selection with copy-mode
+motion and OSC 52/native copy, bracketed paste, the command palette, the
+on-demand tab selector, one bottom line naming NORMAL/PREFIX/COPY/RESIZE/ZOOM,
+and startup settings with dark/light chrome (Catppuccin names kept as aliases,
+plus a named-color `terminal` theme). The local VT enables grapheme
 clustering as Core does, and new terminals start at the grid they will attach
 at. Settings are read at startup only: there is no settings UI or live reload.
 The tests exist and pass. A file picker, install scripts and accessibility
@@ -56,35 +57,57 @@ records, raw output, attach, events, status, documents and machines.
   `herdr.space` or `herdr.tab`. Share only the cross-client `herdr.seen` and
   `herdr.pinned` conventions.
 - **Local daily-use state.** Scrollback, search, selection, mode state, the
-  sidebar selection/offset and theme stay in memory. Never write them to the
-  shared `herdr-terminal` document. The per-screen view holds the sidebar
-  focus flag; its selection and offset are not persisted.
-- **Theme owns every chrome color.** Bars, borders, panels, overlays, the
-  sidebar, selections and mode chips take colors from `Theme`; never hardcode a
-  color in a widget. Both Catppuccin palettes define every role and are mapped
-  down for 256- and 16-color terminals, so no RGB reaches a lesser terminal;
-  `terminal` is the named-color legacy look and reverses selected rows. Agent
-  status colors come only from the Core-reported word through
-  `Theme::status_word`.
-- **The sidebar is persistent, not an overlay.** It owns the left edge on
-  viewports at least 70 columns wide, a quarter of the width clamped to 18..28;
-  bars and panes start to its right. `prefix a` only gives it keyboard focus
-  (`a`/Esc returns it), and below 70 columns the message explains why nothing
-  focuses. Releasing focus when the panel disappears must not restore it when
-  the terminal widens again. Focus counts as covering the panes for
-  seen/attention, but the panel is never mouse-modal: a click inside selects, a
-  click outside returns focus. Focus, selection and offset are local UI state;
-  only the focus flag is saved in the per-screen view.
-- **Modes agree with the strip.** PREFIX, COPY (selection) and RESIZE each own
-  the keys, and the one-row strip over the pane area's last row names the mode
-  that acts. `clear_modes` leaves resize and copy before an overlay, palette,
-  search or sidebar focus, and reconnect clears them too; a mouse-started
-  selection ends resize first. Never let the strip name a mode that no longer
-  owns the keys.
-- **Resize only through `resize_gap`.** Keyboard resize picks the split with
-  `geometry::resize_target` and calls `Model::resize_gap`, the weighted path the
-  mouse drag uses; never edit geometry weights in place. Shift moves five cells;
-  pane minimums hold; a zoomed tab refuses resize, and empty and single-pane
+  rail selection/offset and theme stay in memory. Never write them to the
+  shared `herdr-terminal` document. The per-screen view holds the rail focus
+  flag (`sidebar_open`); its selection and offset are not persisted.
+- **Theme owns every chrome color.** The rail, pane frames and identity rows,
+  the bottom line, overlays, selections and mode chips take colors from
+  `Theme`; never hardcode a color in a widget. `default`/`dark` are the dark
+  palette and `light` the light one; `catppuccin`/`catppuccin-latte` keep the
+  earlier palettes and `terminal` the named-color legacy look. Every role maps
+  down for 256- and 16-color terminals, so no RGB reaches a lesser terminal.
+  Agent and pane status colors come only from the Core-reported word:
+  `panenav::word` picks the word and `Theme::status_word` colors it.
+- **Space → Pane, with a rail.** The default screen has no window bar, brand
+  header, tab bar or per-pane footer: panes start at row 0, each keeps its
+  identity in the top border, and one bottom line spans the screen. On a wide
+  terminal the rail owns the left edge from 90 columns up, a quarter of the
+  width clamped to 20..30 including the separator, and the panes start to its
+  right. Below 90 columns the rail is hidden, a one-row pane-nav of chips sits
+  above the panes, and only the focused pane is drawn, in the full workspace.
+  `prefix a` then opens the rail as an opaque drawer that ends above the
+  bottom line and never resizes a pane, changes the split tree or writes the
+  document. The drawer consumes every mouse event; an outside press only
+  dismisses it, and its gesture swallow clears on a real Up. The wide rail is
+  not mouse-modal: a click outside only returns focus and is routed normally.
+  Releasing focus when the rail disappears must not restore it when the
+  terminal widens again. Focus counts as covering the panes for seen/attention.
+  Rail focus, selection and offset are local UI state; only the focus flag is
+  saved in the per-screen view.
+- **Pane identity and one word.** Each pane's top border row is chrome: a
+  focused marker, the two-digit split-tree number and name/title on the left,
+  the Core word and address on the right. When the header is tight the address
+  drops first, then the title detail; never hide the number, name or word.
+  `panenav::word` is the one word rule for headers and chips (the agent row's
+  derived word when present, otherwise the pane's raw OSC 7501 word), and
+  `panenav::entries` is the one chip builder for drawing and hit testing. A
+  plain shell shows no word; never print `SHELL` or infer one.
+- **Tabs stay, the tab bar does not.** The tab model, document and restore are
+  unchanged, but no tab bar is drawn. Tabs switch through `prefix n`/`p`,
+  `prefix 1..9` and the on-demand `prefix T` selector; a space row's tab count
+  is informational and adds no fixed categories.
+- **One bottom line names the mode.** PREFIX, COPY (selection), RESIZE and
+  ZOOM appear only in the single bottom line, never in a separate strip. The
+  chip order is resize, copy, prefix, then zoom for a zoomed tab.
+  `clear_modes` leaves resize and copy before an overlay, palette, search or
+  rail focus, and reconnect clears them too; a mouse-started selection ends
+  resize first. Never let the bottom line name a mode that no longer owns the
+  keys.
+- **Resize only through `resize_gap`.** Keyboard resize needs a wide (90
+  columns) and unzoomed tab, picks the split with `geometry::resize_target`
+  and calls `Model::resize_gap`, the weighted path the mouse drag uses; never
+  edit geometry weights in place. Shift moves five cells; pane minimums hold;
+  a narrow or zoomed tab gets its explicit message, and empty and single-pane
   tabs get distinct messages.
 - **Settings are startup-only.** Read `config.json` once at launch. Do not add
   live reload or a settings UI without a separate design.
@@ -240,10 +263,11 @@ records, raw output, attach, events, status, documents and machines.
 The Cargo workspace builds and tests. The suites cover the protocol, VT,
 single-pane lifecycle, workspace, persistence, agents, the daily-driver input
 layer (mouse, scrollback/search, clipboard, palette, config and themes),
-grapheme width, initial terminal size, the persistent spaces/agents sidebar,
-the PREFIX/COPY/RESIZE strips and keyboard resize, the terminal manager, the
-machine manager and remote recovery, the file viewer/editor and write-back, and
-observer attach/resize ordering.
+grapheme width, initial terminal size, the spaces/agents rail and its narrow
+drawer, the pane identity row and bottom line, the narrow pane-nav, the tab
+selector, keyboard resize, the terminal manager, the machine manager and remote
+recovery, the file viewer/editor and write-back, and observer attach/resize
+ordering.
 
 ```sh
 cargo build --locked
@@ -298,7 +322,8 @@ src/
     commands.rs, keys.rs # command table and bindings
     palette.rs          # pure palette entries and filtering
     agents.rs           # pure agent facts, ordering, alerts
-    sidebar.rs          # pure sidebar geometry, lines and hit testing
+    sidebar.rs          # pure rail geometry, lines and hit testing
+    panenav.rs          # pure narrow pane-nav chips, scrolling and hit testing
     manager.rs          # pure Core-wide inventory, sort/filter, labels
     machines.rs         # pure machine rows, sort/filter, remote addresses
     file.rs             # pure file context, paging, diff, editor and write rules
@@ -307,8 +332,8 @@ src/
     runtime/resize.rs   # keyboard resize mode over the weighted resize_gap path
     runtime/file.rs     # file reads, editor, diff and write-back
     ui.rs               # ratatui composition
-    ui/sidebar.rs       # persistent sidebar drawing
-    ui/overlays.rs      # overlays, prompts, mode strips and chips
+    ui/sidebar.rs       # rail and drawer drawing
+    ui/overlays.rs      # overlays, prompts, tab selector and chips
     ui/machine_ui.rs    # machine manager panel, prompt and confirmation
     ui/tests.rs, ui/tests/panels.rs  # UI golden and panel tests
     startup.rs          # document claim and restore
@@ -342,8 +367,13 @@ tests/                  # probe, screen, workspace, fake-core
   source.
 - Do not hardcode a chrome color or a status color outside `Theme`; the theme
   role and the Core-reported word decide both.
-- Do not treat the focused sidebar as a mouse overlay; it sits beside the
-  panes and only counts as covering them for seen/attention.
+- Do not add a tab bar, brand/window bar or per-pane footer; the tab model
+  stays behind `prefix n`/`p`, `prefix 1..9` and `prefix T`.
+- Do not infer a pane's word from its title or argv; the agent index and OSC
+  7501 decide it, and a plain shell has no word.
+- Do not treat the wide rail as a mouse overlay, and do not make the narrow
+  drawer non-modal: the drawer consumes every mouse event, the wide rail does
+  not.
 - Do not spawn a Core or `hc` per action; keep one connection.
 - Do not run a bare Core/App against a real home; tests are isolated.
 - Do not add mods, an embedded editor, Markdown or images in v1; see the

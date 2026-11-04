@@ -21,6 +21,14 @@ impl Screen<'_> {
             self.dirty = true;
             return;
         }
+        if geometry::bars(self.area()).rail.width == 0 {
+            // A narrow window draws only the focused pane, so a boundary drag
+            // or arrow has nothing visible to move.
+            self.ui.message =
+                Some("resize needs a wide terminal (90 columns) and an unzoomed tab".into());
+            self.dirty = true;
+            return;
+        }
         let panes = tab.panes().len();
         if panes == 0 {
             self.ui.message = Some("nothing to resize".into());

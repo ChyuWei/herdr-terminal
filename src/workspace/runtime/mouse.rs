@@ -33,6 +33,15 @@ use ratatui::layout::Rect;
 
 impl Screen<'_> {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        // The drawer's press owns the whole gesture. Its drag and release must
+        // not reach the pane the drawer covered. Only a real release clears
+        // this: a lost Up must not let the next Down's release through.
+        if self.drawer_gesture {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                self.drawer_gesture = false;
+            }
+            return Ok(());
+        }
         // A drag that is already in progress owns the mouse. This comes before
         // the overlay rule because starting a selection makes `selecting`
         // some; its release must still end the drag.
@@ -44,6 +53,29 @@ impl Screen<'_> {
         }
         if self.ui.overlay() {
             return Ok(());
+        }
+        // On a narrow terminal the open rail is a modal drawer over the
+        // panes: every event is consumed, and only a press on a row acts. Any
+        // press starts a gesture the rest of which is swallowed; an outside
+        // press also closes the drawer.
+        if self.ui.sidebar.open {
+            let rects = self.rects();
+            if rects.rail.width == 0 {
+                let drawer = self.rail_rect();
+                let pressed = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+                if in_rect(drawer, mouse.column, mouse.row) {
+                    if pressed {
+                        self.sidebar_click(mouse.column, mouse.row);
+                        // A row jump closes the drawer; its release must not
+                        // reach the pane that is now uncovered.
+                        self.drawer_gesture = true;
+                    }
+                } else if pressed {
+                    self.close_sidebar();
+                    self.drawer_gesture = true;
+                }
+                return Ok(());
+            }
         }
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -113,9 +145,9 @@ impl Screen<'_> {
     fn press(&mut self, mouse: MouseEvent) -> Result<()> {
         let (x, y) = (mouse.column, mouse.row);
         let rects = self.rects();
-        let area = self.area();
-        let sidebar = super::super::sidebar::width(area);
-        if x >= area.x && x < area.x.saturating_add(sidebar) {
+        // The rail on a wide terminal, or the summoned drawer on a narrow one.
+        let wide = rects.rail.width > 0;
+        if wide && in_rect(rects.rail, x, y) {
             self.sidebar_click(x, y);
             return Ok(());
         }
@@ -123,19 +155,28 @@ impl Screen<'_> {
             // A click outside the panel takes keyboard focus back.
             self.close_sidebar();
         }
-        if in_rect(rects.tab_bar, x, y) {
-            let space = self.workspace.active_space();
-            if let Some(tab) = geometry::tab_at(space, rects.tab_bar, x, y)
-                && self.workspace.select_tab_id(tab)
-            {
-                self.dirty = true;
+        // The narrow pane-nav row maps every pane of the tab. The chips are
+        // built by the same function the drawing uses, so a status word that
+        // changes a chip's width can never move the mouse's target.
+        if in_rect(rects.pane_nav, x, y) {
+            if let Some(tab) = self.workspace.active_tab() {
+                let entries = super::super::panenav::entries(&self.workspace, &self.agents.rows);
+                let chips = super::super::panenav::layout(&entries, tab.focused, rects.pane_nav);
+                if let Some(pane) = super::super::panenav::at(&chips, x, y)
+                    && self.workspace.focus_pane(pane)
+                {
+                    self.dirty = true;
+                }
             }
             return Ok(());
         }
         if in_rect(rects.status, x, y) {
             return Ok(());
         }
-        if let Some(gap) = geometry::gap_at(self.workspace.active_tab(), self.area(), x, y) {
+        // A split gap is only on screen in the wide, unzoomed layout; the
+        // narrow view draws one pane and must not drag a boundary it hides.
+        if wide && let Some(gap) = geometry::gap_at(self.workspace.active_tab(), self.area(), x, y)
+        {
             let last = match gap.axis {
                 Axis::Columns => x,
                 Axis::Rows => y,

@@ -8,6 +8,7 @@ use super::super::file::{DiffTag, Pane};
 use super::super::machines::{self, MachineRow};
 use super::super::manager::{self, ManagerRow};
 use super::super::model::PaneId;
+use super::super::panenav::truncate;
 use super::super::state::{PreviewState, UiState};
 use super::{HELP, Theme};
 use crate::vt::Screen as VtScreen;
@@ -167,6 +168,101 @@ pub(super) fn draw_palette(
         .saturating_add(Span::raw(before.as_str()).width() as u16)
         .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
     Some((x, inner.y))
+}
+
+/// The on-demand tab selector: the active space's tabs with their index,
+/// name, pane count and active marker. It is the compatibility path for an
+/// old multi-tab space and the only tab chrome; it appears only when summoned
+/// with `prefix T`, never by itself.
+pub(super) fn draw_tabs(
+    buffer: &mut Buffer,
+    area: Rect,
+    workspace: &super::super::model::Workspace,
+    ui: &UiState,
+    theme: &Theme,
+) {
+    let Some(state) = ui.tabs else {
+        return;
+    };
+    let Some(space) = workspace.space(state.space) else {
+        return;
+    };
+    if area.width < 16 || area.height < 5 {
+        return;
+    }
+    let width = area.width.saturating_sub(4).min(64);
+    let height = (space.tabs.len() as u16 + 3)
+        .min(area.height.saturating_sub(2))
+        .max(5);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + 1,
+        width,
+        height,
+    );
+    fill(buffer, rect, theme);
+    let title = Line::from(vec![
+        Span::styled(" tabs ", name(theme)),
+        Span::styled(format!("· {} · ", space.name), hint(theme)),
+        Span::styled("Enter", key(theme)),
+        Span::styled(" switch · ", hint(theme)),
+        Span::styled("Esc", key(theme)),
+        Span::styled(" close ", hint(theme)),
+    ]);
+    let (block, inner) = frame(rect, title, theme);
+    block.render(rect, buffer);
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+    let active = space.tabs.len();
+    // The hint is shortened and then ellipsized to the popup's inner width:
+    // it must end inside the border, never be hard-cut by it.
+    let hint = format!(
+        " {active} {} · j/k · g/G first/last · Enter switch · Esc close",
+        if active == 1 { "tab" } else { "tabs" }
+    );
+    let hint = truncate(&hint, inner.width as usize);
+    Paragraph::new(Line::from(Span::styled(hint, dim(theme))))
+        .render(Rect::new(inner.x, inner.y, inner.width, 1), buffer);
+    let list = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    if list.height == 0 || space.tabs.is_empty() {
+        return;
+    }
+    let visible = (list.height as usize).min(space.tabs.len());
+    let selected = state.selected.min(space.tabs.len() - 1);
+    let offset = selected.saturating_add(1).saturating_sub(visible);
+    let lines: Vec<Line> = space
+        .tabs
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .enumerate()
+        .map(|(index, tab)| {
+            let is_selected = offset + index == selected;
+            let style = if is_selected {
+                theme.selected_row()
+            } else {
+                body(theme)
+            };
+            let marker = if tab.id == space.active { "●" } else { " " };
+            let panes = tab.panes().len();
+            let count = format!("{panes} {}", if panes == 1 { "pane" } else { "panes" });
+            let left = format!(" {marker} {}  {}", offset + index + 1, tab.name);
+            let pad = (list.width as usize).saturating_sub(
+                Span::raw(left.as_str()).width() + Span::raw(count.as_str()).width() + 1,
+            );
+            Line::from(Span::styled(
+                format!("{left}{}{count} ", " ".repeat(pad)),
+                style,
+            ))
+        })
+        .collect();
+    Paragraph::new(lines).render(list, buffer);
 }
 
 /// The peek overlay: the agent's core facts over its local VT. It is

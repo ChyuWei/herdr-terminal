@@ -264,6 +264,9 @@ pub(super) struct Screen<'a> {
     selection_drag: Option<PaneId>,
     /// A grid press that becomes a selection only once the pointer moves.
     selection_press: Option<SelectionPress>,
+    /// A narrow drawer was dismissed by an outside press; the rest of that
+    /// gesture (drag/release/wheel) must not reach the pane underneath.
+    drawer_gesture: bool,
 }
 
 impl<'a> Screen<'a> {
@@ -332,6 +335,7 @@ impl<'a> Screen<'a> {
             resize_drag: None,
             selection_drag: None,
             selection_press: None,
+            drawer_gesture: false,
         };
         let workspace_panes: Vec<PaneId> = screen.workspace.panes().map(|pane| pane.id).collect();
         screen.seen.extend(workspace_panes);
@@ -464,6 +468,51 @@ impl<'a> Screen<'a> {
             .unwrap_or((HIDDEN_COLS, HIDDEN_ROWS))
     }
 
+    /// The bottom line's focused identity: the address, then the app and cwd
+    /// core reported, then the pane's own name/title when nothing was
+    /// reported. The active space and tab are never repeated here.
+    fn identity_line(&self) -> Option<String> {
+        let id = self.workspace.focused_pane()?;
+        let pane = self.workspace.pane(id)?;
+        let record = self.model.terminal(&pane.address);
+        let mut parts = vec![pane.address.clone()];
+        if let Some(record) = record {
+            let app = record
+                .status
+                .as_ref()
+                .map(|status| status.app.as_str())
+                .filter(|app| !app.is_empty())
+                .or_else(|| {
+                    record
+                        .foreground
+                        .as_ref()
+                        .map(|foreground| foreground.name.as_str())
+                        .filter(|name| !name.is_empty())
+                });
+            if let Some(app) = app {
+                parts.push(app.to_owned());
+            }
+            let cwd = record
+                .foreground
+                .as_ref()
+                .map(|foreground| foreground.cwd.as_str())
+                .filter(|cwd| !cwd.is_empty())
+                .or_else(|| (!record.cwd.is_empty()).then_some(record.cwd.as_str()));
+            if let Some(cwd) = cwd {
+                parts.push(cwd.to_owned());
+            }
+        }
+        if parts.len() == 1 {
+            let name = if pane.title.is_empty() || pane.title == pane.name {
+                pane.name.clone()
+            } else {
+                format!("{}: {}", pane.name, pane.title)
+            };
+            parts.push(name);
+        }
+        Some(parts.join(" · "))
+    }
+
     // --- drawing -----------------------------------------------------------
 
     fn draw_if_due(&mut self) -> Result<()> {
@@ -579,6 +628,7 @@ impl<'a> Screen<'a> {
             .focused_pane()
             .and_then(|pane| self.links.get(&pane))
             .is_none_or(|link| link.vt.at_bottom());
+        let identity = self.identity_line();
         let mut shape: Option<SetCursorStyle> = None;
         self.terminal
             .draw(|frame| {
@@ -593,6 +643,7 @@ impl<'a> Screen<'a> {
                     machines: machine_rows,
                     preview: preview_screen.as_ref(),
                     files: file_pane,
+                    identity: identity.as_deref(),
                 };
                 let rendered =
                     ui::render_with(frame.buffer_mut(), area, workspace, &ui_state, &view);

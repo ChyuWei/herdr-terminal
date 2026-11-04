@@ -25,6 +25,7 @@ pub mod machines;
 pub mod manager;
 pub mod model;
 pub mod palette;
+pub mod panenav;
 mod runtime;
 pub mod sidebar;
 mod startup;

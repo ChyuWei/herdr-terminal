@@ -296,6 +296,13 @@ fn wheel_up(x: u16, y: u16) -> String {
     sgr(64, false, x, y)
 }
 
+/// One drawn line that names an agent and its Core-reported status word.
+fn agent_line(screen: &str, name: &str, word: &str) -> bool {
+    screen
+        .lines()
+        .any(|line| line.contains(name) && line.contains(word))
+}
+
 fn cleanup_all(session: &Session) {
     for address in addresses(session) {
         let _ = session.hc_try(&["kill", &address]);
@@ -546,15 +553,11 @@ fn live(session: &Session, address: &str) -> bool {
     record(session, address)["state"].as_str() == Some("live")
 }
 
-fn tab_bar(run: &Run) -> String {
-    run.rendered().lines().next().unwrap_or_default().to_owned()
-}
-
 #[test]
 fn move_zoom_and_rename_change_the_screen() {
     let Some(mut session) = session() else { return };
     session.start();
-    let mut run = Run::spawn(&session, 80, 24);
+    let mut run = Run::spawn(&session, 120, 40);
     wait_addresses(&session, 1, secs(10));
     run.command(b'v');
     let known = wait_addresses(&session, 2, secs(10));
@@ -624,9 +627,21 @@ fn move_zoom_and_rename_change_the_screen() {
     // , renames the tab through the one-line prompt; Enter commits.
     run.command(b',');
     run.send(b"work\r");
+    run.command(b'T');
     assert!(
-        run.wait_screen(secs(10), |_| tab_bar(&run).contains("work")),
-        "the tab rename did not reach the tab bar; screen={:?}",
+        run.wait_text("tabs · space 1", secs(10)),
+        "the tab selector did not open; screen={:?}",
+        run.rendered()
+    );
+    assert!(
+        run.wait_text("work", secs(5)),
+        "the tab rename did not reach the tab selector; screen={:?}",
+        run.rendered()
+    );
+    run.send(&[0x1b]);
+    assert!(
+        run.wait_screen(secs(5), |screen| !screen.contains("tabs · space 1")),
+        "escape did not close the tab selector; screen={:?}",
         run.rendered()
     );
     // Escape cancels, and the keys typed while the prompt was open never
@@ -646,8 +661,8 @@ fn move_zoom_and_rename_change_the_screen() {
     run.command(b'.');
     run.send(b"main\r");
     assert!(
-        run.wait_screen(secs(10), |_| tab_bar(&run).contains("main")),
-        "the space rename did not reach the tab bar; screen={:?}",
+        run.wait_text("main", secs(10)),
+        "the space rename did not reach the rail; screen={:?}",
         run.rendered()
     );
 
@@ -835,7 +850,7 @@ fn doc_addresses(doc: &Value) -> Vec<String> {
 fn a_restart_restores_layout_titles_zoom_and_focus() {
     let Some(mut session) = session() else { return };
     session.start();
-    let mut run = Run::spawn(&session, 80, 24);
+    let mut run = Run::spawn(&session, 120, 40);
     wait_addresses(&session, 1, secs(10));
     run.command(b'v');
     let known = wait_addresses(&session, 2, secs(10));
@@ -882,7 +897,7 @@ fn a_restart_restores_layout_titles_zoom_and_focus() {
 
     // A fresh screen restores the document and its own view: same terminals,
     // no new ones, the left pane zoomed and focused.
-    let mut run = Run::spawn(&session, 80, 24);
+    let mut run = Run::spawn(&session, 120, 40);
     assert!(
         run.wait_screen(secs(10), |screen| {
             screen.contains("LEFT-ONE") && !screen.contains("RIGHT-TWO")
@@ -977,12 +992,7 @@ fn two_screens_share_the_layout_and_keep_their_own_view() {
         .expect("the new tab's terminal")
         .clone();
     assert!(
-        first.wait_screen(secs(10), |screen| {
-            screen
-                .lines()
-                .next()
-                .is_some_and(|bar| bar.contains("tab 2"))
-        }),
+        first.wait_screen(secs(10), |screen| screen.contains("2 tabs")),
         "the doc change did not reach the first screen; screen={:?}",
         first.rendered()
     );
@@ -995,10 +1005,7 @@ fn two_screens_share_the_layout_and_keep_their_own_view() {
     // The first screen can visit the shared tab and type into its terminal.
     first.command(b'2');
     assert!(
-        first.wait_screen(secs(10), |screen| screen
-            .lines()
-            .next()
-            .is_some_and(|bar| { bar.contains("tab 2") })),
+        first.wait_screen(secs(10), |screen| screen.contains(&added)),
         "the first screen did not switch to the shared tab; screen={:?}",
         first.rendered()
     );
@@ -1172,7 +1179,7 @@ fn a_deleted_document_is_rebuilt_from_live_labeled_terminals() {
 fn agents_report_status_turns_seen_and_pin_end_to_end() {
     let Some(mut session) = session() else { return };
     session.start();
-    let mut run = Run::spawn_with(&session, 100, 30, &["sh", "-c", AGENT]);
+    let mut run = Run::spawn_with(&session, 140, 30, &["sh", "-c", AGENT]);
     let address = wait_addresses(&session, 1, secs(10))
         .into_iter()
         .next()
@@ -1197,33 +1204,39 @@ fn agents_report_status_turns_seen_and_pin_end_to_end() {
         "the foreground process was not reported: {}",
         record(&session, &address)
     );
-    assert!(run.wait_text("[idle]", secs(5)), "{}", run.rendered());
+    assert!(
+        run.wait_screen(secs(5), |screen| agent_line(screen, "Build", "idle")),
+        "{}",
+        run.rendered()
+    );
 
     session.hc_json(&["send", &address, "working"]);
     assert!(wait_status(&session, &address, "working", secs(10)));
-    assert!(run.wait_text("[working]", secs(5)), "{}", run.rendered());
+    assert!(
+        run.wait_screen(secs(5), |screen| agent_line(screen, "Build", "working")),
+        "{}",
+        run.rendered()
+    );
     run.command(b'a');
     assert!(
-        run.wait_text("sidebar · Esc closes", secs(10)),
-        "the sidebar did not take focus: {}",
+        run.wait_text("rail · j/k move", secs(10)),
+        "the rail did not take focus: {}",
         run.rendered()
     );
     let sidebar = run.rendered();
     assert!(
-        sidebar.contains("Build working"),
-        "the sidebar row must show the Core-reported word: {sidebar}"
+        agent_line(&sidebar, "Build", "working"),
+        "the rail row must show the Core-reported word: {sidebar}"
     );
     run.send(b"\x1b");
     assert!(
-        run.wait_screen(secs(5), |screen| {
-            !screen.contains("sidebar · Esc closes")
-        }),
-        "the sidebar did not give focus back: {}",
+        run.wait_screen(secs(5), |screen| { !screen.contains("rail · j/k move") }),
+        "the rail did not give focus back: {}",
         run.rendered()
     );
     assert!(
-        run.rendered().contains(" agents"),
-        "the panel itself must stay visible: {}",
+        run.rendered().contains("AGENTS"),
+        "the rail itself must stay visible: {}",
         run.rendered()
     );
 
@@ -1235,12 +1248,16 @@ fn agents_report_status_turns_seen_and_pin_end_to_end() {
         "a visible completed turn was not marked seen: {}",
         record(&session, &address)
     );
-    assert!(run.wait_text("[idle]", secs(5)), "{}", run.rendered());
+    assert!(
+        run.wait_screen(secs(5), |screen| agent_line(screen, "Build", "idle")),
+        "{}",
+        run.rendered()
+    );
 
     // Unread is the one lower write, and the row shows done/unseen until the
     // pane is looked at again.
     run.command(b'a');
-    assert!(run.wait_text("sidebar · Esc closes", secs(5)));
+    assert!(run.wait_text("rail · j/k move", secs(5)));
     run.send(b"u");
     assert!(
         wait_label(&session, &address, "herdr.seen", "0", secs(10)),
@@ -1249,7 +1266,7 @@ fn agents_report_status_turns_seen_and_pin_end_to_end() {
         run.rendered()
     );
     assert!(
-        run.wait_screen(secs(5), |screen| { screen.contains("Build done") }),
+        run.wait_screen(secs(5), |screen| agent_line(screen, "Build", "done")),
         "the unread row was not shown: {}",
         run.rendered()
     );
@@ -1262,7 +1279,7 @@ fn agents_report_status_turns_seen_and_pin_end_to_end() {
         record(&session, &address)
     );
     assert!(
-        run.wait_screen(secs(5), |screen| screen.contains("* Build done")),
+        run.wait_screen(secs(5), |screen| { agent_line(screen, "* Build", "done") }),
         "the pin marker is missing: {}",
         run.rendered()
     );
@@ -1275,7 +1292,7 @@ fn agents_report_status_turns_seen_and_pin_end_to_end() {
         "the layout document was not written: {}",
         session.doc("herdr-terminal")
     );
-    let mut observer = Run::spawn_as(&session, 100, 30, "observer");
+    let mut observer = Run::spawn_as(&session, 140, 30, "observer");
     assert!(
         observer.wait_text("Agent Build", secs(10)),
         "the second screen did not restore the agent: {}",
@@ -1290,16 +1307,14 @@ fn agents_report_status_turns_seen_and_pin_end_to_end() {
         record(&session, &address)
     );
     assert!(
-        run.wait_screen(secs(5), |screen| { screen.contains("Build idle") }),
+        run.wait_screen(secs(5), |screen| agent_line(screen, "Build", "idle")),
         "another client's seen write did not reach the first screen: {}",
         run.rendered()
     );
 
     observer.command(b'a');
     assert!(
-        observer.wait_screen(secs(5), |screen| {
-            screen.contains("* Build idle") && screen.contains("pinned")
-        }),
+        observer.wait_screen(secs(5), |screen| { agent_line(screen, "* Build", "idle") }),
         "the second screen did not show the shared pin state: {}",
         observer.rendered()
     );
@@ -1312,7 +1327,7 @@ fn agents_report_status_turns_seen_and_pin_end_to_end() {
     );
     assert!(
         observer.wait_screen(secs(5), |screen| {
-            screen.contains("idle") && !screen.contains("pinned")
+            agent_line(screen, "Build", "idle") && !screen.contains("* Build")
         }),
         "the second screen did not apply another client's unpin: {}",
         observer.rendered()
@@ -1348,7 +1363,7 @@ fn agents_report_status_turns_seen_and_pin_end_to_end() {
 fn agents_jump_and_peek_across_tabs_end_to_end() {
     let Some(mut session) = session() else { return };
     session.start();
-    let mut run = Run::spawn_with(&session, 100, 30, &["sh", "-c", AGENT]);
+    let mut run = Run::spawn_with(&session, 140, 30, &["sh", "-c", AGENT]);
     let address = wait_addresses(&session, 1, secs(10))
         .into_iter()
         .next()
@@ -1431,7 +1446,7 @@ fn agents_jump_and_peek_across_tabs_end_to_end() {
 fn mouse_clicks_focus_a_pane_and_dragging_a_split_resizes_it() {
     let Some(mut session) = session() else { return };
     session.start();
-    let mut run = Run::spawn(&session, 80, 24);
+    let mut run = Run::spawn(&session, 120, 40);
     wait_addresses(&session, 1, secs(10));
     run.command(b'v');
     let known = wait_addresses(&session, 2, secs(10));
@@ -1440,7 +1455,7 @@ fn mouse_clicks_focus_a_pane_and_dragging_a_split_resizes_it() {
     // The split focuses the new right pane. A grid click moves the focus back
     // to the left pane. A click without a drag is focus-only: typing the next
     // command must reach the program with no Esc.
-    run.send(click(30, 5).as_bytes());
+    run.send(click(40, 5).as_bytes());
     run.title("CLICK-LEFT");
     assert!(
         wait_title(&session, &known[0], "CLICK-LEFT", secs(10)),
@@ -1457,13 +1472,14 @@ fn mouse_clicks_focus_a_pane_and_dragging_a_split_resizes_it() {
     );
     assert_ne!(title_of(&session, &known[1]), "CLICK-LEFT");
 
-    // The sidebar takes 20 columns; the gap is between the 30- and 29-cell panes.
-    run.send(sgr(0, false, 50, 10).as_bytes());
-    run.send(sgr(32, false, 54, 10).as_bytes());
-    run.send(sgr(0, true, 54, 10).as_bytes());
+    // The rail takes 30 columns; the split gap is between the 45- and
+    // 44-cell panes at x=75.
+    run.send(sgr(0, false, 75, 10).as_bytes());
+    run.send(sgr(32, false, 79, 10).as_bytes());
+    run.send(sgr(0, true, 79, 10).as_bytes());
     assert!(
         wait_until(secs(10), || {
-            sizes(&session, &known) == vec![(32, 20), (23, 20)]
+            sizes(&session, &known) == vec![(47, 37), (38, 37)]
         }),
         "the drag did not reach both programs at their exact sizes: {:?}",
         sizes(&session, &known)
@@ -1634,7 +1650,7 @@ fn a_bracketed_paste_reaches_the_program_byte_for_byte() {
     session.start();
     let mut run = Run::spawn_with(
         &session,
-        100,
+        80,
         24,
         &[
             "--",
@@ -1679,7 +1695,7 @@ fn config_applies_theme_and_rebound_keys_at_startup() {
         r#"{"theme":"light","keys":{"new_tab":"b"}}"#,
     )
     .expect("seed config");
-    let mut run = Run::spawn(&session, 80, 24);
+    let mut run = Run::spawn(&session, 120, 30);
     wait_addresses(&session, 1, secs(10));
     assert!(
         run.wait_text("space 1", secs(10)),
@@ -1687,7 +1703,7 @@ fn config_applies_theme_and_rebound_keys_at_startup() {
         run.rendered()
     );
     assert!(
-        run.raw().contains("38;2;30;102;245"),
+        run.raw().contains("38;2;35;107;85"),
         "the light accent was not drawn in truecolor: {:?}",
         run.raw()
     );
@@ -1717,7 +1733,7 @@ fn a_malformed_config_warns_and_still_starts_the_workspace() {
     let dir = session.config_home().join("herdr-terminal");
     std::fs::create_dir_all(&dir).expect("config dir");
     std::fs::write(dir.join("config.json"), "{not json").expect("seed config");
-    let mut run = Run::spawn(&session, 80, 24);
+    let mut run = Run::spawn(&session, 120, 30);
     wait_addresses(&session, 1, secs(10));
     assert!(
         run.wait_text("space 1", secs(10)),
@@ -1742,8 +1758,8 @@ fn a_mouse_aware_program_receives_grid_events_but_not_chrome() {
     session.start();
     let mut run = Run::spawn_with(
         &session,
-        80,
-        24,
+        120,
+        30,
         &[
             "--",
             "sh",
@@ -1759,27 +1775,27 @@ fn a_mouse_aware_program_receives_grid_events_but_not_chrome() {
     );
 
     // The program's terminal echoes the bytes it receives, so the pane text is
-    // the pane-local SGR report: click at screen (30,5) inside an inner grid
-    // that starts at (21,2), so the program sees column 9, row 3.
-    run.send(click(30, 5).as_bytes());
+    // the pane-local SGR report: click at screen (40,6) inside an inner grid
+    // that starts at (31,1), so the program sees column 9, row 5.
+    run.send(click(40, 6).as_bytes());
     assert!(
-        run.wait_text("^[[<0;10;4M", secs(10)),
+        run.wait_text("^[[<0;10;6M", secs(10)),
         "the click was not forwarded with local coordinates: {:?}",
         run.rendered()
     );
-    run.send(wheel_up(30, 5).as_bytes());
+    run.send(wheel_up(40, 6).as_bytes());
     assert!(
-        run.wait_text("^[[<64;10;4M", secs(10)),
+        run.wait_text("^[[<64;10;6M", secs(10)),
         "the wheel was not forwarded to the tracking program: {:?}",
         run.rendered()
     );
 
-    // Chrome never reaches the program: the tab bar, status bar and pane
-    // border add no mouse reports.
+    // Chrome never reaches the program: the rail, the status line and the
+    // pane border add no mouse reports.
     let reports = run.rendered().matches("^[[<").count();
-    run.send(click(30, 0).as_bytes());
-    run.send(click(30, 23).as_bytes());
-    run.send(click(20, 5).as_bytes());
+    run.send(click(10, 5).as_bytes());
+    run.send(click(40, 0).as_bytes());
+    run.send(click(40, 29).as_bytes());
     run.send(b"printf 'CHROME-DONE\\n'\r");
     assert!(
         run.wait_text("CHROME-DONE", secs(10)),

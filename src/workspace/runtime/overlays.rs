@@ -12,7 +12,7 @@ use crate::config::ClipboardMode;
 use crate::core::{Error, Result};
 use crate::tui::vt_error;
 use crate::workspace::palette;
-use crate::workspace::state::{Edit, PaletteState, SearchState};
+use crate::workspace::state::{Edit, PaletteState, SearchState, TabsState};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io::Write;
 
@@ -40,6 +40,99 @@ impl Screen<'_> {
         self.ui.selecting = None;
         self.ui.palette = Some(PaletteState::default());
         self.dirty = true;
+    }
+
+    /// Opens the tab selector for the active space, selected on its active
+    /// tab. It is the discoverable compatibility path for an old multi-tab
+    /// space; it never opens by itself and changes nothing until Enter.
+    pub(super) fn open_tabs(&mut self) {
+        self.clear_modes();
+        let space_id = self.workspace.active_space_id();
+        let Some(space) = self.workspace.space(space_id) else {
+            return;
+        };
+        let selected = space
+            .tabs
+            .iter()
+            .position(|tab| tab.id == space.active)
+            .unwrap_or(0);
+        self.ui.help = false;
+        self.ui.prompt = None;
+        self.ui.peek = None;
+        self.ui.palette = None;
+        self.ui.search = None;
+        self.ui.selecting = None;
+        self.ui.tabs = Some(TabsState {
+            space: space_id,
+            selected,
+        });
+        self.dirty = true;
+    }
+
+    fn close_tabs(&mut self) {
+        if self.ui.tabs.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// One key in the tab selector: j/k (or arrows) move, g/G jump to the
+    /// first/last tab, Enter switches to the selected tab and closes, Esc/q
+    /// closes without switching.
+    pub(super) fn tabs_key(&mut self, key: &KeyEvent) -> Result<()> {
+        if key.kind == KeyEventKind::Release {
+            return Ok(());
+        }
+        let Some(state) = self.ui.tabs else {
+            return Ok(());
+        };
+        let Some(space) = self.workspace.space(state.space) else {
+            self.close_tabs();
+            return Ok(());
+        };
+        let len = space.tabs.len();
+        if len == 0 {
+            self.close_tabs();
+            return Ok(());
+        }
+        let plain = !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.close_tabs(),
+            KeyCode::Char('q') if plain => self.close_tabs(),
+            KeyCode::Down | KeyCode::Char('j') if plain => {
+                if let Some(state) = self.ui.tabs.as_mut() {
+                    state.selected = (state.selected + 1).min(len - 1);
+                }
+                self.dirty = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') if plain => {
+                if let Some(state) = self.ui.tabs.as_mut() {
+                    state.selected = state.selected.saturating_sub(1);
+                }
+                self.dirty = true;
+            }
+            KeyCode::Home | KeyCode::Char('g') if plain => {
+                if let Some(state) = self.ui.tabs.as_mut() {
+                    state.selected = 0;
+                }
+                self.dirty = true;
+            }
+            KeyCode::End | KeyCode::Char('G') if plain => {
+                if let Some(state) = self.ui.tabs.as_mut() {
+                    state.selected = len - 1;
+                }
+                self.dirty = true;
+            }
+            KeyCode::Enter => {
+                let tab = space.tabs[state.selected.min(len - 1)].id;
+                self.close_tabs();
+                if self.workspace.select_tab_id(tab) {
+                    self.dirty = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub(super) fn open_search(&mut self) {

@@ -244,6 +244,7 @@ pub enum Overlay {
     Manager,
     Machines,
     Files,
+    Tabs,
     Preview,
     Peek(PaneId),
     Sidebar,
@@ -272,6 +273,7 @@ pub fn visible_panes(
         | Overlay::Manager
         | Overlay::Machines
         | Overlay::Files
+        | Overlay::Tabs
         | Overlay::Preview => {
             return visible;
         }
@@ -361,6 +363,19 @@ impl Attention {
         }
         if self.done > 0 {
             parts.push(format!("{} done", self.done));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// The rail's attention line: blocked work and finished turns nobody has
+    /// read yet. It is a summary of the rows, not a status of its own.
+    pub fn summary(self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.blocked > 0 {
+            parts.push(format!("{} blocked", self.blocked));
+        }
+        if self.done > 0 {
+            parts.push(format!("{} done unread", self.done));
         }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
