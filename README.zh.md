@@ -15,9 +15,9 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 **已实现**
 
 - **连接**：发现 Core、单条长连接、`hello` 检查、断线重连，运行中的程序不丢。
-- **终端**：运行、attach、本地 VT 渲染、键盘和鼠标输入、resize、focus、display facts、基于 credit 的流控，以及 `lost`/`restarted`/`finished` 生命周期。
+- **终端**：运行、attach、本地 VT 渲染、键盘和鼠标输入、resize、focus、display facts、基于 credit 的流控，以及 `lost`/`restarted`/`finished` 生命周期。新的本地终端会从当前 pane 由 Core 报告的 cwd 启动，否则使用客户端进程的 cwd（若为 `/` 或不可读则用 `$HOME`）；在机器上启动时不发送本地 cwd，使用该机器的 home（替换终端沿用退出终端的 cwd），恢复的工作区中显式指定的 `ht PROG` 也跟随当前 pane。本屏启动的终端在程序退出时会自动关闭 pane（断开 stream，并尽可能用 `terminal.rm` 移除已结束记录）；若它是 tab 的最后一个 pane，会在同一 space/tab 中启动一个新的 shell，`machine/t7` pane 仍在同一机器上，后台 tab 不会因此切换为 active；几乎立即退出的 shell 不会再次替换，而已在恢复或采用时即为 finished 的记录会保留最终画面直到关闭。
 - **文本渲染**：默认开启 grapheme clustering，与 Core 和 Herdr App 一致，因此 `✍️`、`❤️` 等带 variation selector 的 emoji 是一个宽两格的 cluster，后面紧跟一个零宽占位格，不会拆成不同单元格。
-- **初始终端尺寸**：启动新终端时会带上 attach 时将使用的网格（初始 shell、split/tab/space、显式程序、`ht screen`、重连后的替换终端和 `ht probe`），因此只读取一次尺寸的程序也能以正确的布局启动。所有受支持的 Core 都会应用该字段，因此不需要版本判断。
+- **初始终端尺寸**：启动新终端时会带上 attach 时将使用的网格（初始 shell、split/tab/space、显式程序、`ht screen`、重连或退出后的替换终端和 `ht probe`），因此只读取一次尺寸的程序也能以正确的布局启动。所有受支持的 Core 都会应用该字段，因此不需要版本判断。
 - **工作区**：创建 spaces、tabs、panes；split/close/move；focus、zoom；重命名 tab 和 space。
 - **终端操作**：labels、keep、kill/rm、shell 或命令。
 - **终端管理器**：`prefix t` 打开 Core 范围内所有 live 终端的列表，包含已显示标记、OSC 7501 状态（未报告时为 `unknown`）、存活时间、地址，以及可选的名称/标题/父终端/机器/cwd；按 blocked/error、working、done、idle、unknown 排序，并支持大小写不敏感的子串过滤。`Enter` 通过采用现有地址显示未显示的终端（不会启动新程序），或隐藏已显示的终端（detach 并移除 pane，绝不 kill/rm）；`p` 通过 observer attach 只读预览，和 agent peek 不同。选择和过滤属于本地 UI 状态。
