@@ -245,14 +245,15 @@ pub enum Overlay {
     Machines,
     Files,
     Preview,
-    Sidebar,
     Peek(PaneId),
+    Sidebar,
 }
 
-/// The panes whose output the person can see. An unfocused window sees none;
-/// help, prompt and the sidebar cover every pane; a peek shows only its
-/// target; otherwise every pane in the active tab is visible, or only the
-/// zoomed pane.
+/// The panes whose output the person is watching. An unfocused window sees
+/// none; help, prompt and the other overlays cover every pane, and a focused
+/// sidebar counts as covering them because keyboard attention is on the panel;
+/// a peek shows only its target; otherwise every pane in the active tab is
+/// visible, or only the zoomed pane.
 pub fn visible_panes(
     workspace: &Workspace,
     window_focused: bool,
@@ -267,11 +268,11 @@ pub fn visible_panes(
         | Overlay::Prompt
         | Overlay::Palette
         | Overlay::Search
+        | Overlay::Sidebar
         | Overlay::Manager
         | Overlay::Machines
         | Overlay::Files
-        | Overlay::Preview
-        | Overlay::Sidebar => {
+        | Overlay::Preview => {
             return visible;
         }
         Overlay::Peek(pane) => {

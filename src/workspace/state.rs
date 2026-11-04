@@ -85,8 +85,11 @@ pub struct UiState {
     pub message: Option<String>,
     /// The prefix key was pressed and the next key is a command.
     pub prefix: bool,
+    /// Resize mode is active: arrows adjust the nearest split boundary.
+    pub resize: bool,
     pub connection: Connection,
-    /// The modal agent sidebar and its selection.
+    /// The persistent agent sidebar and its selection. `open` means it has
+    /// keyboard focus; on a wide terminal the panel is drawn either way.
     pub sidebar: Sidebar,
     /// The Core-wide terminal manager and its local selection/filter.
     pub manager: ManagerState,
@@ -112,6 +115,7 @@ impl Default for UiState {
             selecting: None,
             message: None,
             prefix: false,
+            resize: false,
             connection: Connection::Live,
             sidebar: Sidebar::default(),
             manager: ManagerState::default(),
@@ -147,6 +151,8 @@ impl UiState {
         } else if self.files.open {
             Overlay::Files
         } else if self.sidebar.open {
+            // Keyboard focus is on the panel, not on the terminals beside it:
+            // for seen/attention purposes those panes are not being watched.
             Overlay::Sidebar
         } else {
             Overlay::None
@@ -155,7 +161,8 @@ impl UiState {
 
     /// Whether an overlay other than the text selection owns every key and
     /// mouse event. A selection is modal for keys but lets a fresh mouse press
-    /// through, so mouse routing checks this rather than [`Self::modal`].
+    /// through, so mouse routing checks this rather than [`Self::modal`]. The
+    /// persistent sidebar is not an overlay: it sits beside the panes.
     pub fn overlay(&self) -> bool {
         self.help
             || self.prompt.is_some()
@@ -166,12 +173,13 @@ impl UiState {
             || self.machines.open
             || self.files.open
             || self.preview.is_some()
-            || self.sidebar.open
     }
 
-    /// Whether an overlay currently owns every key.
+    /// Whether an overlay or a keyboard mode currently owns every key. The
+    /// focused sidebar is a keyboard mode even though it does not cover the
+    /// panes.
     pub fn modal(&self) -> bool {
-        self.overlay() || self.selecting.is_some()
+        self.overlay() || self.selecting.is_some() || self.resize || self.sidebar.open
     }
 }
 
@@ -231,11 +239,13 @@ impl SearchState {
     }
 }
 
-/// The agent sidebar: open flag, selection by pane id, and scroll offset.
+/// The persistent sidebar: whether it has keyboard focus, its selected row
+/// and the scroll offset.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sidebar {
+    /// Keyboard focus. The panel is drawn on wide terminals either way.
     pub open: bool,
-    pub selected: Option<PaneId>,
+    pub selected: Option<super::sidebar::Item>,
     pub offset: usize,
 }
 
@@ -529,7 +539,15 @@ mod tests {
         let mut ui = UiState::default();
         assert_eq!(ui.agent_overlay(), Overlay::None);
         ui.sidebar.open = true;
-        assert_eq!(ui.agent_overlay(), Overlay::Sidebar);
+        assert_eq!(
+            ui.agent_overlay(),
+            Overlay::Sidebar,
+            "keyboard focus in the sidebar means the panes are not being watched"
+        );
+        assert!(
+            !ui.overlay(),
+            "the sidebar is beside the panes, not modal for the mouse"
+        );
         ui.peek = Some(PaneId(7));
         assert_eq!(
             ui.agent_overlay(),

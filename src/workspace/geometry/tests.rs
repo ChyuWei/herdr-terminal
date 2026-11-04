@@ -24,15 +24,15 @@ fn bars_and_borders_leave_the_terminal_grid_inside_them() {
     let layout = leaf(1);
     let tab = make_tab(layout);
     let rects = compute(Some(&tab), Rect::new(0, 0, 80, 24));
-    assert_eq!(rects.tab_bar, Rect::new(0, 0, 80, 1));
-    assert_eq!(rects.status, Rect::new(0, 23, 80, 1));
-    assert_eq!(rects.workspace, Rect::new(0, 1, 80, 22));
-    assert_eq!(rects.panes, vec![(PaneId(1), Rect::new(0, 1, 80, 22))]);
+    assert_eq!(rects.tab_bar, Rect::new(20, 0, 60, 1));
+    assert_eq!(rects.status, Rect::new(20, 23, 60, 1));
+    assert_eq!(rects.workspace, Rect::new(20, 1, 60, 22));
+    assert_eq!(rects.panes, vec![(PaneId(1), Rect::new(20, 1, 60, 22))]);
     assert_eq!(
         rects.pane(PaneId(1)).and_then(inner),
-        Some(Rect::new(1, 2, 78, 20))
+        Some(Rect::new(21, 2, 58, 20))
     );
-    assert_eq!(attach_size(Rect::new(0, 1, 80, 22)), (78, 20));
+    assert_eq!(attach_size(Rect::new(20, 1, 60, 22)), (58, 20));
 }
 
 #[test]
@@ -42,8 +42,8 @@ fn columns_and_rows_share_cells_with_a_gap() {
     assert_eq!(
         rects.panes,
         vec![
-            (PaneId(1), Rect::new(0, 1, 40, 22)),
-            (PaneId(2), Rect::new(41, 1, 39, 22)),
+            (PaneId(1), Rect::new(20, 1, 30, 22)),
+            (PaneId(2), Rect::new(51, 1, 29, 22)),
         ]
     );
 
@@ -52,8 +52,8 @@ fn columns_and_rows_share_cells_with_a_gap() {
     assert_eq!(
         rects.panes,
         vec![
-            (PaneId(1), Rect::new(0, 1, 80, 11)),
-            (PaneId(2), Rect::new(0, 13, 80, 10)),
+            (PaneId(1), Rect::new(20, 1, 60, 11)),
+            (PaneId(2), Rect::new(20, 13, 60, 10)),
         ]
     );
 }
@@ -90,9 +90,9 @@ fn weights_change_only_the_extra_space() {
     children[1].size = 3;
     let tab = make_tab(layout);
     let rects = compute(Some(&tab), Rect::new(0, 0, 80, 24));
-    assert_eq!(rects.panes[0].1.width, 21);
-    assert_eq!(rects.panes[1].1.width, 58);
-    assert_eq!(rects.panes[0].1.width + 1 + rects.panes[1].1.width, 80);
+    assert_eq!(rects.panes[0].1.width, 16);
+    assert_eq!(rects.panes[1].1.width, 43);
+    assert_eq!(rects.panes[0].1.width + 1 + rects.panes[1].1.width, 60);
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn zoom_shows_only_the_focused_pane_but_directions_use_the_full_layout() {
     let mut tab = make_tab(split(Axis::Columns, vec![leaf(1), leaf(2)]));
     tab.zoomed = Some(PaneId(2));
     let rects = compute(Some(&tab), Rect::new(0, 0, 80, 24));
-    assert_eq!(rects.panes, vec![(PaneId(2), Rect::new(0, 1, 80, 22))]);
+    assert_eq!(rects.panes, vec![(PaneId(2), Rect::new(20, 1, 60, 22))]);
     let full = compute_without_zoom(Some(&tab), Rect::new(0, 0, 80, 24));
     assert_eq!(full.panes.len(), 2);
     assert_eq!(neighbor(&full, PaneId(2), Direction::Left), Some(PaneId(1)));
@@ -135,13 +135,14 @@ fn tiny_viewports_clamp_gaps_before_panes() {
 fn hit_testing_includes_borders_but_not_gaps() {
     let tab = make_tab(split(Axis::Columns, vec![leaf(1), leaf(2)]));
     let rects = compute(Some(&tab), Rect::new(0, 0, 80, 24));
-    assert_eq!(rects.at(0, 1), Some(PaneId(1)), "top-left border");
-    assert_eq!(rects.at(39, 22), Some(PaneId(1)), "bottom-right border");
-    assert_eq!(rects.at(40, 10), None, "the gap");
-    assert_eq!(rects.at(41, 1), Some(PaneId(2)));
+    assert_eq!(rects.at(20, 1), Some(PaneId(1)), "top-left border");
+    assert_eq!(rects.at(49, 22), Some(PaneId(1)), "bottom-right border");
+    assert_eq!(rects.at(50, 10), None, "the gap");
+    assert_eq!(rects.at(51, 1), Some(PaneId(2)));
     assert_eq!(rects.at(79, 22), Some(PaneId(2)));
-    assert_eq!(rects.at(0, 0), None, "the tab bar");
+    assert_eq!(rects.at(20, 0), None, "the tab bar");
     assert_eq!(rects.at(80, 10), None);
+    assert_eq!(rects.at(0, 10), None, "the sidebar is not a pane");
 }
 
 #[test]
@@ -192,14 +193,14 @@ fn split_boundaries_are_hit_testable_on_the_gap_cell() {
     assert_eq!(boundaries[0].axis, Axis::Columns);
     assert_eq!(boundaries[0].path, Vec::<usize>::new());
     assert_eq!(boundaries[0].index, 0);
-    assert_eq!(boundaries[0].rect, Rect::new(40, 1, 1, 22));
+    assert_eq!(boundaries[0].rect, Rect::new(50, 1, 1, 22));
     assert_eq!(
-        gap_at(Some(&tab), viewport, 40, 10),
+        gap_at(Some(&tab), viewport, 50, 10),
         Some(boundaries[0].clone())
     );
-    assert_eq!(gap_at(Some(&tab), viewport, 39, 10), None);
-    assert_eq!(gap_at(Some(&tab), viewport, 41, 10), None);
-    assert_eq!(gap_at(Some(&tab), viewport, 40, 0), None, "tab bar");
+    assert_eq!(gap_at(Some(&tab), viewport, 49, 10), None);
+    assert_eq!(gap_at(Some(&tab), viewport, 51, 10), None);
+    assert_eq!(gap_at(Some(&tab), viewport, 50, 0), None, "tab bar");
 
     let nested = make_tab(split(
         Axis::Rows,
@@ -233,25 +234,100 @@ fn tab_spans_match_the_drawn_tab_bar_and_hit_the_right_tab() {
     space.tabs.push(Tab::new(TabId(1), "tab 1".into()));
     space.tabs.push(Tab::new(TabId(2), "tab 2".into()));
     space.active = TabId(2);
-    let area = Rect::new(0, 0, 80, 1);
+    let area = bars(Rect::new(0, 0, 80, 1)).0;
+    assert_eq!(area, Rect::new(20, 0, 60, 1));
     let spans = tab_spans(&space, area);
     assert_eq!(spans.len(), 2);
-    assert_eq!(spans[0], (TabId(1), Rect::new(9, 0, 9, 1)));
-    assert_eq!(spans[1], (TabId(2), Rect::new(18, 0, 9, 1)));
-    assert_eq!(tab_at(&space, area, 9, 0), Some(TabId(1)));
-    assert_eq!(tab_at(&space, area, 17, 0), Some(TabId(1)));
-    assert_eq!(tab_at(&space, area, 18, 0), Some(TabId(2)));
+    assert_eq!(spans[0], (TabId(1), Rect::new(30, 0, 9, 1)));
+    assert_eq!(spans[1], (TabId(2), Rect::new(39, 0, 9, 1)));
+    assert_eq!(tab_at(&space, area, 30, 0), Some(TabId(1)));
+    assert_eq!(tab_at(&space, area, 38, 0), Some(TabId(1)));
+    assert_eq!(tab_at(&space, area, 39, 0), Some(TabId(2)));
     assert_eq!(
-        tab_at(&space, area, 8, 0),
+        tab_at(&space, area, 29, 0),
         None,
         "the space name is not a tab"
     );
-    assert_eq!(tab_at(&space, area, 27, 0), None, "past the last tab");
+    assert_eq!(tab_at(&space, area, 48, 0), None, "past the last tab");
+    assert_eq!(tab_at(&space, area, 0, 0), None, "the sidebar is not a tab");
 
     let narrow = tab_spans(&space, Rect::new(0, 0, 20, 1));
     assert_eq!(narrow.len(), 2);
     assert_eq!(
-        narrow[1].1.width, 2,
+        narrow[1].1.width, 1,
         "a clipped tab keeps its visible cells"
+    );
+}
+
+#[test]
+fn keyboard_resize_picks_the_deepest_matching_split_on_the_focused_route() {
+    let tab = make_tab(split(Axis::Columns, vec![leaf(1), leaf(2)]));
+    assert_eq!(
+        resize_target(&tab, PaneId(1), Axis::Columns, true),
+        Some(ResizeStep {
+            path: Vec::new(),
+            index: 0,
+            delta: 1
+        })
+    );
+    assert_eq!(
+        resize_target(&tab, PaneId(1), Axis::Columns, false),
+        Some(ResizeStep {
+            path: Vec::new(),
+            index: 0,
+            delta: -1
+        }),
+        "the only boundary is on the right, so it moves left"
+    );
+    assert_eq!(
+        resize_target(&tab, PaneId(2), Axis::Columns, false),
+        Some(ResizeStep {
+            path: Vec::new(),
+            index: 0,
+            delta: -1
+        })
+    );
+    assert_eq!(
+        resize_target(&tab, PaneId(1), Axis::Rows, true),
+        None,
+        "there is no row split"
+    );
+
+    // A nested grid moves its local boundary before the outer one.
+    let nested = make_tab(split(
+        Axis::Rows,
+        vec![split(Axis::Columns, vec![leaf(1), leaf(2)]), leaf(3)],
+    ));
+    assert_eq!(
+        resize_target(&nested, PaneId(1), Axis::Columns, true),
+        Some(ResizeStep {
+            path: vec![0],
+            index: 0,
+            delta: 1
+        })
+    );
+    assert_eq!(
+        resize_target(&nested, PaneId(1), Axis::Rows, true),
+        Some(ResizeStep {
+            path: Vec::new(),
+            index: 0,
+            delta: 1
+        })
+    );
+    assert_eq!(
+        resize_target(&nested, PaneId(3), Axis::Rows, false),
+        Some(ResizeStep {
+            path: Vec::new(),
+            index: 0,
+            delta: -1
+        })
+    );
+
+    let mut zoomed = make_tab(split(Axis::Columns, vec![leaf(1), leaf(2)]));
+    zoomed.zoomed = Some(PaneId(1));
+    assert_eq!(
+        resize_target(&zoomed, PaneId(1), Axis::Columns, true),
+        None,
+        "a zoomed tab has no visible boundaries"
     );
 }

@@ -113,6 +113,16 @@ impl Screen<'_> {
     fn press(&mut self, mouse: MouseEvent) -> Result<()> {
         let (x, y) = (mouse.column, mouse.row);
         let rects = self.rects();
+        let area = self.area();
+        let sidebar = super::super::sidebar::width(area);
+        if x >= area.x && x < area.x.saturating_add(sidebar) {
+            self.sidebar_click(x, y);
+            return Ok(());
+        }
+        if self.ui.sidebar.open {
+            // A click outside the panel takes keyboard focus back.
+            self.close_sidebar();
+        }
         if in_rect(rects.tab_bar, x, y) {
             let space = self.workspace.active_space();
             if let Some(tab) = geometry::tab_at(space, rects.tab_bar, x, y)
@@ -202,9 +212,12 @@ impl Screen<'_> {
         if let Some(link) = self.links.get_mut(&press.pane) {
             link.vt.extend_selection(x, y);
         }
+        // COPY and resize are mutually exclusive: a mouse selection ends
+        // resize first, so the strip always names the mode that consumes the
+        // next key.
+        self.clear_modes();
         self.selection_drag = Some(press.pane);
         self.ui.selecting = Some(press.pane);
-        self.ui.message = Some("selection: drag · y copy · Esc cancel".into());
         self.dirty = true;
         Ok(())
     }

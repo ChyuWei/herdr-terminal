@@ -27,6 +27,7 @@ impl Screen<'_> {
             self.close_files();
             return;
         }
+        self.clear_modes();
         self.ui.help = false;
         self.ui.prompt = None;
         self.ui.palette = None;

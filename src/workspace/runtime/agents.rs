@@ -370,17 +370,40 @@ impl Screen<'_> {
 
     // --- sidebar ----------------------------------------------------------
 
+    /// `prefix a`: give the persistent sidebar keyboard focus, or take it
+    /// away. The panel itself stays visible on a wide terminal either way.
     pub(super) fn toggle_sidebar(&mut self) {
-        let sidebar = &mut self.ui.sidebar;
-        sidebar.open = !sidebar.open;
-        if sidebar.open {
-            sidebar.selected = self
-                .workspace
-                .focused_pane()
-                .filter(|pane| self.agents.rows.iter().any(|row| row.pane == *pane))
-                .or_else(|| self.agents.rows.first().map(|row| row.pane));
-            sidebar.offset = 0;
+        if super::super::sidebar::width(self.area()) == 0 {
+            self.ui.message = Some("the sidebar needs a terminal at least 70 columns wide".into());
+            self.dirty = true;
+            return;
         }
+        if self.ui.sidebar.open {
+            self.close_sidebar();
+            return;
+        }
+        self.clear_modes();
+        let focused = self
+            .workspace
+            .focused_pane()
+            .filter(|pane| self.agents.rows.iter().any(|row| row.pane == *pane));
+        let selected = focused
+            .map(super::super::sidebar::Item::Agent)
+            .or_else(|| {
+                self.agents
+                    .rows
+                    .first()
+                    .map(|row| super::super::sidebar::Item::Agent(row.pane))
+            })
+            .or_else(|| {
+                Some(super::super::sidebar::Item::Space(
+                    self.workspace.active_space_id(),
+                ))
+            });
+        self.ui.sidebar.selected = selected;
+        self.ui.sidebar.offset = 0;
+        self.ui.sidebar.open = true;
+        self.keep_sidebar_visible();
         self.dirty = true;
     }
 
@@ -392,8 +415,8 @@ impl Screen<'_> {
     }
 
     pub(super) fn sidebar_move(&mut self, delta: isize) {
-        let len = self.agents.rows.len();
-        if len == 0 {
+        let items = super::super::sidebar::items(&self.workspace, &self.agents.rows);
+        if items.is_empty() {
             self.ui.sidebar.selected = None;
             return;
         }
@@ -401,67 +424,115 @@ impl Screen<'_> {
             .ui
             .sidebar
             .selected
-            .and_then(|pane| self.agents.rows.iter().position(|row| row.pane == pane));
+            .and_then(|item| items.iter().position(|candidate| *candidate == item));
         let index = match (current, delta.signum()) {
-            (Some(index), 1) => (index + 1).min(len - 1),
+            (Some(index), 1) => (index + 1).min(items.len() - 1),
             (Some(index), -1) => index.saturating_sub(1),
             (None, 1) => 0,
-            (None, _) => len - 1,
+            (None, _) => items.len() - 1,
             _ => current.unwrap_or(0),
         };
-        self.select_row(index);
+        self.select_sidebar_item(index);
     }
 
     pub(super) fn sidebar_edge(&mut self, last: bool) {
-        if self.agents.rows.is_empty() {
+        let items = super::super::sidebar::items(&self.workspace, &self.agents.rows);
+        if items.is_empty() {
             self.ui.sidebar.selected = None;
             return;
         }
-        self.select_row(if last { self.agents.rows.len() - 1 } else { 0 });
+        self.select_sidebar_item(if last { items.len() - 1 } else { 0 });
     }
 
-    fn select_row(&mut self, index: usize) {
-        let rows = &self.agents.rows;
-        self.ui.sidebar.selected = rows.get(index).map(|row| row.pane);
-        let height = super::ui::sidebar_inner_height(self.area());
-        self.ui.sidebar.offset =
-            agents::scroll_to(self.ui.sidebar.offset, Some(index), height, rows.len());
+    fn select_sidebar_item(&mut self, index: usize) {
+        let items = super::super::sidebar::items(&self.workspace, &self.agents.rows);
+        self.ui.sidebar.selected = items.get(index).copied();
+        self.keep_sidebar_visible();
         self.dirty = true;
     }
 
-    /// Keeps the selection by pane id across rows reordering, replacing a gone
-    /// pane with the row that took its index (or the last row).
-    fn keep_sidebar_selection(&mut self, rows: &[AgentRow]) {
-        if !self.ui.sidebar.open {
-            return;
-        }
-        let previous = self.ui.sidebar.selected;
-        let previous_index = self
-            .agents
-            .rows
-            .iter()
-            .position(|row| Some(row.pane) == previous);
-        self.ui.sidebar.selected = agents::selection_after(rows, previous, previous_index);
-        let index = self
-            .ui
-            .sidebar
-            .selected
-            .and_then(|pane| rows.iter().position(|row| row.pane == pane));
-        let height = super::ui::sidebar_inner_height(self.area());
-        self.ui.sidebar.offset =
-            agents::scroll_to(self.ui.sidebar.offset, index, height, rows.len());
+    fn keep_sidebar_visible(&mut self) {
+        let height = super::super::sidebar::height(self.area());
+        let total = super::super::sidebar::line_count(&self.workspace, &self.agents.rows);
+        let line = self.ui.sidebar.selected.and_then(|item| {
+            super::super::sidebar::line_index(&self.workspace, &self.agents.rows, item)
+        });
+        self.ui.sidebar.offset = agents::scroll_to(self.ui.sidebar.offset, line, height, total);
     }
 
-    /// The row an action applies to: the sidebar selection while it is open,
-    /// otherwise the focused pane when it is an agent.
+    /// Keeps the selection by item across rows reordering. A gone agent falls
+    /// back to the row that took its index, then to the active space.
+    fn keep_sidebar_selection(&mut self, rows: &[AgentRow]) {
+        if self.ui.sidebar.selected.is_none() {
+            return;
+        }
+        match self.ui.sidebar.selected {
+            Some(super::super::sidebar::Item::Agent(pane)) => {
+                let previous_index = self.agents.rows.iter().position(|row| row.pane == pane);
+                let kept = agents::selection_after(rows, Some(pane), previous_index);
+                self.ui.sidebar.selected =
+                    kept.map(super::super::sidebar::Item::Agent).or_else(|| {
+                        Some(super::super::sidebar::Item::Space(
+                            self.workspace.active_space_id(),
+                        ))
+                    });
+            }
+            Some(super::super::sidebar::Item::Space(id)) if self.workspace.space(id).is_some() => {}
+            _ => {
+                self.ui.sidebar.selected = Some(super::super::sidebar::Item::Space(
+                    self.workspace.active_space_id(),
+                ));
+            }
+        }
+        self.keep_sidebar_visible();
+    }
+
+    /// A click in the sidebar: a space row switches to that space (keeping
+    /// its own active tab) and an agent row jumps to the pane, returning
+    /// keyboard focus to it. Empty panel cells are consumed without action.
+    pub(super) fn sidebar_click(&mut self, x: u16, y: u16) -> bool {
+        if super::super::sidebar::width(self.area()) == 0 {
+            return false;
+        }
+        let layout = super::super::sidebar::layout(
+            &self.workspace,
+            &self.agents.rows,
+            self.area(),
+            self.ui.sidebar.offset,
+        );
+        let Some(item) = super::super::sidebar::item_at(&layout, x, y) else {
+            return false;
+        };
+        self.clear_modes();
+        self.ui.sidebar.selected = Some(item);
+        self.keep_sidebar_visible();
+        match item {
+            super::super::sidebar::Item::Space(id) => {
+                if self.workspace.select_space_id(id) {
+                    self.dirty = true;
+                }
+            }
+            super::super::sidebar::Item::Agent(pane) => {
+                self.jump_to_agent(pane);
+                self.ui.sidebar.open = false;
+                self.dirty = true;
+            }
+        }
+        true
+    }
+
+    /// The agent row an action applies to: the sidebar selection while it is
+    /// focused, otherwise the focused pane when it is an agent.
     fn action_row(&self) -> Option<AgentRow> {
         if self.ui.sidebar.open {
-            let selected = self.ui.sidebar.selected?;
+            let super::super::sidebar::Item::Agent(pane) = self.ui.sidebar.selected? else {
+                return None;
+            };
             return self
                 .agents
                 .rows
                 .iter()
-                .find(|row| row.pane == selected)
+                .find(|row| row.pane == pane)
                 .cloned();
         }
         let focused = self.workspace.focused_pane()?;
@@ -472,16 +543,27 @@ impl Screen<'_> {
             .cloned()
     }
 
-    /// Enter in the sidebar: jump to the selected agent and close the sidebar.
+    /// Enter in the sidebar: switch to a space or jump to an agent. A jump
+    /// returns keyboard focus to the pane.
     pub(super) fn sidebar_enter(&mut self) -> Result<()> {
-        let Some(row) = self.action_row() else {
-            self.ui.message = Some("no agent selected".into());
-            self.dirty = true;
-            return Ok(());
-        };
-        self.jump_to_agent(row.pane);
-        self.ui.sidebar.open = false;
-        Ok(())
+        match self.ui.sidebar.selected {
+            Some(super::super::sidebar::Item::Space(id)) => {
+                if self.workspace.select_space_id(id) {
+                    self.dirty = true;
+                }
+                Ok(())
+            }
+            Some(super::super::sidebar::Item::Agent(pane)) => {
+                self.jump_to_agent(pane);
+                self.ui.sidebar.open = false;
+                Ok(())
+            }
+            None => {
+                self.ui.message = Some("nothing selected in the sidebar".into());
+                self.dirty = true;
+                Ok(())
+            }
+        }
     }
 
     /// Sidebar `i`: peek the selected agent, keeping the sidebar underneath.
@@ -534,7 +616,7 @@ impl Screen<'_> {
 
     fn jump_to_agent(&mut self, pane: PaneId) {
         if self.workspace.jump_to(pane) {
-            self.ui.sidebar.selected = Some(pane);
+            self.ui.sidebar.selected = Some(super::super::sidebar::Item::Agent(pane));
             self.dirty = true;
         }
     }

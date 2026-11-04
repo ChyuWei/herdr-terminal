@@ -1144,6 +1144,16 @@ impl Workspace {
         self.step_space(-1)
     }
 
+    /// Selects a space by id (a sidebar click or Enter). The space keeps its
+    /// own active tab.
+    pub fn select_space_id(&mut self, id: SpaceId) -> bool {
+        if self.active == id || !self.spaces.iter().any(|space| space.id == id) {
+            return false;
+        }
+        self.active = id;
+        true
+    }
+
     fn step_space(&mut self, step: isize) -> bool {
         let Some(index) = self.spaces.iter().position(|space| space.id == self.active) else {
             return false;

@@ -43,6 +43,7 @@ impl Screen<'_> {
             self.close_manager();
             return;
         }
+        self.clear_modes();
         let focused = self
             .workspace
             .focused_pane()
@@ -346,6 +347,7 @@ impl Screen<'_> {
     /// local VT. The manager stays underneath; any key closes the preview and
     /// returns to it. No pane, document or workspace change is made.
     pub(super) fn open_preview(&mut self, address: &str) -> Result<()> {
+        self.clear_modes();
         let Some(record) = self.model.terminal(address).cloned() else {
             self.ui.message = Some(format!("terminal {address} is no longer in core"));
             self.dirty = true;

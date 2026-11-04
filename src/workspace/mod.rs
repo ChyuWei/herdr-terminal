@@ -26,6 +26,7 @@ pub mod manager;
 pub mod model;
 pub mod palette;
 mod runtime;
+pub mod sidebar;
 mod startup;
 pub mod state;
 mod sync;

@@ -666,11 +666,14 @@ fn ht_reattaches_to_the_terminal_a_previous_client_left() {
     let Some(mut session) = session() else { return };
     session.start();
 
+    // A normal grid keeps the shell prompt on one line: at 40x10 the host
+    // name and cwd wrap the prompt, so the redraw after Core's detach/reattach
+    // resize can scroll the marker out of the ten-row screen on longer hosts.
     let mut first = ScreenRun::spawn(
         &session,
-        &["screen", "--cols", "40", "--rows", "10"],
-        40,
-        10,
+        &["screen", "--cols", "80", "--rows", "24"],
+        80,
+        24,
     );
     let address = wait_only_labelled(&session, secs(10));
     // The marker cannot appear in the typed line's echo: only a running shell
@@ -695,9 +698,9 @@ fn ht_reattaches_to_the_terminal_a_previous_client_left() {
     // The second client must adopt the same terminal, not start a duplicate.
     let mut second = ScreenRun::spawn(
         &session,
-        &["screen", "--cols", "40", "--rows", "10"],
-        40,
-        10,
+        &["screen", "--cols", "80", "--rows", "24"],
+        80,
+        24,
     );
     assert!(
         second.wait_text("FIRST-DONE", secs(10)),
