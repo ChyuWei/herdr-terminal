@@ -495,7 +495,7 @@ fn keep_close_leaves_the_program_and_kill_ends_it() {
 }
 
 #[test]
-fn an_exiting_program_keeps_its_final_screen_and_status() {
+fn an_exiting_program_closes_its_pane_and_starts_a_replacement_shell() {
     let Some(mut session) = session() else { return };
     session.start();
     let mut run = Run::spawn_with(
@@ -505,40 +505,33 @@ fn an_exiting_program_keeps_its_final_screen_and_status() {
         &["--", "sh", "-c", "printf 'FINAL-%s\\n' OK; exit 7"],
     );
 
-    // Whether the exit beat the first attach or not, the pane must show the
-    // program's last output and the record's exact status.
+    // The exit status is reported, the finished record is removed, and one
+    // fresh shell takes the empty tab instead of a frozen final screen.
     assert!(
-        run.wait_text("FINAL-OK", secs(10)),
-        "the final screen was lost; screen={:?} stderr={:?}",
+        run.wait_text("exited (7)", secs(10)),
+        "the exit status was not shown; screen={:?} stderr={:?}",
         run.rendered(),
         run.errors()
     );
     assert!(
-        run.wait_text("exited (7)", secs(5)),
-        "the exit status was not shown; screen={:?}",
-        run.rendered()
-    );
-    let known = all_addresses(&session);
-    assert_eq!(known.len(), 1, "the finished record must stay for the pane");
-    let record = record(&session, &known[0]);
-    assert_eq!(record["state"].as_str(), Some("finished"));
-    assert_eq!(record["exit_code"].as_i64(), Some(7));
-    assert!(
-        !run.rendered().contains("no terminals in this tab"),
-        "the finished pane must stay visible; screen={:?}",
-        run.rendered()
-    );
-
-    // x closes the finished pane and only then removes its record.
-    run.command(b'x');
-    assert!(
-        wait_until(secs(10), || all_addresses(&session).is_empty()),
-        "closing the finished pane did not remove its record: {:?}",
+        wait_until(secs(10), || {
+            let known = all_addresses(&session);
+            known.len() == 1 && live(&session, &known[0])
+        }),
+        "expected one live replacement, found {:?}",
         all_addresses(&session)
     );
     assert!(
-        run.wait_text("no terminals in this tab", secs(5)),
-        "the empty state did not follow the close; screen={:?}",
+        !run.rendered().contains("no terminals in this tab"),
+        "the tab must not be left empty; screen={:?}",
+        run.rendered()
+    );
+
+    // The replacement is a working shell, not the exited program's screen.
+    run.send(b"printf 'REPLACED-%s\\n' OK\r");
+    assert!(
+        run.wait_text("REPLACED-OK", secs(10)),
+        "the replacement shell did not accept input; screen={:?}",
         run.rendered()
     );
 
@@ -546,6 +539,7 @@ fn an_exiting_program_keeps_its_final_screen_and_status() {
     let status = run.wait_exit(secs(5)).expect("detach");
     assert_eq!(status.code(), Some(0), "stderr={:?}", run.errors());
     assert!(run.pty.is_cooked());
+    cleanup_all(&session);
 }
 
 fn live(session: &Session, address: &str) -> bool {

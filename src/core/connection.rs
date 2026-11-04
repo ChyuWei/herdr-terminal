@@ -92,6 +92,10 @@ pub struct RunOptions {
     /// it will attach with. Older cores ignore the field; a core that applies
     /// it starts the program at this size before the first attach.
     pub size: Option<(u16, u16)>,
+    /// The directory the program starts in. `None` leaves the choice to core
+    /// (the daemon's directory locally, the machine's home for a remote
+    /// start). A local path is never sent with `on`.
+    pub cwd: Option<String>,
     /// Start the program on another machine this core added. The terminal's
     /// address is then `machine/t7`; core relays attach, input and resize.
     pub on: Option<String>,
@@ -108,6 +112,7 @@ impl Default for RunOptions {
             keep: false,
             no_parent: true,
             size: None,
+            cwd: None,
             on: None,
         }
     }
@@ -129,9 +134,10 @@ pub fn client_labels() -> BTreeMap<String, String> {
 
 /// The `terminal.run` params. `size` is included only when the caller knows
 /// the grid the terminal will attach at; cores that predate the field ignore
-/// it, and a core that applies it starts the program at that size. `on` is
-/// included only when the terminal runs on another machine; every local start
-/// keeps exactly the params it sent before.
+/// it, and a core that applies it starts the program at that size. `cwd` is
+/// included only when the caller chose a directory. `on` is included only
+/// when the terminal runs on another machine; every local start keeps exactly
+/// the params it sent before, plus its optional `cwd`.
 fn run_params(options: &RunOptions) -> Value {
     let mut params = json!({
         "argv": &options.argv,
@@ -146,6 +152,9 @@ fn run_params(options: &RunOptions) -> Value {
     }
     if let Some((cols, rows)) = options.size {
         params["size"] = json!({"cols": cols, "rows": rows});
+    }
+    if let Some(cwd) = &options.cwd {
+        params["cwd"] = json!(cwd);
     }
     if let Some(machine) = &options.on {
         params["on"] = json!(machine);
@@ -1009,6 +1018,18 @@ mod tests {
             json!(options.labels),
             "labels are unchanged by a machine start"
         );
+    }
+
+    #[test]
+    fn run_params_carry_a_start_directory_only_when_one_is_chosen() {
+        let mut options = RunOptions::default();
+        let without = run_params(&options);
+        assert!(
+            without.get("cwd").is_none(),
+            "an unchosen directory must not grow a cwd field: {without}"
+        );
+        options.cwd = Some("/work/tree".into());
+        assert_eq!(run_params(&options)["cwd"], json!("/work/tree"));
     }
 
     #[test]

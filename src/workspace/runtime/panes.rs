@@ -112,7 +112,43 @@ impl Screen<'_> {
                             ));
                             self.dirty = true;
                         }
-                        Some("finished") => self.recover_finished_pane(pane, &address, None),
+                        Some("finished") => {
+                            // A terminal this screen started is a local exit:
+                            // close its pane. An adopted or restored record
+                            // that was already finished keeps its final view.
+                            let owned = self
+                                .links
+                                .get(&pane)
+                                .is_some_and(|link| link.session.owned());
+                            if owned {
+                                // The exact status and cwd come from the
+                                // record; the final screen is not read. A
+                                // record fetched here also reaches the
+                                // replacement, which starts in its cwd.
+                                let code = match self
+                                    .model
+                                    .terminal(&address)
+                                    .map(session::record_exit_code)
+                                {
+                                    Some(code) => Some(code),
+                                    None => match self.client.get(&address) {
+                                        Ok(record) => {
+                                            let code = session::record_exit_code(&record);
+                                            self.model.upsert(record);
+                                            Some(code)
+                                        }
+                                        Err(error) if session::is_lost(&error) => {
+                                            self.begin_reconnect();
+                                            return Ok(());
+                                        }
+                                        Err(_) => None,
+                                    },
+                                };
+                                self.close_finished_pane(pane, &address, code.unwrap_or(1));
+                            } else {
+                                self.recover_finished_pane(pane, &address, None);
+                            }
+                        }
                         Some("not_found") => self.remove_gone(pane, &address),
                         _ => self.forget_pane(
                             pane,

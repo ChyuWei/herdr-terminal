@@ -49,6 +49,33 @@ pub struct Options {
     pub verbose: bool,
 }
 
+/// The start directory a new local terminal gets, from the process's own
+/// inputs. The decision itself is the pure [`model::start_cwd`]; a remote
+/// start (`remote`) sends no directory at all.
+pub(super) fn local_start_cwd(pane_cwd: Option<&str>, remote: bool) -> Option<String> {
+    let client_cwd = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty());
+    model::start_cwd(remote, pane_cwd, client_cwd.as_deref(), home.as_deref())
+}
+
+/// The focused pane's recorded cwd, when core reported one and the pane is
+/// local. A qualified (`machine/t7`) address holds a path on that machine and
+/// must never reach a local start.
+pub(crate) fn focused_pane_cwd(
+    workspace: &model::Workspace,
+    model: &crate::model::Model,
+) -> Option<String> {
+    let pane = workspace.focused_pane()?;
+    let address = workspace.pane(pane)?.address.clone();
+    if machines::machine(&address).is_some() {
+        return None;
+    }
+    model.terminal(&address).map(|record| record.cwd.clone())
+}
+
 /// Opens the workspace and runs it until detach. Returns 0 when the person
 /// detaches; programs keep running and the document stays.
 pub fn run(options: Options) -> Result<i32> {
