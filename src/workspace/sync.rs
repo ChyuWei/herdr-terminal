@@ -1,6 +1,11 @@
 //! State for the shared-document CAS loop. Pure: the runtime performs the
 //! `doc.get`/`doc.set` calls and this type remembers what it last read or
 //! wrote, what still needs writing, and when to retry.
+//!
+//! The retry deadline throttles repeated stale refetches; it is not a
+//! background fetch. A single failed `doc.get` can still hold the UI for up to
+//! `DOC_TIMEOUT` because the call is synchronous, and moving fetches off the
+//! UI thread is later work.
 
 use super::model::SharedDoc;
 use crate::core::Error;
@@ -74,6 +79,20 @@ impl DocState {
     pub fn due(&self, now: Instant) -> bool {
         self.retry_at.is_none_or(|at| at <= now)
     }
+
+    /// Whether a stale document should be fetched now. A failed fetch's
+    /// deadline throttles repeated stale refetches; doc events keep `stale`
+    /// set but do not clear the deadline.
+    pub fn refresh_due(&self, now: Instant) -> bool {
+        self.stale && self.due(now)
+    }
+
+    /// A `doc.get` succeeded, so any earlier retry deadline is satisfied. The
+    /// caller clears this before a possible write, so a fresh write failure's
+    /// deadline is not overwritten.
+    pub fn fetched(&mut self) {
+        self.retry_at = None;
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +136,43 @@ mod tests {
         state.retry_later(now);
         assert!(!state.due(now));
         assert!(state.due(now + DOC_RETRY));
+    }
+
+    #[test]
+    fn a_stale_document_refreshes_only_after_its_deadline() {
+        let now = Instant::now();
+        let mut state = DocState::new(doc("a"), 1);
+        assert!(!state.refresh_due(now), "nothing to fetch");
+        state.note_event(2);
+        assert!(state.refresh_due(now), "a stale document fetches");
+        state.retry_later(now);
+        assert!(!state.refresh_due(now), "the failed fetch cools down");
+        assert!(state.refresh_due(now + DOC_RETRY));
+    }
+
+    #[test]
+    fn a_successful_fetch_clears_the_retry_deadline() {
+        let now = Instant::now();
+        let mut state = DocState::new(doc("a"), 1);
+        state.note_event(2);
+        state.retry_later(now);
+        assert!(!state.refresh_due(now));
+        state.fetched();
+        assert!(state.retry_at.is_none());
+        assert!(state.refresh_due(now), "the next loop may fetch at once");
+    }
+
+    #[test]
+    fn a_newer_doc_event_does_not_clear_the_retry_deadline() {
+        let now = Instant::now();
+        let mut state = DocState::new(doc("a"), 1);
+        state.retry_later(now);
+        state.note_event(2);
+        assert!(state.stale, "the event still marks the document stale");
+        assert!(
+            !state.refresh_due(now),
+            "but it must not bypass the cooldown"
+        );
+        assert!(state.refresh_due(now + DOC_RETRY));
     }
 }

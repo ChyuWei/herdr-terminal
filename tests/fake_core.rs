@@ -148,6 +148,10 @@ fn run_tests() {
     #[cfg(unix)]
     workspace_refetches_the_document_after_missed();
     #[cfg(unix)]
+    workspace_throttles_a_failing_document_refresh();
+    #[cfg(unix)]
+    workspace_doc_event_does_not_bypass_a_failed_refresh_cooldown();
+    #[cfg(unix)]
     workspace_recreates_a_deleted_document();
     #[cfg(unix)]
     workspace_merges_a_concurrent_change_in_another_space();
@@ -3505,6 +3509,139 @@ fn workspace_refetches_the_document_after_missed() {
             .iter()
             .any(|entry| entry["call"] == "terminal.run"),
         "a resnapshot must not start a terminal"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// How many `doc.get` calls the client made. A failed call logs both its
+/// dispatch record (with `params`) and an error record, so count dispatches.
+#[cfg(unix)]
+fn doc_get_count(scratch: &Scratch) -> usize {
+    scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["call"] == "doc.get" && entry.get("params").is_some())
+        .count()
+}
+
+#[cfg(unix)]
+fn a_doc_get_failed(scratch: &Scratch) -> bool {
+    scratch
+        .entries()
+        .iter()
+        .any(|entry| entry["call"] == "doc.get" && entry["error"] == "io")
+}
+
+/// A failed document fetch sets a retry deadline; the real loop must not call
+/// `doc.get` again on every iteration, only after that deadline.
+#[cfg(unix)]
+fn workspace_throttles_a_failing_document_refresh() {
+    let scratch = Scratch::new("doc-get-fail");
+    scratch.seed_doc(doc_one_pane(), 2);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-get-fail");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    // A key drives the scripted doc event, whose refetch then fails.
+    workspace.type_text("x");
+    assert!(
+        common::wait_until(secs(5), || a_doc_get_failed(&scratch)),
+        "the refresh never failed: {:?}",
+        scratch.entries()
+    );
+    let before = doc_get_count(&scratch);
+    // Well under DOC_RETRY: a loop that ignores the deadline would add many
+    // calls here.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        doc_get_count(&scratch),
+        before,
+        "a failed fetch must not retry on every loop iteration: {:?}",
+        scratch.entries()
+    );
+
+    assert!(
+        common::wait_until(secs(4), || doc_get_count(&scratch) > before),
+        "the retry deadline never elapsed: {:?}",
+        scratch.entries()
+    );
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let after = doc_get_count(&scratch);
+    assert!(
+        after <= before + 1,
+        "at most one retry per deadline, not one per loop: before={} after={} entries={:?}",
+        before,
+        after,
+        scratch.entries()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A doc event delivered while a failed fetch cools down sets `stale` but must
+/// not clear the deadline, so it causes no immediate extra `doc.get`.
+#[cfg(unix)]
+fn workspace_doc_event_does_not_bypass_a_failed_refresh_cooldown() {
+    let scratch = Scratch::new("doc-get-fail-event");
+    scratch.seed_doc(doc_one_pane(), 2);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-get-fail-event");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    // The first key delivers the doc event whose refetch fails.
+    workspace.type_text("x");
+    assert!(
+        common::wait_until(secs(5), || a_doc_get_failed(&scratch)),
+        "the refresh never failed: {:?}",
+        scratch.entries()
+    );
+    let before = doc_get_count(&scratch);
+
+    // A second key makes the scripted core deliver another doc event now,
+    // while the failed fetch's deadline is still in the future.
+    workspace.type_text("y");
+    assert!(
+        common::wait_until(secs(5), || {
+            scratch
+                .entries()
+                .iter()
+                .any(|entry| entry["event"] == "doc-during-cooldown")
+        }),
+        "the core did not deliver the cooldown event: {:?}",
+        scratch.entries()
+    );
+    let at_event = doc_get_count(&scratch);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        doc_get_count(&scratch),
+        at_event,
+        "a doc event must not bypass the failed fetch's deadline: {:?}",
+        scratch.entries()
+    );
+    assert!(
+        at_event <= before + 1,
+        "no fetch may happen around the event before the deadline"
     );
 
     workspace.send(&[0x1d]);
@@ -7357,6 +7494,12 @@ fn fake_connect() -> io::Result<()> {
     // Whole (unbounded) reads drive the truncation modes below; paged reads
     // stay complete because the viewer asks by offset and limit.
     let mut whole_reads = 0u32;
+    // `doc-get-fail` / `doc-get-fail-event`: the startup read succeeds, then
+    // an attach-time doc event makes every refresh fail with a non-lost error.
+    // The second scenario sends another doc event on the first key, during the
+    // retry cooldown.
+    let mut doc_get_failing = false;
+    let mut doc_event_during_cooldown_sent = false;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         let mut frame = json!({"channel": channel, "kind": kind, "len": payload.len()});
@@ -7472,6 +7615,22 @@ fn fake_connect() -> io::Result<()> {
                     }
                 }),
             );
+            if scenario == "doc-get-fail-event"
+                && doc_get_failing
+                && !doc_event_during_cooldown_sent
+            {
+                // A doc event while a failed refresh is cooling down: it must
+                // not make the client fetch again before the deadline.
+                doc_event_during_cooldown_sent = true;
+                let (stored, _) = read_doc(doc_path);
+                let version = replace_doc(doc_path, stored);
+                notify(&mut output, doc_event_message(version))?;
+                log(
+                    log_path,
+                    json!({"event": "doc-during-cooldown", "version": version}),
+                );
+                continue;
+            }
             if scenario.starts_with("agents") {
                 agent_step += 1;
                 agent_key_script(&scenario, agent_step, &mut output, &mut event_seq)?;
@@ -7654,6 +7813,14 @@ fn fake_connect() -> io::Result<()> {
                     "doc-reconnect" => {
                         replace_doc(doc_path, doc_same_tab());
                         return Ok(());
+                    }
+                    // The document refresh fails from here on: the first
+                    // failed fetch starts the retry deadline.
+                    "doc-get-fail" | "doc-get-fail-event" => {
+                        let (stored, _) = read_doc(doc_path);
+                        let version = replace_doc(doc_path, stored);
+                        doc_get_failing = true;
+                        notify(&mut output, doc_event_message(version))?;
                     }
                     // Another screen deleted the document. Core keeps the
                     // version, so it is recreated at that version.
@@ -8305,7 +8472,8 @@ fn fake_connect() -> io::Result<()> {
                             write_frame(&mut output, channel, DATA, text)?;
                         }
                         "doc-mismatch" | "doc-missing" | "doc-foreign" | "doc-fresh"
-                        | "doc-deleted" | "doc-orphan-invalid" => {
+                        | "doc-deleted" | "doc-orphan-invalid" | "doc-get-fail"
+                        | "doc-get-fail-event" => {
                             write_frame(&mut output, channel, DATA, b"PANE-ONE\n")?;
                         }
                         "manager" | "manager-events" => {
@@ -8654,6 +8822,17 @@ fn fake_connect() -> io::Result<()> {
             // Documents live in one file next to the log so every connection
             // and every screen sees the same store, like core's state file.
             "doc.get" => {
+                if doc_get_failing {
+                    log(log_path, json!({"call": "doc.get", "error": "io"}));
+                    reply_error(
+                        &mut output,
+                        &id,
+                        "io",
+                        "the document store is busy",
+                        "retry later",
+                    )?;
+                    continue;
+                }
                 let (value, version) = read_doc(doc_path);
                 reply(
                     &mut output,
@@ -8914,6 +9093,8 @@ fn doc_scenario(scenario: &str) -> bool {
             | "doc-orphan"
             | "doc-orphan-invalid"
             | "doc-program"
+            | "doc-get-fail"
+            | "doc-get-fail-event"
     )
 }
 
@@ -8999,7 +9180,7 @@ fn snapshot_for(
         }
         "doc-mismatch" | "doc-missing" | "doc-event" | "doc-conflict-merge"
         | "doc-conflict-tab" | "doc-reconnect" | "doc-missed" | "doc-deleted"
-        | "doc-stale-snapshot" | "doc-conflict-flush" => {
+        | "doc-stale-snapshot" | "doc-conflict-flush" | "doc-get-fail" | "doc-get-fail-event" => {
             vec![doc_record_for(scenario, "t1")]
         }
         "doc-deleted-claim-lost" => Vec::new(),

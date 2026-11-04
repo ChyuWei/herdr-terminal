@@ -1,6 +1,10 @@
 //! Shared-document synchronization and applying a document to the live
 //! workspace. The pure decisions live in `model::doc`; this file performs the
 //! bounded `doc.get`/`doc.set` calls, CAS merge and pane reconciliation.
+//!
+//! The stale-refresh deadline throttles refetches after a failure. It is not
+//! background work: one failed `doc.get` still blocks the UI for up to
+//! `DOC_TIMEOUT`, and moving the call off the UI thread is later work.
 
 use super::Screen;
 use crate::core::{Result, Terminal};
@@ -25,7 +29,12 @@ impl Screen<'_> {
         }
         let now = Instant::now();
         if self.doc.stale {
-            self.fetch_document()?;
+            // A failed fetch sets a deadline; do not hammer core every loop
+            // iteration while it is in effect. Dirty writes wait too: the base
+            // is stale until the refetch succeeds.
+            if self.doc.refresh_due(now) {
+                self.fetch_document()?;
+            }
         } else if self.doc.dirty && self.doc.due(now) {
             self.write_document(MAX_WRITE_ROUNDS)?;
         }
@@ -63,6 +72,10 @@ impl Screen<'_> {
                 return Ok(());
             }
         };
+        // The read succeeded, so an earlier failed-fetch deadline is over.
+        // Clear it before any write below: a write failure sets its own fresh
+        // deadline that must not be overwritten by this success.
+        self.doc.fetched();
         if get.value.is_null() {
             // The document was deleted while this screen was away. Core keeps
             // the version of a deleted document, so recreate it at that
