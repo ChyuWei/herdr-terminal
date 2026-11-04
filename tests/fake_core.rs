@@ -54,9 +54,25 @@ fn run_tests() {
     #[cfg(unix)]
     screen_draws_the_final_frame_when_data_and_close_arrive_together();
     #[cfg(unix)]
-    workspace_keeps_the_final_screen_and_status_when_the_program_exited_before_attach();
+    workspace_replaces_a_program_that_exited_before_attach();
     #[cfg(unix)]
-    workspace_draws_the_final_frame_and_status_when_data_and_close_arrive_together();
+    workspace_replaces_a_pane_whose_stream_ends_with_an_exit();
+    #[cfg(unix)]
+    workspace_closes_only_the_pane_whose_program_exited();
+    #[cfg(unix)]
+    workspace_an_exiting_agent_terminal_closes_its_pane();
+    #[cfg(unix)]
+    workspace_a_late_finish_does_not_close_the_replacement();
+    #[cfg(unix)]
+    workspace_a_remote_exit_is_replaced_on_its_machine();
+    #[cfg(unix)]
+    workspace_a_local_start_ignores_a_focused_remote_panes_cwd();
+    #[cfg(unix)]
+    workspace_a_background_exit_does_not_steal_the_active_tab();
+    #[cfg(unix)]
+    workspace_a_local_replacement_ignores_the_focused_panes_cwd();
+    #[cfg(unix)]
+    workspace_an_instantly_exiting_replacement_is_not_respawned();
     #[cfg(unix)]
     workspace_reclaims_a_start_whose_run_reply_was_lost();
     #[cfg(unix)]
@@ -127,6 +143,10 @@ fn run_tests() {
     workspace_sends_each_new_terminals_attach_size_to_run();
     #[cfg(unix)]
     workspace_an_explicit_program_gets_the_new_tab_attach_size();
+    #[cfg(unix)]
+    workspace_the_first_shell_starts_in_the_client_directory();
+    #[cfg(unix)]
+    workspace_a_new_tab_starts_in_the_focused_panes_directory();
     #[cfg(unix)]
     workspace_reclaims_a_deleted_document_at_its_version();
     #[cfg(unix)]
@@ -490,60 +510,61 @@ fn screen_draws_the_final_frame_when_data_and_close_arrive_together() {
     );
 }
 
-/// A program that exited before the workspace's first attach: the pane must
-/// show core's kept final screen and the finished record's exact status, stay
-/// on screen, and only remove the record when the person closes it.
+/// A program that exited before the workspace's first attach: its pane is
+/// closed, its record removed, and one fresh shell replaces it in the tab.
 #[cfg(unix)]
-fn workspace_keeps_the_final_screen_and_status_when_the_program_exited_before_attach() {
+fn workspace_replaces_a_program_that_exited_before_attach() {
     let scratch = Scratch::new("workspace-finished");
     let mut workspace = FakeScreen::spawn_workspace(&scratch, "finished");
 
     assert!(
-        workspace.wait_text("FAST", secs(10)),
-        "the recovered final screen was not drawn; raw={:?} stderr={:?}",
-        workspace.output.text(),
-        workspace.stderr.text()
-    );
-    assert!(
-        workspace.wait_text("exited (7)", secs(5)),
+        workspace.wait_text("exited (7)", secs(10)),
         "the finished record's status was not shown; screen={:?} raw={:?}",
         workspace.rendered(),
         workspace.output.text()
     );
     assert!(
+        workspace.wait_text("PAINT", secs(10)),
+        "the replacement shell did not paint; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+    assert!(
         !workspace.rendered().contains("no terminals in this tab"),
-        "the finished pane must stay visible; screen={:?}",
+        "the exit must not leave an empty tab; screen={:?}",
         workspace.rendered()
     );
 
     let log = scratch.entries();
-    assert!(
-        log.iter().any(|entry| entry["call"] == "terminal.get"),
-        "the finished record must be read; log={log:?}"
+    let runs: Vec<&serde_json::Value> = log
+        .iter()
+        .filter(|entry| entry["call"] == "terminal.run")
+        .collect();
+    assert_eq!(
+        runs.len(),
+        2,
+        "one initial shell and exactly one replacement; log={log:?}"
+    );
+    assert_eq!(
+        runs[1]["params"]["argv"],
+        json!([]),
+        "the replacement must be a plain shell, not the finished program"
+    );
+    assert_eq!(
+        runs[1]["params"]["cwd"],
+        json!("/srv/work"),
+        "the cwd fetched by terminal.get must reach the replacement"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry["call"] == "terminal.rm" && entry["params"]["terminal"] == "t1")
+            .count(),
+        1,
+        "the finished record must be removed once; log={log:?}"
     );
     assert!(
-        log.iter().any(|entry| entry["call"] == "terminal.read"),
-        "the final screen must be read; log={log:?}"
-    );
-    assert!(
-        !log.iter().any(|entry| entry["call"] == "terminal.rm"),
-        "the record must not be removed before the screen has been shown; log={log:?}"
-    );
-
-    // x closes the finished view; only now is its record removed.
-    workspace.command(b'x');
-    assert!(
-        common::wait_until(secs(5), || scratch
-            .entries()
-            .iter()
-            .any(|entry| entry["call"] == "terminal.rm")),
-        "closing the finished pane must remove its record; log={:?}",
-        scratch.entries()
-    );
-    assert!(
-        workspace.wait_text("no terminals in this tab", secs(5)),
-        "the empty state did not follow the close; screen={:?}",
-        workspace.rendered()
+        !log.iter().any(|entry| entry["call"] == "terminal.read"),
+        "an exit must not need the final screen; log={log:?}"
     );
 
     workspace.send(&[0x1d]);
@@ -557,48 +578,43 @@ fn workspace_keeps_the_final_screen_and_status_when_the_program_exited_before_at
     assert!(workspace.pty.is_cooked(), "the terminal was not restored");
 }
 
-/// DATA and CLOSE in one attach burst: the workspace must draw the final text
-/// and the exact status before the record is removed.
+/// DATA and CLOSE in one attach burst: the exit closes the pane and one fresh
+/// shell replaces it; the end of the stream is still final.
 #[cfg(unix)]
-fn workspace_draws_the_final_frame_and_status_when_data_and_close_arrive_together() {
+fn workspace_replaces_a_pane_whose_stream_ends_with_an_exit() {
     let scratch = Scratch::new("workspace-final");
     let mut workspace = FakeScreen::spawn_workspace(&scratch, "workspace-final");
 
     assert!(
-        workspace.wait_text("READY", secs(10)),
-        "the final frame is missing READY; screen={:?} stderr={:?}",
+        workspace.wait_text("exited (7)", secs(10)),
+        "the close reason's status was not shown; screen={:?} stderr={:?}",
         workspace.rendered(),
         workspace.stderr.text()
     );
     assert!(
-        workspace.wait_text("END", secs(5)),
-        "the final frame is missing END; screen={:?}",
-        workspace.rendered()
-    );
-    assert!(
-        workspace.wait_text("exited (7)", secs(5)),
-        "the close reason's status was not shown; screen={:?}",
+        workspace.wait_text("PAINT", secs(10)),
+        "the replacement shell did not paint; screen={:?}",
         workspace.rendered()
     );
     assert!(
         !workspace.rendered().contains("no terminals in this tab"),
-        "the finished pane was removed before its final frame; screen={:?}",
+        "the exit must not leave an empty tab; screen={:?}",
         workspace.rendered()
     );
     let log = scratch.entries();
-    assert!(
-        !log.iter().any(|entry| entry["call"] == "terminal.rm"),
-        "the record must not be removed before the final frame is shown; log={log:?}"
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .count(),
+        2,
+        "one initial shell and exactly one replacement; log={log:?}"
     );
-
-    workspace.command(b'x');
-    assert!(
-        common::wait_until(secs(5), || scratch
-            .entries()
-            .iter()
-            .any(|entry| entry["call"] == "terminal.rm")),
-        "closing the finished pane must remove its record; log={:?}",
-        scratch.entries()
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry["call"] == "terminal.rm" && entry["params"]["terminal"] == "t1")
+            .count(),
+        1,
+        "the exited record must be removed once; log={log:?}"
     );
 
     workspace.send(&[0x1d]);
@@ -610,6 +626,494 @@ fn workspace_draws_the_final_frame_and_status_when_data_and_close_arrive_togethe
         workspace.stderr.text()
     );
     assert!(workspace.pty.is_cooked(), "the terminal was not restored");
+}
+
+/// One pane exiting among siblings closes only that pane: the others stay,
+/// nothing is started, and the document drops the exited address.
+#[cfg(unix)]
+fn workspace_closes_only_the_pane_whose_program_exited() {
+    let scratch = Scratch::new("exit-split");
+    scratch.seed_doc(doc_same_tab(), 2);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "exit-split");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)) && workspace.wait_text("PANE-TWO", secs(10)),
+        "both panes were not restored; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    // A key drives the scripted `finished` + stream close for t2.
+    workspace.type_text("x");
+    assert!(
+        common::wait_until(secs(10), || scratch.entries().iter().any(|entry| {
+            entry["call"] == "terminal.rm" && entry["params"]["terminal"] == "t2"
+        })),
+        "the exited pane's record was not removed; log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        common::wait_until(secs(10), || !workspace.rendered().contains("PANE-TWO")),
+        "the exited pane stayed on screen; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.wait_text("exited (5)", secs(5)),
+        "the exit status was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.rendered().contains("PANE-ONE"),
+        "the sibling pane must stay; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        !scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["call"] == "terminal.run"),
+        "a sibling exit must not start a terminal; log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        common::wait_until(secs(10), || {
+            doc_addresses(&scratch.doc_value()) == vec!["t1".to_owned()]
+        }),
+        "the document still names the exited pane: {:?}",
+        scratch.doc_value()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// An agent terminal is no exception: its exit closes the pane and the last
+/// pane is replaced by a shell.
+#[cfg(unix)]
+fn workspace_an_exiting_agent_terminal_closes_its_pane() {
+    let scratch = Scratch::new("agents-exit");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "agents-exit");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the agent pane was not drawn; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.send(b"x");
+    assert!(
+        common::wait_until(secs(10), || scratch.entries().iter().any(|entry| {
+            entry["call"] == "terminal.rm" && entry["params"]["terminal"] == "t1"
+        })),
+        "the agent's record was not removed; log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        workspace.wait_text("exited (0)", secs(5)),
+        "the agent's exit status was not shown; screen={:?}",
+        workspace.rendered()
+    );
+    assert!(
+        workspace.wait_text("PANE-TWO", secs(10)),
+        "the replacement shell did not paint; screen={:?}",
+        workspace.rendered()
+    );
+    assert_eq!(
+        scratch
+            .entries()
+            .iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .count(),
+        2,
+        "exactly one replacement shell; log={:?}",
+        scratch.entries()
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A late duplicate `finished` for a pane already removed must not close the
+/// replacement shell or start another one.
+#[cfg(unix)]
+fn workspace_a_late_finish_does_not_close_the_replacement() {
+    let scratch = Scratch::new("exit-dup");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "exit-dup");
+    assert!(
+        workspace.wait_text("PAINT", secs(10)),
+        "the replacement shell did not paint; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    workspace.type_text("x");
+    assert!(
+        common::wait_until(secs(10), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["event"] == "late-finish")),
+        "the duplicate finish was never delivered; log={:?}",
+        scratch.entries()
+    );
+    // Let the client apply the duplicate; no tight wall-clock bound.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        workspace.rendered().contains("PAINT"),
+        "the replacement pane was closed by a duplicate; screen={:?}",
+        workspace.rendered()
+    );
+    let log = scratch.entries();
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .count(),
+        2,
+        "a duplicate finish must not start another shell; log={log:?}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry["call"] == "terminal.rm")
+            .count(),
+        1,
+        "only the exited record is removed; log={log:?}"
+    );
+
+    // A positive marker: the replacement still takes input after the
+    // duplicate, so a wrongly closed pane cannot pass as quiet.
+    workspace.type_text("z");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t2" && text == "z")
+        }),
+        "the replacement stopped taking input: {:?}",
+        program_input(&scratch)
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A remote pane whose program exits is replaced on the same machine: the
+/// replacement `terminal.run` carries `on` and the remote cwd, and no local
+/// shell is started.
+#[cfg(unix)]
+fn workspace_a_remote_exit_is_replaced_on_its_machine() {
+    let scratch = Scratch::new("machine-exit");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-exit");
+    assert!(
+        common::wait_until(secs(10), || wire_attach_count(&scratch.entries(), "t1")
+            >= 1),
+        "the initial shell did not attach; log={:?}",
+        scratch.entries()
+    );
+
+    screen.command(b'm');
+    assert!(
+        screen.wait_text("2/4 connected", secs(5)),
+        "the machine manager did not list core's machines: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"j");
+    screen.send(b"n");
+    assert!(
+        common::wait_until(secs(10), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry.get("machine_run").is_some())),
+        "terminal.run with on was not called: {:?}",
+        scratch.entries()
+    );
+    let remote = scratch
+        .entries()
+        .iter()
+        .find(|entry| entry.get("machine_run").is_some())
+        .and_then(|entry| entry["machine_run"]["address"].as_str())
+        .expect("the mirrored remote address")
+        .to_owned();
+    assert!(
+        screen.wait_text(&remote, secs(10)),
+        "the remote pane is not shown: {:?}",
+        screen.rendered()
+    );
+
+    // A key ends the remote program; the replacement must stay remote.
+    screen.type_text("q");
+    let remote_runs = || {
+        scratch
+            .entries()
+            .into_iter()
+            .filter(|entry| entry["call"] == "terminal.run" && entry["params"]["on"] == "delta")
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        common::wait_until(secs(10), || remote_runs().len() == 2),
+        "the remote pane was not replaced on its machine; log={:?}",
+        scratch.entries()
+    );
+    let runs = remote_runs();
+    let replacement = &runs[1];
+    assert_eq!(
+        replacement["params"]["cwd"],
+        json!("/home/remote"),
+        "the remote replacement keeps the exited cwd: {replacement}"
+    );
+    assert_eq!(
+        replacement["params"]["argv"],
+        json!([]),
+        "the replacement is a plain shell"
+    );
+    assert_eq!(
+        scratch
+            .entries()
+            .iter()
+            .filter(|entry| entry["call"] == "terminal.run" && entry["params"].get("on").is_none())
+            .count(),
+        1,
+        "only the initial shell may be local; log={:?}",
+        scratch.entries()
+    );
+    assert_eq!(
+        scratch
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry["call"] == "terminal.rm" && entry["params"]["terminal"] == remote
+            })
+            .count(),
+        1,
+        "the exited remote record must be removed once; log={:?}",
+        scratch.entries()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A local start ignores the focused pane's cwd when that pane is remote:
+/// `/home/remote` is a path on the other machine.
+#[cfg(unix)]
+fn workspace_a_local_start_ignores_a_focused_remote_panes_cwd() {
+    let scratch = Scratch::new("cwd-remote");
+    scratch.seed_doc(one_tab_doc(&[(3, "t1"), (4, "alpha/t7")]), 2);
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "machines-cwd");
+    assert!(
+        screen.wait_text("alpha/t7", secs(10)),
+        "the remote pane was not restored: {:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+
+    screen.send(click(60, 12).as_bytes());
+    assert!(
+        screen.wait_text("/ alpha/t7", secs(5)),
+        "the remote pane did not take the focus: {:?}",
+        screen.rendered()
+    );
+    screen.command(b'c');
+    let runs = || {
+        scratch
+            .entries()
+            .into_iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        common::wait_until(secs(10), || runs().len() == 1),
+        "the new tab did not start a local terminal; log={:?}",
+        scratch.entries()
+    );
+    let started = runs();
+    let client = std::env::current_dir().expect("client cwd");
+    assert_eq!(
+        started[0]["params"]["cwd"],
+        json!(client.to_string_lossy()),
+        "a local start uses the client cwd, never the remote path"
+    );
+    assert!(
+        started[0]["params"].get("on").is_none(),
+        "the new tab is local: {:?}",
+        started[0]
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// The replacement shell for a background tab must not become the active
+/// tab; it appears in its own tab, sized for its own layout.
+#[cfg(unix)]
+fn workspace_a_background_exit_does_not_steal_the_active_tab() {
+    let scratch = Scratch::new("bg-exit");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "bg-exit");
+    assert!(
+        screen.wait_text("PANE-ONE", secs(10)),
+        "the first pane did not paint: {:?}",
+        screen.rendered()
+    );
+    screen.command(b'c');
+    assert!(
+        screen.wait_text("PANE-TWO", secs(10)),
+        "the second tab did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.wait_text("/ t2", secs(5)),
+        "the second tab is not active: {:?}",
+        screen.rendered()
+    );
+
+    // A key on the active pane ends the background tab's only pane.
+    screen.type_text("q");
+    let runs = || {
+        scratch
+            .entries()
+            .into_iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        common::wait_until(secs(10), || runs().len() == 3),
+        "the background pane was not replaced; log={:?}",
+        scratch.entries()
+    );
+    assert!(
+        screen.wait_text("/ t2", secs(5)) && screen.rendered().contains("PANE-TWO"),
+        "the replacement stole the active tab: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("PANE-THREE"),
+        "the background tab's pane became visible: {:?}",
+        screen.rendered()
+    );
+    let started = runs();
+    assert_eq!(
+        started[2]["params"]["size"],
+        json!({"cols": 78, "rows": 20}),
+        "the background replacement starts at its own tab's size"
+    );
+
+    // The replacement does exist in the background tab.
+    screen.command(b'p');
+    assert!(
+        screen.wait_text("PANE-THREE", secs(10)),
+        "the replacement is missing from its tab: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A local replacement never borrows the person's current pane directory:
+/// the exited record has no cwd, so it falls back to the client cwd.
+#[cfg(unix)]
+fn workspace_a_local_replacement_ignores_the_focused_panes_cwd() {
+    let scratch = Scratch::new("cwd-fallback");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "cwd-fallback");
+    assert!(
+        screen.wait_text("PANE-ONE", secs(10)),
+        "the first pane did not paint: {:?}",
+        screen.rendered()
+    );
+    screen.command(b'c');
+    assert!(
+        screen.wait_text("PANE-TWO", secs(10)),
+        "the second tab did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || scratch
+            .entries()
+            .iter()
+            .any(|entry| entry["event"] == "pane-cwd")),
+        "the focused pane's cwd never reached the client: {:?}",
+        scratch.entries()
+    );
+
+    // The focused pane (t2, cwd /user/pane) ends the background pane t1,
+    // whose record the model does not carry.
+    screen.type_text("q");
+    let runs = || {
+        scratch
+            .entries()
+            .into_iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        common::wait_until(secs(10), || runs().len() == 3),
+        "the background pane was not replaced; log={:?}",
+        scratch.entries()
+    );
+    let started = runs();
+    let client = std::env::current_dir().expect("client cwd");
+    assert_eq!(
+        started[2]["params"]["cwd"],
+        json!(client.to_string_lossy()),
+        "the replacement must use the client cwd: {:?}",
+        started[2]
+    );
+    assert_ne!(
+        started[2]["params"]["cwd"],
+        json!("/user/pane"),
+        "the focused pane's cwd must not leak into another pane's replacement"
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+}
+
+/// A replacement shell that exits at once is not respawned forever: the
+/// guard leaves the empty tab after one try and says so.
+#[cfg(unix)]
+fn workspace_an_instantly_exiting_replacement_is_not_respawned() {
+    let scratch = Scratch::new("respawn-chain");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "respawn-chain");
+    assert!(
+        screen.wait_text("exits immediately", secs(10)),
+        "the broken-shell message was not shown; screen={:?} stderr={:?}",
+        screen.rendered(),
+        screen.stderr.text()
+    );
+
+    screen.send(&[0x1d]);
+    let status = screen.wait_exit(secs(5)).expect("detach");
+    assert_eq!(status.code(), Some(0), "stderr={:?}", screen.stderr.text());
+    let runs = scratch
+        .entries()
+        .iter()
+        .filter(|entry| entry["call"] == "terminal.run")
+        .count();
+    assert_eq!(
+        runs,
+        2,
+        "the initial shell and exactly one replacement only; log={:?}",
+        scratch.entries()
+    );
 }
 
 /// The connection dies after core creates a split's terminal but before the
@@ -2253,6 +2757,10 @@ fn workspace_machine_manager_lists_actions_and_starts_a_terminal_on_a_machine() 
         run["params"]["labels"]["herdr.terminal.pane"].is_string(),
         "the remote start carries its pane label: {run}"
     );
+    assert!(
+        run["params"].get("cwd").is_none(),
+        "a machine start never sends a local directory: {run}"
+    );
     let remote = log
         .iter()
         .find(|entry| entry.get("machine_run").is_some())
@@ -2989,6 +3497,97 @@ fn workspace_an_explicit_program_gets_the_new_tab_attach_size() {
         runs[0]["params"]["size"],
         json!({"cols": 78, "rows": 20}),
         "the new tab must start at the pane it will attach at"
+    );
+    assert_eq!(
+        runs[0]["params"]["cwd"],
+        json!("/srv/work"),
+        "an explicit program follows the restored focused pane's cwd"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// The first shell has no pane to follow, so it starts where the client
+/// runs. The fake core records the params without acting on them.
+#[cfg(unix)]
+fn workspace_the_first_shell_starts_in_the_client_directory() {
+    let scratch = Scratch::new("cwd-client");
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "m6-copy");
+    assert!(
+        wait_for_text(&workspace, "hello"),
+        "the first pane did not paint; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    let runs: Vec<_> = scratch
+        .entries()
+        .into_iter()
+        .filter(|entry| entry["call"] == "terminal.run")
+        .collect();
+    assert_eq!(runs.len(), 1, "only the initial shell has run");
+    let client = std::env::current_dir().expect("client cwd");
+    assert_eq!(
+        runs[0]["params"]["cwd"],
+        json!(client.to_string_lossy()),
+        "the first shell must start where the client was started"
+    );
+
+    workspace.send(&[0x1d]);
+    let status = workspace.wait_exit(secs(5)).expect("detach");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr={:?}",
+        workspace.stderr.text()
+    );
+}
+
+/// A new tab follows the focused pane: its terminal starts in the directory
+/// core reports for that pane, not in the client's directory.
+#[cfg(unix)]
+fn workspace_a_new_tab_starts_in_the_focused_panes_directory() {
+    let scratch = Scratch::new("cwd-pane");
+    scratch.seed_doc(doc_one_pane(), 3);
+    let mut workspace = FakeScreen::spawn_workspace(&scratch, "cwd-pane");
+    assert!(
+        workspace.wait_text("PANE-ONE", secs(10)),
+        "the restored pane did not paint; screen={:?} stderr={:?}",
+        workspace.rendered(),
+        workspace.stderr.text()
+    );
+
+    let runs = |scratch: &Scratch| {
+        scratch
+            .entries()
+            .into_iter()
+            .filter(|entry| entry["call"] == "terminal.run")
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        runs(&scratch).is_empty(),
+        "restoring a document must start nothing; log={:?}",
+        scratch.entries()
+    );
+
+    workspace.command(b'c');
+    assert!(
+        common::wait_until(secs(10), || runs(&scratch).len() == 1),
+        "the new tab did not start a terminal; log={:?}",
+        scratch.entries()
+    );
+    let started = runs(&scratch);
+    assert_eq!(
+        started[0]["params"]["cwd"],
+        json!("/srv/work"),
+        "the new tab must start in the focused pane's directory"
     );
 
     workspace.send(&[0x1d]);
@@ -7500,6 +8099,14 @@ fn fake_connect() -> io::Result<()> {
     // retry cooldown.
     let mut doc_get_failing = false;
     let mut doc_event_during_cooldown_sent = false;
+    // `exit-dup`: after the replacement shell is up, a late duplicate
+    // `finished` names the pane that was already removed.
+    let mut late_finish_sent = false;
+    // `agents-exit`: the agent's program ends on the first key.
+    let mut agent_exit_sent = false;
+    let mut machine_exit_sent = false;
+    let mut bg_exit_sent = false;
+    let mut cwd_fallback_sent = false;
 
     while let Some((channel, kind, payload)) = read_frame(&mut input)? {
         let mut frame = json!({"channel": channel, "kind": kind, "len": payload.len()});
@@ -7630,6 +8237,124 @@ fn fake_connect() -> io::Result<()> {
                     json!({"event": "doc-during-cooldown", "version": version}),
                 );
                 continue;
+            }
+            if scenario == "exit-dup" && !late_finish_sent && runs >= 2 {
+                // The pane that exited is already gone; this duplicate must
+                // not touch the replacement shell.
+                late_finish_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "finished",
+                        "t1",
+                        json!({"reason": "exited", "exit_code": 7}),
+                    ),
+                )?;
+                log(log_path, json!({"event": "late-finish"}));
+                continue;
+            }
+            if scenario == "agents-exit" && !agent_exit_sent {
+                // An agent program exits exactly like any other: `finished`
+                // then the stream closes.
+                agent_exit_sent = true;
+                event_seq += 1;
+                notify(
+                    &mut output,
+                    agent_event(
+                        event_seq,
+                        "finished",
+                        "t1",
+                        json!({"reason": "exited", "exit_code": 0}),
+                    ),
+                )?;
+                close_target(
+                    &mut output,
+                    &mut attached_channels,
+                    &mut channel_targets,
+                    "t1",
+                    0,
+                )?;
+                continue;
+            }
+            if scenario == "machines-exit" && !machine_exit_sent {
+                // The remote pane exits: `finished`, then its stream closes.
+                // The replacement must go back to the same machine.
+                let target = channel_targets.get(&channel).cloned().unwrap_or_default();
+                if target.contains('/') {
+                    machine_exit_sent = true;
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(
+                            event_seq,
+                            "finished",
+                            &target,
+                            json!({"reason": "exited", "exit_code": 3}),
+                        ),
+                    )?;
+                    close_target(
+                        &mut output,
+                        &mut attached_channels,
+                        &mut channel_targets,
+                        &target,
+                        3,
+                    )?;
+                    continue;
+                }
+            }
+            if scenario == "bg-exit" && !bg_exit_sent {
+                // A key on the active tab's pane ends the background tab's
+                // only pane; its replacement must not steal the active tab.
+                let target = channel_targets.get(&channel).cloned().unwrap_or_default();
+                if target == "t2" {
+                    bg_exit_sent = true;
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(
+                            event_seq,
+                            "finished",
+                            "t1",
+                            json!({"reason": "exited", "exit_code": 4}),
+                        ),
+                    )?;
+                    close_target(
+                        &mut output,
+                        &mut attached_channels,
+                        &mut channel_targets,
+                        "t1",
+                        4,
+                    )?;
+                    continue;
+                }
+            }
+            if scenario == "cwd-fallback" && !cwd_fallback_sent {
+                // A key on the active pane ends the background tab's only
+                // pane, whose record is not in the model.
+                let target = channel_targets.get(&channel).cloned().unwrap_or_default();
+                if target == "t2" {
+                    cwd_fallback_sent = true;
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(
+                            event_seq,
+                            "finished",
+                            "t1",
+                            json!({"reason": "exited", "exit_code": 6}),
+                        ),
+                    )?;
+                    close_target(
+                        &mut output,
+                        &mut attached_channels,
+                        &mut channel_targets,
+                        "t1",
+                        6,
+                    )?;
+                    continue;
+                }
             }
             if scenario.starts_with("agents") {
                 agent_step += 1;
@@ -7807,6 +8532,28 @@ fn fake_connect() -> io::Result<()> {
                     "doc-remove" => {
                         let version = replace_doc(doc_path, doc_one_pane());
                         notify(&mut output, doc_event_message(version))?;
+                    }
+                    // One pane's program exits while its sibling keeps
+                    // running: `finished` then the stream closes. Only the
+                    // exited pane goes away.
+                    "exit-split" => {
+                        event_seq += 1;
+                        notify(
+                            &mut output,
+                            agent_event(
+                                event_seq,
+                                "finished",
+                                "t2",
+                                json!({"reason": "exited", "exit_code": 5}),
+                            ),
+                        )?;
+                        close_target(
+                            &mut output,
+                            &mut attached_channels,
+                            &mut channel_targets,
+                            "t2",
+                            5,
+                        )?;
                     }
                     // The connection drops after another screen changed the
                     // document; the fresh connection must refetch it.
@@ -8102,6 +8849,11 @@ fn fake_connect() -> io::Result<()> {
                     record["address"] = json!(address);
                     record["name"] = json!(name);
                     record["labels"] = Value::Object(last_run_labels.clone());
+                    if scenario == "machines-exit" {
+                        // A path on the machine, which a local start must
+                        // never receive.
+                        record["cwd"] = json!("/home/remote");
+                    }
                     record
                 } else if scenario == "workspace-pending" {
                     if runs == 1 {
@@ -8161,8 +8913,28 @@ fn fake_connect() -> io::Result<()> {
                         "cwd": "/work",
                     });
                     record
-                } else if scenario == "finished" {
-                    record("finished")
+                } else if scenario == "finished" || scenario == "exit-dup" {
+                    // The first start is already over; the shell that
+                    // replaces it is live.
+                    if runs == 1 {
+                        record("finished")
+                    } else {
+                        let mut record = live_record(5100 + runs);
+                        record["address"] = json!(format!("t{runs}"));
+                        record["name"] = json!(name);
+                        record["labels"] = Value::Object(last_run_labels.clone());
+                        record
+                    }
+                } else if scenario == "workspace-final" {
+                    if runs == 1 {
+                        live_record(4242)
+                    } else {
+                        let mut record = live_record(5200 + runs);
+                        record["address"] = json!(format!("t{runs}"));
+                        record["name"] = json!(name);
+                        record["labels"] = Value::Object(last_run_labels.clone());
+                        record
+                    }
                 } else if scenario == "workspace-missed" && runs > 1 {
                     named_record("t2", name, 4444)
                 } else if scenario.starts_with("m6-") {
@@ -8178,14 +8950,60 @@ fn fake_connect() -> io::Result<()> {
                     record["name"] = json!(name);
                     record["labels"] = Value::Object(last_run_labels.clone());
                     record
+                } else if scenario == "machines-cwd" {
+                    // A local start in a scenario whose document also holds a
+                    // remote pane; the fake never gives it the remote path.
+                    let address = if runs == 1 { "t2" } else { "t3" };
+                    let mut record = live_record(7400 + runs);
+                    record["address"] = json!(address);
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    record
+                } else if scenario == "bg-exit" {
+                    // A tab whose pane exits while a later tab is active.
+                    let address = match runs {
+                        1 => "t1",
+                        2 => "t2",
+                        _ => "t3",
+                    };
+                    let mut record = live_record(4500 + runs);
+                    record["address"] = json!(address);
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    record
+                } else if scenario == "cwd-fallback" {
+                    // The focused pane's record knows a cwd; the pane that
+                    // exits is absent from the model.
+                    let address = match runs {
+                        1 => "t1",
+                        2 => "t2",
+                        _ => "t3",
+                    };
+                    let mut record = live_record(4700 + runs);
+                    record["address"] = json!(address);
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    if runs == 2 {
+                        record["cwd"] = json!("/user/pane");
+                    }
+                    record
+                } else if scenario == "respawn-chain" {
+                    // Every start is already over: a broken shell.
+                    let mut record = record("finished");
+                    record["address"] = json!(format!("t{runs}"));
+                    record["name"] = json!(name);
+                    record["labels"] = Value::Object(last_run_labels.clone());
+                    record
                 } else if doc_scenario(&scenario) {
                     // A split's terminal, with the labels the client sent.
-                    let address =
-                        if scenario.starts_with("doc-conflict") || scenario == "doc-program" {
-                            "t3"
-                        } else {
-                            "t1"
-                        };
+                    let address = if scenario.starts_with("doc-conflict")
+                        || scenario == "doc-program"
+                        || scenario == "cwd-pane"
+                    {
+                        "t3"
+                    } else {
+                        "t1"
+                    };
                     let mut record = live_record(7000 + runs);
                     record["address"] = json!(address);
                     record["name"] = json!(name);
@@ -8214,6 +9032,22 @@ fn fake_connect() -> io::Result<()> {
                         &mut output,
                         agent_event(event_seq, "created", &last_run_address, created),
                     )?;
+                } else if scenario == "machines-exit" {
+                    // The subscription carries the remote record (including
+                    // its cwd) the run reply only started.
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(event_seq, "created", &last_run_address, created),
+                    )?;
+                } else if scenario == "cwd-fallback" && runs == 2 {
+                    // Give the client the focused pane's cwd in its model.
+                    event_seq += 1;
+                    notify(
+                        &mut output,
+                        agent_event(event_seq, "created", &last_run_address, created),
+                    )?;
+                    log(log_path, json!({"event": "pane-cwd"}));
                 }
             }
             "terminal.attach" => {
@@ -8221,7 +9055,9 @@ fn fake_connect() -> io::Result<()> {
                     .as_str()
                     .unwrap_or("t1")
                     .to_owned();
-                if scenario == "finished" {
+                if ((scenario == "finished" || scenario == "exit-dup") && target == "t1")
+                    || scenario == "respawn-chain"
+                {
                     reply_error(
                         &mut output,
                         &id,
@@ -8413,8 +9249,9 @@ fn fake_connect() -> io::Result<()> {
                             )?;
                         }
                         // The same simultaneous DATA+CLOSE ending for the
-                        // default workspace, with a non-zero status.
-                        "workspace-final" => {
+                        // default workspace, with a non-zero status. Only the
+                        // first pane ends; its replacement shell stays live.
+                        "workspace-final" if target == "t1" => {
                             write_frame(&mut output, channel, DATA, b"\x1b[38;2;1;2;3mREADY\n")?;
                             write_frame(&mut output, channel, DATA, b"END\n")?;
                             write_frame(
@@ -8438,7 +9275,8 @@ fn fake_connect() -> io::Result<()> {
                         | "doc-remove"
                         | "doc-stale-snapshot"
                         | "doc-deleted-recover"
-                        | "doc-focus" => {
+                        | "doc-focus"
+                        | "cwd-pane" => {
                             let text: &[u8] = if target == "t2" {
                                 b"PANE-TWO\n"
                             } else {
@@ -8463,10 +9301,19 @@ fn fake_connect() -> io::Result<()> {
                             write_frame(&mut output, channel, DATA, text)?;
                         }
                         "doc-event" | "doc-event-focus" | "doc-missed" | "doc-reconnect"
-                        | "doc-conflict-merge" | "doc-conflict-tab" | "doc-conflict-flush" => {
+                        | "doc-conflict-merge" | "doc-conflict-tab" | "doc-conflict-flush"
+                        | "exit-split" => {
                             let text: &[u8] = match target.as_str() {
                                 "t2" => b"PANE-TWO\n",
                                 "t3" => b"SPLIT-PANE\n",
+                                _ => b"PANE-ONE\n",
+                            };
+                            write_frame(&mut output, channel, DATA, text)?;
+                        }
+                        "bg-exit" | "cwd-fallback" => {
+                            let text: &[u8] = match target.as_str() {
+                                "t2" => b"PANE-TWO\n",
+                                "t3" => b"PANE-THREE\n",
                                 _ => b"PANE-ONE\n",
                             };
                             write_frame(&mut output, channel, DATA, text)?;
@@ -8680,6 +9527,16 @@ fn fake_connect() -> io::Result<()> {
                 }
                 let record = if scenario.starts_with("files") {
                     file_pane_record(target)
+                } else if scenario == "finished" && target == "t1" {
+                    // A distinctive directory only this record carries: the
+                    // attach-reply path must hand it to the replacement.
+                    let mut record = record("finished");
+                    record["cwd"] = json!("/srv/work");
+                    record
+                } else if scenario == "respawn-chain" {
+                    let mut record = record("finished");
+                    record["address"] = json!(target);
+                    record
                 } else if doc_scenario(&scenario) {
                     if target == last_run_address && target != "t1" {
                         let mut record = live_record(8000);
@@ -9093,8 +9950,10 @@ fn doc_scenario(scenario: &str) -> bool {
             | "doc-orphan"
             | "doc-orphan-invalid"
             | "doc-program"
+            | "cwd-pane"
             | "doc-get-fail"
             | "doc-get-fail-event"
+            | "exit-split"
     )
 }
 
@@ -9137,6 +9996,11 @@ fn snapshot_for(
             cross_screen_worker_record("t9"),
             same_screen_stale_worker_record("t10"),
         ],
+        "machines-cwd" => {
+            let mut remote = doc_terminal("alpha/t7", 1, 2, 4);
+            remote["cwd"] = json!("/home/remote");
+            vec![doc_terminal("t1", 1, 2, 3), remote]
+        }
         "machines-remote"
         | "machines-missed"
         | "machines-reconnect"
@@ -9172,6 +10036,10 @@ fn snapshot_for(
             doc_record_for(scenario, "t1"),
             doc_record_for(scenario, "t2"),
         ],
+        "exit-split" => vec![
+            doc_record_for(scenario, "t1"),
+            doc_record_for(scenario, "t2"),
+        ],
         "doc-reconnect" if generation > 1 => {
             vec![
                 doc_record_for(scenario, "t1"),
@@ -9185,6 +10053,7 @@ fn snapshot_for(
         }
         "doc-deleted-claim-lost" => Vec::new(),
         "doc-orphan" => vec![doc_record_for(scenario, "t1"), orphan_record("t7", 5, 6, 9)],
+        "cwd-pane" => vec![doc_record_for(scenario, "t1")],
         "doc-orphan-invalid" => vec![doc_record_for(scenario, "t1"), unlabeled_record("t9")],
         "doc-foreign" => vec![unlabeled_record("t1")],
         "agents-lost" if generation > 1 => vec![agent_snapshot_record("t1")],
@@ -9429,6 +10298,21 @@ fn doc_record_for(scenario: &str, address: &str) -> Value {
             doc_terminal("t2", 20, 21, 22)
         }
         ("doc-event-focus", "t3") => doc_terminal("t3", 1, 2, 5),
+        ("doc-program", "t1") => {
+            let mut record = doc_terminal("t1", 1, 2, 3);
+            record["cwd"] = json!("/srv/work");
+            record
+        }
+        ("doc-program", "t2") => {
+            let mut record = doc_terminal("t2", 1, 2, 4);
+            record["cwd"] = json!("/srv/work");
+            record
+        }
+        ("cwd-pane", "t1") => {
+            let mut record = doc_terminal("t1", 1, 2, 3);
+            record["cwd"] = json!("/srv/work");
+            record
+        }
         (_, "t2") => doc_terminal("t2", 1, 2, 4),
         (_, "t1") => doc_terminal("t1", 1, 2, 3),
         _ => {
@@ -10050,6 +10934,27 @@ fn missed_workspace_event(
 
 /// A notification from core: a newline-terminated JSON line on the events
 /// channel, as core sends it.
+/// Ends one attached pane's stream as core does after its program exits.
+fn close_target(
+    out: &mut impl Write,
+    attached: &mut BTreeSet<u32>,
+    targets: &mut BTreeMap<u32, String>,
+    target: &str,
+    code: i32,
+) -> io::Result<()> {
+    let channel = targets
+        .iter()
+        .find(|(_, name)| name.as_str() == target)
+        .map(|(channel, _)| *channel);
+    if let Some(channel) = channel {
+        let reason = format!(r#"{{"reason":"exited","exit_code":{code}}}"#);
+        write_frame(out, channel, CLOSE, reason.as_bytes())?;
+        attached.remove(&channel);
+        targets.remove(&channel);
+    }
+    Ok(())
+}
+
 fn notify(out: &mut impl Write, message: serde_json::Value) -> io::Result<()> {
     let mut line = message.to_string();
     line.push('\n');

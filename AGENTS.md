@@ -70,6 +70,13 @@ records, raw output, attach, events, status, documents and machines.
   program that reads its size once starts with the right layout. Use the exact
   grid the terminal will attach at, not a guess, and omit the field when it is
   unknown. The supported Core floor applies it, so no version gate is needed.
+- **Start directory.** A new local terminal starts in the focused pane's
+  Core-reported cwd when Core has one, otherwise the client process's cwd, and
+  `$HOME` when that is `/` or unreadable. The first shell has no pane, so it
+  uses the client rule; an explicit `ht PROG` in a restored workspace follows
+  the focused pane too. A start with `on` sends no cwd and uses the machine's
+  home; never send a local path to a remote start. A replacement shell uses the
+  exited terminal's cwd, then the client rule for a local pane.
 - **Observer attaches are read-only.** The connection requires
   `resize_notifications`, so an observer attach always carries `observe` and
   `resize_notifications`; the attach reply must still confirm it.
@@ -174,8 +181,14 @@ records, raw output, attach, events, status, documents and machines.
   picker/list remains planned. There is no embedded editor, merge or
   three-way resolution, and no direct path IO for the file itself.
 - **Reconnect semantics.** A dropped connection is not a dead program. On
-  `missed`, resnapshot; on `lost`/`restarted`, reattach; on `finished`, drop
-  the stream. Never assume the program died.
+  `missed`, resnapshot; on `lost`/`restarted`, reattach. When a program in a
+  terminal this screen started exits, close its pane: stop the stream, remove
+  the finished record with `terminal.rm` (best effort), and remove the pane; a
+  tab's last pane gets one fresh shell in the same space and tab (same machine
+  for `machine/t7`), a background tab's replacement must not switch the active
+  space or tab, and a replacement that exits almost immediately is not replaced
+  again. A restored or adopted record that was already finished keeps its final
+  screen until `x`. Never assume the program died from a dropped connection.
 - **No mods in v1.** If mods come later, use the old TUI's manifest +
   external-command model (`herdr-plugin.toml`, actions/events/panes/link
   handlers, CLI/socket), not Herdr App's JS/GPUI runtime.

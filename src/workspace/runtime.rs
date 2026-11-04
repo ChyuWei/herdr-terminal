@@ -68,6 +68,9 @@ const DRAIN_TIME: Duration = Duration::from_millis(8);
 const EVENT_BATCH: usize = 256;
 /// How long a parked or restarting terminal waits before another attach.
 const ATTACH_RETRY: Duration = Duration::from_millis(500);
+/// How long a fresh replacement shell must live before its own exit earns
+/// another replacement. An instantly exiting shell gets exactly one try.
+const REPLACEMENT_GRACE: Duration = Duration::from_secs(2);
 /// The fallback attach size for a pane with no visible geometry.
 const HIDDEN_COLS: u16 = crate::screen::DEFAULT_COLS;
 const HIDDEN_ROWS: u16 = crate::screen::DEFAULT_ROWS;
@@ -163,6 +166,21 @@ struct PendingStart {
     name: String,
     /// The machine the start was for, so a retry never falls back to local.
     on: Option<String>,
+    /// The start directory already chosen, kept so a retry starts where the
+    /// first attempt would have.
+    cwd: Option<String>,
+}
+
+/// A fresh shell owed to a tab whose last pane exited: where it goes, the
+/// machine the exited pane ran on (so a remote shell stays remote), and the
+/// directory it starts in.
+pub(super) struct Replacement {
+    pub request: StartRequest,
+    /// The machine prefix of the exited pane's address, if it was remote.
+    pub on: Option<String>,
+    /// The exited terminal's recorded cwd, captured before its record was
+    /// forgotten.
+    pub cwd: Option<String>,
 }
 
 /// One open file, its pre-editor text and the local temp file an editor may
@@ -197,6 +215,14 @@ pub(super) struct Screen<'a> {
     /// Every pane id this screen has seen; recovered orphans never resurrect
     /// a pane the person closed or another screen removed.
     seen: BTreeSet<PaneId>,
+    /// Fresh shells owed to tabs whose last pane exited. They are queued and
+    /// started by the loop, never inline while an exit is being handled: a
+    /// program that exits the instant it starts must not recurse.
+    replacements: Vec<Replacement>,
+    /// When this client started each replacement shell, by address. An exit
+    /// inside [`REPLACEMENT_GRACE`] means the shell itself is broken, so no
+    /// further replacement is started. Entries are dropped when they age out.
+    replacement_started: BTreeMap<String, Instant>,
     /// A start interrupted by the connection loss; resolved after reconnect.
     pending: Option<PendingStart>,
     ui: UiState,
@@ -278,6 +304,8 @@ impl<'a> Screen<'a> {
             view,
             seen,
             pending: None,
+            replacements: Vec::new(),
+            replacement_started: BTreeMap::new(),
             ui,
             agents: AgentRuntime::default(),
             manager_rows: Vec::new(),
@@ -383,6 +411,10 @@ impl<'a> Screen<'a> {
             return Ok(());
         }
         self.apply_events()?;
+        if self.reconn.is_some() {
+            return Ok(());
+        }
+        self.run_replacements()?;
         if self.reconn.is_some() {
             return Ok(());
         }

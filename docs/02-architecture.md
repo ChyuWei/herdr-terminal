@@ -518,13 +518,25 @@ and reattaches. `ht` has no update command.
    a won deleted-document claim with no recovered pane, or an explicit
    PROGRAM.
 
+**Start directory**
+
+A new local terminal starts in the focused pane's Core-reported cwd when Core
+has one, otherwise the client process's cwd, and `$HOME` when that cwd is `/`
+or unreadable. The first shell has no pane, so it uses the client rule; an
+explicit PROGRAM started into a restored workspace follows the focused pane
+too. A start with `on` sends no cwd, so the machine's home applies; a local
+path is never sent to a machine. A replacement shell starts in the exited
+terminal's recorded cwd when it has one (a path on that machine for
+`machine/t7`), then the client rule for a local pane.
+
 **Initial size**
 
 Every spawn path sends `terminal.run`'s optional `size` when it knows the grid
 the terminal will attach at: the initial shell, a new pane/split/tab/space, an
-explicit PROGRAM after restore, `ht screen`, a replacement after reconnect, and
-`ht probe`. Workspace starts use the pending pane's exact inner grid, previewed
-on a clone of the deterministic insertion so a failed run leaves no empty tab.
+explicit PROGRAM after restore, `ht screen`, a replacement after reconnect or
+an exit, and `ht probe`. Workspace starts use the pending pane's exact inner
+grid, previewed on a clone of the deterministic insertion so a failed run
+leaves no empty tab.
 A path that cannot know the size omits the field and core's default applies.
 The minimum supported Core applies the field, so no version gate is used. This
 matters because a program that reads its size once at startup, before a viewer
@@ -548,7 +560,15 @@ no keys, mouse reports, RESIZE, FOCUS or FACTS. Normal attaches are unchanged.
 - A dropped connection does **not** mean the programs died.
 - Reconnect, `hello`, resubscribe; on `missed`, resnapshot; re-read documents; reattach terminals.
 - On `lost`, the kept terminal stays live; wait for `restarted` and attach again.
-- On `finished`, remove the stream but keep the record/scrollback as configured.
+- On `finished` for a program in a terminal this screen started, close the
+  pane: stop the stream, remove the finished record with `terminal.rm` (best
+  effort), and remove the pane. If it was the tab's last pane, start one fresh
+  shell in the same space and tab (the same machine for `machine/t7`); a
+  background tab's replacement does not switch the active space or tab, and
+  one that exits almost immediately is not replaced again.
+- A restored or adopted record that was already finished keeps its final
+  screen until closed; reconnects and `missed` snapshots preserve that
+  behavior.
 
 **Shutdown**
 
@@ -686,8 +706,11 @@ currently implements.
   `hello` feature check, event subscription, and reconnect that keeps the
   programs running.
 - **Terminals:** local VT rendering, keyboard and mouse input, resize, focus,
-  display facts, credit-based flow control, and the attach lifecycle (`lost`,
-  `restarted`, `finished`, reattach).
+  display facts, credit-based flow control, start directories from the focused
+  pane, client cwd or home, and the attach lifecycle (`lost`, `restarted`,
+  `finished`, reattach). A terminal this screen started closes its pane on exit
+  and replaces a tab's last pane with one fresh shell on the same machine; a
+  restored or adopted finished record keeps its final screen until closed.
 - **Workspace:** spaces, tabs, panes, split/close/move, focus and zoom.
 - **Terminal manager:** a Core-wide modal inventory of every live terminal
   from the event model, with a shown marker, status word, age and optional
@@ -751,10 +774,11 @@ currently implements.
 The implemented set covers the connection and terminal foundation, the
 workspace and its persistence, agent awareness, the daily-driver input layer
 (mouse, history, search, selection, clipboard, palette, settings and themes),
-the local VT's grapheme clustering, initial terminal sizes, the Core-wide
-terminal manager and its read-only Preview, the machine manager with its
-remote terminals and rename recovery, and the Core-backed file viewer, editor,
-line diff and write-back. Packaging, notices, CI and versioning are also
+the local VT's grapheme clustering, initial terminal sizes, start directories
+and exit-driven pane replacement, the Core-wide terminal manager and its
+read-only Preview, the machine manager with its remote terminals and rename
+recovery, and the Core-backed file viewer, editor, line diff and write-back.
+Packaging, notices, CI and versioning are also
 implemented; the package is macOS Apple Silicon. Still planned: tab reorder,
 custom layouts, accessibility, general confirm/toast prompts, the file picker
 and directory listing, install scripts, `ht status` and mods. Scrollback,

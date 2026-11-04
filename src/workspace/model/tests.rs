@@ -400,6 +400,7 @@ fn a_split_with_a_stale_target_still_inserts_the_pane() {
         },
         new_space: false,
         new_tab: false,
+        background: false,
     };
     let second = workspace.insert_terminal(&request, "t2".into(), "t2".into());
     assert_eq!(
@@ -630,4 +631,128 @@ fn an_adopted_pane_captures_and_restores_by_address() {
     assert!(ours.owned);
     assert!(!adopted.owned, "restore keeps an adopted terminal unowned");
     assert_eq!(adopted.name, "worker");
+}
+
+#[test]
+fn a_finished_last_pane_is_replaced_in_its_own_tab() {
+    let mut workspace = Workspace::new();
+    let tab_name = workspace.active_tab().expect("tab").name.clone();
+    let first = add(&mut workspace, StartKind::Initial, "t1");
+    let (space, tab) = workspace.location(first).expect("location");
+
+    let request = workspace
+        .remove_finished_pane(first)
+        .expect("the last pane asks for a replacement");
+    assert_eq!((request.space, request.tab), (space, tab));
+    assert_eq!(request.placement, Placement::Only);
+    assert!(!request.new_space && !request.new_tab);
+    assert!(
+        request.background,
+        "a replacement must not steal the active tab"
+    );
+    assert_ne!(request.pane, first, "the replacement gets a new pane id");
+    assert_eq!(
+        workspace.active_tab().map(|tab| tab.name.clone()),
+        Some(tab_name),
+        "the tab stays, with its name"
+    );
+    assert_eq!(workspace.active_tab().expect("tab").layout, None);
+    assert_eq!(workspace.pane_count(), 0);
+
+    let replacement = workspace.insert_terminal(&request, "t2".to_owned(), "t2".to_owned());
+    assert_eq!(replacement, request.pane);
+    assert_eq!(
+        workspace.location(replacement),
+        Some((space, tab)),
+        "the shell replaces the pane in the same tab"
+    );
+}
+
+#[test]
+fn a_background_replacement_does_not_steal_the_active_tab() {
+    let mut workspace = Workspace::new();
+    let first = add(&mut workspace, StartKind::Initial, "t1");
+    let (space, first_tab) = workspace.location(first).expect("location");
+    let tab_request = workspace.start_request(StartKind::Tab);
+    let (second_space, second_tab) = (tab_request.space, tab_request.tab);
+    let second = workspace.insert_terminal(&tab_request, "t2".into(), "t2".into());
+    assert_eq!(workspace.active_tab_id(), Some(second_tab));
+
+    let replacement = workspace
+        .remove_finished_pane(first)
+        .expect("the background tab's last pane asks for a replacement");
+    let pane = workspace.insert_terminal(&replacement, "t3".into(), "t3".into());
+
+    assert_eq!(
+        workspace.active_tab_id(),
+        Some(second_tab),
+        "the active tab must not follow the replacement"
+    );
+    assert_eq!(
+        workspace.location(pane),
+        Some((space, first_tab)),
+        "the replacement belongs to the background tab"
+    );
+    assert_eq!(
+        workspace.tab(space, first_tab).and_then(|tab| tab.focused),
+        Some(pane),
+        "the replacement is focused inside its own tab"
+    );
+    assert_eq!(workspace.location(second), Some((second_space, second_tab)));
+}
+
+#[test]
+fn a_finished_pane_with_siblings_does_not_ask_for_a_replacement() {
+    let mut workspace = Workspace::new();
+    let first = add(&mut workspace, StartKind::Initial, "t1");
+    let split = workspace.start_request(StartKind::Split(Axis::Columns));
+    let second = workspace.insert_terminal(&split, "t2".to_owned(), "t2".to_owned());
+    let (space, tab) = workspace.location(first).expect("location");
+
+    assert_eq!(workspace.remove_finished_pane(first), None);
+    assert_eq!(workspace.pane_count(), 1);
+    assert_eq!(workspace.location(second), Some((space, tab)));
+    assert_eq!(workspace.focused_pane(), Some(second));
+}
+
+#[test]
+fn the_start_directory_follows_the_pane_then_the_client_then_home() {
+    let client = Path::new("/work/tree");
+    let home = Path::new("/home/person");
+
+    assert_eq!(
+        start_cwd(false, Some("/srv/app"), Some(client), Some(home)).as_deref(),
+        Some("/srv/app"),
+        "a focused pane's cwd wins"
+    );
+    assert_eq!(
+        start_cwd(false, Some("   "), Some(client), Some(home)).as_deref(),
+        Some("/work/tree"),
+        "an empty pane cwd is ignored"
+    );
+    assert_eq!(
+        start_cwd(false, None, Some(client), Some(home)).as_deref(),
+        Some("/work/tree"),
+        "the client's own directory is next"
+    );
+    assert_eq!(
+        start_cwd(false, None, Some(Path::new("/")), Some(home)).as_deref(),
+        Some("/home/person"),
+        "the filesystem root falls back to home"
+    );
+    assert_eq!(
+        start_cwd(false, None, None, Some(home)).as_deref(),
+        Some("/home/person"),
+        "an unreadable client cwd falls back to home"
+    );
+    assert_eq!(
+        start_cwd(false, None, Some(Path::new("/")), None),
+        None,
+        "no home leaves the choice to core"
+    );
+    assert_eq!(
+        start_cwd(true, Some("/srv/app"), Some(client), Some(home)),
+        None,
+        "a remote start never sends a local path"
+    );
 }

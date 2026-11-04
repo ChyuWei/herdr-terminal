@@ -18,11 +18,11 @@
 //!   screen shows the address so the user knows what still runs.
 //! * `X` kill: close and **end** the terminal even if it was kept.
 //!
-//! A pane whose program already ended keeps its final screen as a **finished
-//! pane**: every close key only forgets its record (`terminal.rm`), because
-//! there is no program left to detach or kill. The pane stays visible until
-//! the person closes it explicitly; nothing silently discards the final
-//! screen.
+//! A pane whose program ended is **closed automatically**: the runtime removes
+//! its record and the pane, and when it was the last pane of its tab it starts
+//! one fresh shell in that tab so the workspace is never left empty. An exit
+//! is not a finished screen to revisit; live panes still follow the close,
+//! keep and kill rules above.
 //!
 //! The proposed M3 key table used `k`/`K` for keep/kill; those keys are the
 //! conventional focus/move-up family, so [`super::keys`] maps keep/kill to
@@ -36,6 +36,7 @@ use super::geometry;
 use ratatui::layout::Rect;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 mod doc;
 mod ids;
@@ -299,6 +300,10 @@ pub struct StartRequest {
     pub placement: Placement,
     pub new_space: bool,
     pub new_tab: bool,
+    /// Insert the pane without making its space or tab active. A replacement
+    /// shell for a background tab must not pull the person away from where
+    /// they are; normal starts switch as usual.
+    pub background: bool,
 }
 
 /// Where the new pane goes.
@@ -337,6 +342,32 @@ impl StartRequest {
             ("herdr.seen".to_owned(), "0".to_owned()),
         ])
     }
+}
+
+/// The directory a new local terminal starts in.
+///
+/// A focused pane's terminal `cwd` wins (follow the pane); otherwise the
+/// client's current directory, unless that is the filesystem root or could not
+/// be read (`client_cwd` is `None`), in which case `$HOME` is used. A remote
+/// start sends nothing, so core uses that machine's home.
+pub fn start_cwd(
+    remote: bool,
+    pane_cwd: Option<&str>,
+    client_cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<String> {
+    if remote {
+        return None;
+    }
+    if let Some(cwd) = pane_cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        return Some(cwd.to_owned());
+    }
+    if let Some(cwd) = client_cwd
+        && cwd != Path::new("/")
+    {
+        return Some(cwd.to_string_lossy().into_owned());
+    }
+    home.map(|home| home.to_string_lossy().into_owned())
 }
 
 /// What a close request does to the terminal.
@@ -568,6 +599,7 @@ impl Workspace {
                     placement: Placement::Only,
                     new_space: false,
                     new_tab: false,
+                    background: false,
                 }
             }
             StartKind::Tab => StartRequest {
@@ -577,6 +609,7 @@ impl Workspace {
                 placement: Placement::Only,
                 new_space: false,
                 new_tab: true,
+                background: false,
             },
             StartKind::Space => StartRequest {
                 space: SpaceId(self.ids.alloc()),
@@ -585,6 +618,7 @@ impl Workspace {
                 placement: Placement::Only,
                 new_space: true,
                 new_tab: true,
+                background: false,
             },
             StartKind::Split(axis) => {
                 let (space, tab) = self.active_ids();
@@ -599,6 +633,7 @@ impl Workspace {
                     placement,
                     new_space: false,
                     new_tab: false,
+                    background: false,
                 }
             }
         }
@@ -611,7 +646,7 @@ impl Workspace {
     pub fn pending_attach_size(&self, request: &StartRequest, viewport: Rect) -> (u16, u16) {
         let mut preview = self.clone();
         preview.insert_terminal(request, String::new(), String::new());
-        geometry::compute(preview.active_tab(), viewport)
+        geometry::compute(preview.tab(request.space, request.tab), viewport)
             .pane(request.pane)
             .map(geometry::attach_size)
             .unwrap_or((1, 1))
@@ -679,6 +714,48 @@ impl Workspace {
         Some(self.insert_pane(request, pane))
     }
 
+    /// Removes a pane whose program ended, keeping its tab and space in place
+    /// even when it was their last pane. Returns a request for the fresh shell
+    /// that replaces it when the tab is now empty; the caller starts that
+    /// shell in the same tab. Nothing here changes the active space or tab.
+    pub fn remove_finished_pane(&mut self, pane: PaneId) -> Option<StartRequest> {
+        let Some((space_id, tab_id)) = self.location(pane) else {
+            self.panes.remove(&pane);
+            return None;
+        };
+        self.panes.remove(&pane);
+        let si = self.spaces.iter().position(|space| space.id == space_id)?;
+        let ti = self.spaces[si]
+            .tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)?;
+        let empty = {
+            let tab = &mut self.spaces[si].tabs[ti];
+            if let Some(root) = tab.layout.take() {
+                tab.layout = remove_layout(root, pane);
+            }
+            tab.history.retain(|id| *id != pane);
+            if tab.zoomed == Some(pane) {
+                tab.zoomed = None;
+            }
+            if tab.focused == Some(pane) {
+                refocus(tab);
+            }
+            tab.layout.is_none()
+        };
+        empty.then(|| StartRequest {
+            space: space_id,
+            tab: tab_id,
+            pane: PaneId(self.ids.alloc()),
+            placement: Placement::Only,
+            new_space: false,
+            new_tab: false,
+            // The exited pane may be in a background tab; its replacement
+            // must not switch the person to it.
+            background: true,
+        })
+    }
+
     /// The shared insertion logic: create the requested space/tab, place the
     /// pane in the layout, make it active and focus it. The pane's id is
     /// `request.pane`; the caller has already checked for duplicates.
@@ -715,8 +792,10 @@ impl Workspace {
             }
         };
         let tab_id = self.spaces[si].tabs[ti].id;
-        self.active = self.spaces[si].id;
-        self.spaces[si].active = tab_id;
+        if !request.background {
+            self.active = self.spaces[si].id;
+            self.spaces[si].active = tab_id;
+        }
 
         self.panes.insert(pane_id, pane);
 

@@ -198,8 +198,13 @@ pub(super) fn open(options: &Options, viewport: Rect) -> Result<Opened> {
     };
 
     if !started_initial && !options.argv.is_empty() {
-        let (pane, session) =
-            start_program(&client, &mut resolved.workspace, &options.argv, viewport)?;
+        let (pane, session) = start_program(
+            &client,
+            &mut resolved.workspace,
+            &model,
+            &options.argv,
+            viewport,
+        )?;
         resolved.seen.insert(pane);
         resolved.sessions.push((pane, session));
     }
@@ -307,7 +312,9 @@ fn claim_empty(
             };
             let request = workspace.start_request(StartKind::Initial);
             let size = workspace.pending_attach_size(&request, viewport);
-            let run = run_options(argv, &request, size);
+            // The initial shell has no focused pane to follow; it starts
+            // where this client was run (or in $HOME when that is the root).
+            let run = run_options(argv, &request, size, super::local_start_cwd(None, false));
             let session = match Session::start(client.clone(), &run) {
                 Ok(session) => session,
                 Err(error) => {
@@ -347,10 +354,12 @@ fn claim_empty(
 }
 
 /// Starts an explicit PROGRAM in the workspace, as a new tab unless the
-/// workspace is empty.
+/// workspace is empty. In a restored workspace it follows the focused pane's
+/// directory like any other new local terminal.
 fn start_program(
     client: &Arc<CoreClient>,
     workspace: &mut Workspace,
+    model: &Model,
     argv: &[String],
     viewport: Rect,
 ) -> Result<(PaneId, Session)> {
@@ -361,7 +370,9 @@ fn start_program(
     };
     let request = workspace.start_request(kind);
     let size = workspace.pending_attach_size(&request, viewport);
-    let run = run_options(argv, &request, size);
+    let focused = super::focused_pane_cwd(workspace, model);
+    let cwd = super::local_start_cwd(focused.as_deref(), false);
+    let run = run_options(argv, &request, size, cwd);
     let session = Session::start(client.clone(), &run).map_err(|error| {
         Error::Protocol(format!(
             "could not start {:?}: {error}",
@@ -416,6 +427,7 @@ fn run_options(
     argv: &[String],
     request: &super::model::StartRequest,
     size: (u16, u16),
+    cwd: Option<String>,
 ) -> RunOptions {
     RunOptions {
         argv: argv.to_vec(),
@@ -424,6 +436,7 @@ fn run_options(
         keep: true,
         rm: false,
         size: Some(size),
+        cwd,
         ..RunOptions::default()
     }
 }

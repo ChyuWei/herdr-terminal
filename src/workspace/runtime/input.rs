@@ -1,7 +1,7 @@
 //! Local input: the prefix state machine, overlays, forwarding keys and mouse
 //! to the focused pane, and the effects of commands (start, close, detach).
 
-use super::{PendingStart, Screen, TICK};
+use super::{PendingStart, REPLACEMENT_GRACE, Replacement, Screen, TICK};
 use crate::core::{Error, Result, RunOptions};
 use crate::session::{self, Session};
 use crate::vt;
@@ -10,7 +10,7 @@ use crate::workspace::keys;
 use crate::workspace::model::{CloseAction, ClosedPane, StartRequest};
 use crate::workspace::state::{Edit, Prompt, PromptEdit};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 impl Screen<'_> {
     pub(super) fn poll_input(&mut self, had_data: bool) -> Result<()> {
@@ -363,6 +363,47 @@ impl Screen<'_> {
         name: String,
         on: Option<String>,
     ) -> Result<()> {
+        let focused = self.focused_pane_cwd();
+        // A remote start must never carry a local path; the helper returns
+        // None for it so core uses the machine's home.
+        let cwd = crate::workspace::local_start_cwd(focused.as_deref(), on.is_some());
+        self.start_with_cwd(request, name, on, cwd)
+    }
+
+    /// Starts the fresh shell that replaces an exited last pane. A remote
+    /// pane's shell stays on its machine (with the exit's own cwd, a path on
+    /// that machine); a local one uses the exited directory, then the client
+    /// cwd. The person's current pane is never consulted: the exited pane may
+    /// be in a background tab.
+    pub(super) fn start_replacement(
+        &mut self,
+        request: StartRequest,
+        on: Option<String>,
+        pane_cwd: Option<String>,
+    ) -> Result<()> {
+        let cwd = if on.is_some() {
+            pane_cwd.filter(|cwd| !cwd.trim().is_empty())
+        } else {
+            crate::workspace::local_start_cwd(pane_cwd.as_deref(), false)
+        };
+        self.start_with_cwd(request, session::start_name(), on, cwd)
+    }
+
+    /// The focused pane's terminal `cwd`, when core has reported one. A
+    /// qualified (`machine/t7`) address holds a path on that machine; it must
+    /// never reach a local start.
+    fn focused_pane_cwd(&self) -> Option<String> {
+        crate::workspace::focused_pane_cwd(&self.workspace, &self.model)
+    }
+
+    /// Runs one terminal with an already chosen start directory.
+    fn start_with_cwd(
+        &mut self,
+        request: StartRequest,
+        name: String,
+        on: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<()> {
         let size = self.workspace.pending_attach_size(&request, self.area());
         let run = RunOptions {
             argv: Vec::new(),
@@ -371,6 +412,7 @@ impl Screen<'_> {
             keep: true,
             rm: false,
             size: Some(size),
+            cwd,
             on: on.clone(),
             ..RunOptions::default()
         };
@@ -380,7 +422,12 @@ impl Screen<'_> {
                 // The terminal may exist under this pane id; never let orphan
                 // recovery adopt it before the pending start is resolved.
                 self.seen.insert(request.pane);
-                self.pending = Some(PendingStart { request, name, on });
+                self.pending = Some(PendingStart {
+                    request,
+                    name,
+                    on,
+                    cwd: run.cwd.clone(),
+                });
                 self.begin_reconnect();
                 return Ok(());
             }
@@ -393,9 +440,43 @@ impl Screen<'_> {
         self.finish_start(request, session)
     }
 
+    /// Starts the fresh shells queued by exited last panes, one loop step
+    /// after the exit. A tab that already gained a pane in the meantime is
+    /// left alone. The queue is never retried on failure.
+    pub(super) fn run_replacements(&mut self) -> Result<()> {
+        let queued: Vec<_> = std::mem::take(&mut self.replacements);
+        // A replacement that lived past the grace is an ordinary terminal
+        // again; forgetting its start keeps this map from growing.
+        self.replacement_started
+            .retain(|_, started| started.elapsed() < REPLACEMENT_GRACE);
+        for Replacement { request, on, cwd } in queued {
+            let empty = self
+                .workspace
+                .tab(request.space, request.tab)
+                .is_some_and(|tab| tab.panes().is_empty());
+            if !empty {
+                continue;
+            }
+            if let Err(error) = self.start_replacement(request, on, cwd) {
+                self.ui.message = Some(format!("a replacement shell could not start: {error}"));
+                self.dirty = true;
+            }
+            if self.reconn.is_some() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Inserts a successfully started or reclaimed terminal and attaches it.
     fn finish_start(&mut self, request: StartRequest, session: Session) -> Result<()> {
         let address = session.address().to_owned();
+        if request.background {
+            // Remember that this client started a replacement shell, so an
+            // immediate exit is not answered with another one forever.
+            self.replacement_started
+                .insert(address.clone(), Instant::now());
+        }
         let pane = self
             .workspace
             .insert_terminal(&request, address.clone(), address);
@@ -428,7 +509,7 @@ impl Screen<'_> {
                 let session = Session::reclaim(self.client.clone(), address);
                 self.finish_start(pending.request, session)
             }
-            None => self.start_with_name_on(pending.request, pending.name, pending.on),
+            None => self.start_with_cwd(pending.request, pending.name, pending.on, pending.cwd),
         }
     }
 

@@ -1,12 +1,15 @@
 //! Attach-byte draining, event application and lifecycle outcomes: finished,
 //! lost, restarted, removed and `missed` all resolve to a pane state here.
 
-use super::{ATTACH_RETRY, DRAIN_BYTES, DRAIN_TIME, EVENT_BATCH, Screen};
+use super::{
+    ATTACH_RETRY, DRAIN_BYTES, DRAIN_TIME, EVENT_BATCH, REPLACEMENT_GRACE, Replacement, Screen,
+};
 use crate::core::{EventKind, Notification, Result, StreamItem};
 use crate::screen::lifecycle::{self, Disposition};
 use crate::session;
 use crate::tui::vt_error;
 use crate::vt::Vt;
+use crate::workspace::machines;
 use crate::workspace::model::{DOC_NAME, PANE_LABEL, PaneId};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -329,8 +332,9 @@ impl Screen<'_> {
                     .map(|link| (link.stream.is_some(), link.finalized))
                     .unwrap_or((false, false));
                 if finalized {
-                    // The final screen is already on screen; a later record
-                    // only refines the status.
+                    // A restored completed record (adopted, not a local exit)
+                    // stays as a finished view; a later record only refines
+                    // its status.
                     let code = self
                         .model
                         .terminal(address)
@@ -348,8 +352,14 @@ impl Screen<'_> {
                         link.retry_at = None;
                     }
                 } else {
-                    let code = self.model.terminal(address).map(session::record_exit_code);
-                    self.recover_finished_pane(pane, address, code);
+                    // The exit is final now (no stream of ours to drain):
+                    // close the pane without reading a final screen.
+                    let code = self
+                        .model
+                        .terminal(address)
+                        .map(session::record_exit_code)
+                        .unwrap_or(1);
+                    self.close_finished_pane(pane, address, code);
                 }
             }
             EventKind::Removed => {
@@ -518,19 +528,65 @@ impl Screen<'_> {
         }
     }
 
-    /// Finalizes a pane whose program ended while attached. Its VT already
-    /// holds the last bytes, so the final frame is preserved and the pane
-    /// stays visible until the person closes it.
+    /// A pane whose program ended while attached closes like any other local
+    /// exit; its final screen is not read or kept.
     pub(super) fn finish_attached(&mut self, pane: PaneId, address: &str, reason: Option<Value>) {
         let code = session::finished_exit_code(self.model.terminal(address), reason.as_ref());
-        self.finalize_pane(pane, address, code);
+        self.close_finished_pane(pane, address, code);
     }
 
-    /// Recovers a terminal that finished without this pane's stream (it exited
-    /// before the first attach, while the connection was down, or before a
-    /// parked terminal could be reattached): read its record and final screen
-    /// from core and show them. The record is not removed here; `x` on the
-    /// finished pane removes it after it has been shown.
+    /// A locally observed exit: close the pane, forget its record (best
+    /// effort) and, when it was the last pane of its tab, start exactly one
+    /// fresh shell there. The exited terminal's directory is captured before
+    /// the record is forgotten. No final screen is read.
+    pub(super) fn close_finished_pane(&mut self, pane: PaneId, address: &str, code: i32) {
+        // A late duplicate `finished` for a pane already closed has no link;
+        // it must never touch the replacement.
+        let Some(mut link) = self.links.remove(&pane) else {
+            return;
+        };
+        let cwd = self
+            .model
+            .terminal(address)
+            .map(|record| record.cwd.clone())
+            .filter(|cwd| !cwd.trim().is_empty());
+        // A pane on `machine/t7` must be replaced on that machine, never by a
+        // local shell that happens to inherit the remote path.
+        let on = machines::machine(address);
+        // A replacement this client just started that exits inside the grace
+        // is a broken shell, not a person's program ending: one try only.
+        let immediate = self
+            .replacement_started
+            .remove(address)
+            .is_some_and(|started| started.elapsed() < REPLACEMENT_GRACE);
+        let _ = link.session.detach_current();
+        if let Err(error) = link.session.remove_finished() {
+            eprintln!("ht: warning: could not remove finished terminal {address}: {error}");
+        }
+        let replacement = self.workspace.remove_finished_pane(pane);
+        self.ui.message = Some(if immediate {
+            format!(
+                "terminal {address} exited ({code}); the shell exits immediately, \
+                 not starting another"
+            )
+        } else {
+            format!("terminal {address} exited ({code})")
+        });
+        self.dirty = true;
+        if let Some(request) = replacement
+            && !immediate
+        {
+            // The loop starts the shell on its next step; a failed start
+            // reports its error and leaves the empty tab (no retry loop).
+            self.replacements.push(Replacement { request, on, cwd });
+        }
+    }
+
+    /// Recovers a terminal that was already finished when this screen adopted
+    /// it (restored from the document, found again after a restart, or seen in
+    /// a reconnect/missed snapshot): read its record and final screen from core
+    /// and show them. A locally observed exit never comes here; it closes the
+    /// pane. `x` on such a restored finished pane removes its record.
     pub(super) fn recover_finished_pane(
         &mut self,
         pane: PaneId,
@@ -607,9 +663,10 @@ impl Screen<'_> {
         Ok(())
     }
 
-    /// Keeps a pane as a finished view: its final VT stays, its status is
-    /// shown, and its session stops tracking a stream. `terminal.rm` waits for
-    /// the explicit close of the pane.
+    /// Keeps an already-finished terminal as a finished view: its final VT
+    /// stays, its status is shown, and its session stops tracking a stream.
+    /// Only restored/adopted records and reconnect snapshots take this path;
+    /// `terminal.rm` waits for the explicit close of the pane.
     fn finalize_pane(&mut self, pane: PaneId, address: &str, code: i32) {
         let already = self.links.get(&pane).is_some_and(|link| link.finalized);
         if !already && let Some(link) = self.links.get_mut(&pane) {
