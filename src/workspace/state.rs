@@ -6,7 +6,7 @@
 use super::agents::Overlay;
 use super::commands::RenameTarget;
 use super::keys::KeyMap;
-use super::model::PaneId;
+use super::model::{PaneId, SpaceId};
 
 /// A one-line editable text field, used by the palette and the search bar.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -97,6 +97,8 @@ pub struct UiState {
     pub machines: MachineState,
     /// The file viewer/editor overlay: open, its path prompt and its error.
     pub files: FileState,
+    /// The on-demand tab selector for the active space, when open.
+    pub tabs: Option<TabsState>,
     /// The read-only observer preview, when open.
     pub preview: Option<PreviewState>,
     /// The agent being peeked, when the peek overlay is open.
@@ -121,6 +123,7 @@ impl Default for UiState {
             manager: ManagerState::default(),
             machines: MachineState::default(),
             files: FileState::default(),
+            tabs: None,
             preview: None,
             peek: None,
             keymap: KeyMap::default(),
@@ -150,6 +153,8 @@ impl UiState {
             Overlay::Machines
         } else if self.files.open {
             Overlay::Files
+        } else if self.tabs.is_some() {
+            Overlay::Tabs
         } else if self.sidebar.open {
             // Keyboard focus is on the panel, not on the terminals beside it:
             // for seen/attention purposes those panes are not being watched.
@@ -172,6 +177,7 @@ impl UiState {
             || self.manager.open
             || self.machines.open
             || self.files.open
+            || self.tabs.is_some()
             || self.preview.is_some()
     }
 
@@ -259,6 +265,15 @@ pub struct ManagerState {
     pub filter: Line,
     pub filtering: bool,
     pub offset: usize,
+}
+
+/// The on-demand tab selector: the space whose tabs are listed and the
+/// selected row. It is the compatibility path for an old multi-tab space; it
+/// owns no layout and never opens by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabsState {
+    pub space: SpaceId,
+    pub selected: usize,
 }
 
 /// The machine manager's local state. The selection is a core machine name,

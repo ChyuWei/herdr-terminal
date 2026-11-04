@@ -370,14 +370,22 @@ impl Screen<'_> {
 
     // --- sidebar ----------------------------------------------------------
 
-    /// `prefix a`: give the persistent sidebar keyboard focus, or take it
-    /// away. The panel itself stays visible on a wide terminal either way.
-    pub(super) fn toggle_sidebar(&mut self) {
-        if super::super::sidebar::width(self.area()) == 0 {
-            self.ui.message = Some("the sidebar needs a terminal at least 70 columns wide".into());
-            self.dirty = true;
-            return;
+    /// The rail's cells right now: the persistent column on a wide terminal,
+    /// the overlay drawer while it is summoned on a narrow one.
+    pub(super) fn rail_rect(&self) -> ratatui::layout::Rect {
+        let bars = super::super::geometry::bars(self.area());
+        if bars.rail.width > 0 {
+            bars.rail
+        } else if self.ui.sidebar.open {
+            super::super::sidebar::drawer_rect(self.area())
+        } else {
+            ratatui::layout::Rect::new(0, 0, 0, 0)
         }
+    }
+
+    /// `prefix a`: give the rail keyboard focus, or take it away. On a narrow
+    /// terminal the rail is an overlay drawer; it never shrinks the panes.
+    pub(super) fn toggle_sidebar(&mut self) {
         if self.ui.sidebar.open {
             self.close_sidebar();
             return;
@@ -452,12 +460,13 @@ impl Screen<'_> {
     }
 
     fn keep_sidebar_visible(&mut self) {
-        let height = super::super::sidebar::height(self.area());
-        let total = super::super::sidebar::line_count(&self.workspace, &self.agents.rows);
-        let line = self.ui.sidebar.selected.and_then(|item| {
-            super::super::sidebar::line_index(&self.workspace, &self.agents.rows, item)
-        });
-        self.ui.sidebar.offset = agents::scroll_to(self.ui.sidebar.offset, line, height, total);
+        self.ui.sidebar.offset = super::super::sidebar::scroll_to_item(
+            &self.workspace,
+            &self.agents.rows,
+            self.rail_rect(),
+            self.ui.sidebar.offset,
+            self.ui.sidebar.selected,
+        );
     }
 
     /// Keeps the selection by item across rows reordering. A gone agent falls
@@ -491,13 +500,14 @@ impl Screen<'_> {
     /// its own active tab) and an agent row jumps to the pane, returning
     /// keyboard focus to it. Empty panel cells are consumed without action.
     pub(super) fn sidebar_click(&mut self, x: u16, y: u16) -> bool {
-        if super::super::sidebar::width(self.area()) == 0 {
+        let rail = self.rail_rect();
+        if rail.width == 0 {
             return false;
         }
         let layout = super::super::sidebar::layout(
             &self.workspace,
             &self.agents.rows,
-            self.area(),
+            rail,
             self.ui.sidebar.offset,
         );
         let Some(item) = super::super::sidebar::item_at(&layout, x, y) else {

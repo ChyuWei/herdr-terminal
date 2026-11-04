@@ -26,8 +26,8 @@ fn two_panes() -> (Workspace, PaneId, PaneId) {
     (workspace, first, second)
 }
 
-/// Snapshots each visible pane's VT with the same "hi" text, so golden rows
-/// show the terminal grid inside the border.
+/// Snapshots each drawn pane's VT with the same "hi" text, so the terminal
+/// grid inside the border is visible.
 fn render_ws(workspace: &Workspace, ui: &UiState, width: u16, height: u16) -> (Buffer, Render) {
     let area = Rect::new(0, 0, width, height);
     let rects = geometry::compute(workspace.active_tab(), area);
@@ -145,32 +145,48 @@ fn render_agents_theme(
         machines: &[],
         preview: None,
         files: None,
+        identity: None,
     };
     let rendered = render_with(&mut buffer, area, workspace, ui, &view);
     (buffer, rendered)
 }
 
+/// One pane on a narrow terminal: the pane-nav row, the identity row on the
+/// top border, the grid and the single bottom line. There is no tab bar, no
+/// brand header and no per-pane footer.
 #[test]
-fn a_single_pane_matches_the_hand_written_frame() {
+fn a_narrow_frame_is_the_pane_nav_above_one_framed_pane_and_one_bottom_line() {
     let (workspace, _) = one_pane();
     let (buffer, rendered) = render_ws(&workspace, &UiState::default(), 40, 12);
     let rows = lines(&buffer);
-    let blank_body = format!("│{}│", " ".repeat(38));
-    let expected = vec![
-        format!(" space 1 │ 1 tab 1{}", " ".repeat(22)),
-        format!("┌ t1 {}┐", "─".repeat(34)),
-        format!("│hi{}│", " ".repeat(36)),
-        blank_body.clone(),
-        blank_body.clone(),
-        blank_body.clone(),
-        blank_body.clone(),
-        blank_body.clone(),
-        blank_body.clone(),
-        blank_body,
-        format!("└{}┘", "─".repeat(38)),
-        format!(" space 1 / tab 1 / t1{}^b ? help", " ".repeat(10)),
-    ];
-    assert_eq!(rows, expected);
+    assert_eq!(
+        rows[0],
+        format!("01 t1{}", " ".repeat(35)),
+        "the pane-nav row names the pane without renumbering"
+    );
+    assert_eq!(
+        rows[1],
+        format!("┌› 01{}t1┐", " ".repeat(32)),
+        "the identity lives on the top border; the default name is shown once, on the right"
+    );
+    assert_eq!(rows[2], format!("│hi{}│", " ".repeat(36)));
+    for row in &rows[3..10] {
+        assert_eq!(row, &format!("│{}│", " ".repeat(38)));
+    }
+    assert_eq!(rows[10], format!("└{}┘", "─".repeat(38)));
+    assert!(
+        rows[11].starts_with(" NORMAL  t1"),
+        "the bottom line starts with the mode and the identity: {:?}",
+        rows[11]
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("tabs")),
+        "no tab bar is drawn: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("tab 1")),
+        "no tab chrome is drawn: {rows:?}"
+    );
     assert_eq!(
         rendered.focused,
         Some((workspace.focused_pane().unwrap(), Rect::new(1, 2, 38, 8)))
@@ -179,81 +195,312 @@ fn a_single_pane_matches_the_hand_written_frame() {
 }
 
 #[test]
-fn the_focused_border_is_highlighted_and_the_other_is_dim() {
+fn a_wide_terminal_puts_the_rail_left_and_the_panes_start_at_row_zero() {
+    let (workspace, _) = one_pane();
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 120, 40);
+    let rows = lines(&buffer);
+    assert!(rows[0].contains(" SPACES"), "{:?}", rows[0]);
+    assert_eq!(rows[0].chars().nth(29), Some('│'), "rail separator");
+    let pane_row: String = rows[0].chars().skip(30).collect();
+    assert!(
+        pane_row.starts_with('┌'),
+        "the pane area starts at row zero beside the rail: {:?}",
+        rows[0]
+    );
+    assert!(rows[0].contains("› 01"), "{:?}", rows[0]);
+    assert!(
+        rows[0].contains("t1┐"),
+        "the address is on the right: {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[39].as_bytes()[0],
+        b' ',
+        "the status row spans the rail"
+    );
+    assert!(rows[39].starts_with(" NORMAL  t1"), "{:?}", rows[39]);
+    assert!(
+        !rows.iter().any(|row| row.contains("tab 1")),
+        "no tab bar: {rows:?}"
+    );
+}
+
+#[test]
+fn the_focused_frame_and_header_are_mint_and_the_other_is_a_hairline() {
     let (workspace, first, second) = two_panes();
     assert_eq!(workspace.focused_pane(), Some(second));
-    let (buffer, rendered) = render_ws(&workspace, &UiState::default(), 40, 12);
+    let theme = Theme::default();
+    let (buffer, rendered) = render_ws(&workspace, &UiState::default(), 120, 20);
+    // Both panes are drawn wide: 01 at x=30 and 02 at x=76.
+    assert_eq!(buffer[(30, 0)].fg, theme.line, "unfocused frame");
+    assert_eq!(buffer[(76, 0)].fg, theme.accent, "focused frame is mint");
     assert_eq!(
-        buffer[(0, 1)].fg,
-        Color::Rgb(69, 71, 90),
-        "left pane, unfocused (surface1)"
+        buffer[(77, 0)].bg,
+        theme.active_bg,
+        "the focused header is a color block"
     );
     assert_eq!(
-        buffer[(21, 1)].fg,
-        Color::Rgb(137, 180, 250),
-        "right pane, focused (accent)"
+        buffer[(31, 0)].bg,
+        theme.panel_bg,
+        "the unfocused header stays quiet"
     );
-    assert_eq!(rendered.focused, Some((second, Rect::new(22, 2, 17, 8))));
+    assert!(
+        buffer[(79, 0)].modifier.contains(Modifier::BOLD),
+        "the focused number is bold"
+    );
+    assert_eq!(rendered.focused.map(|(pane, _)| pane), Some(second));
     let _ = first;
 }
 
 #[test]
-fn the_active_tab_uses_the_accent_block_and_the_others_stay_quiet() {
-    let (mut workspace, _) = one_pane();
-    add(&mut workspace, StartKind::Tab, "t2");
-    let (buffer, _) = render_ws(&workspace, &UiState::default(), 40, 12);
-    let row: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
-    let first = row.find("1 tab 1").expect("first tab") as u16;
-    let second = row.find("2 tab 2").expect("second tab") as u16;
-    assert_eq!(
-        buffer[(first, 0)].bg,
-        Color::Rgb(49, 50, 68),
-        "inactive tab uses surface0: {row:?}"
+fn the_pane_header_keeps_the_number_name_and_word_and_drops_the_address_first() {
+    let mut workspace = Workspace::new();
+    let request = workspace.start_request(StartKind::Initial);
+    let first = workspace.insert_terminal(&request, "t7".to_owned(), "build".to_owned());
+    workspace.set_title(first, "claude".into());
+    workspace.set_status(first, Some("blocked".into()));
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 60, 12);
+    let header = lines(&buffer)[1].clone();
+    assert!(header.contains("› 01 build: claude"), "{header:?}");
+    assert!(header.contains("blocked"), "{header:?}");
+    assert!(
+        header.contains(" t7"),
+        "the address is on the right: {header:?}"
     );
-    assert_eq!(
-        buffer[(first, 0)].fg,
-        Color::Rgb(166, 173, 200),
-        "inactive tab text is subtext0: {row:?}"
+
+    // A narrow pane drops the address, then the title detail, before the word.
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 24, 12);
+    let header = lines(&buffer)[1].clone();
+    assert!(header.contains("01 build"), "{header:?}");
+    assert!(header.contains("blocked"), "{header:?}");
+    assert!(
+        !header.contains("t7"),
+        "the address was dropped: {header:?}"
     );
     assert!(
-        !buffer[(first, 0)].modifier.contains(Modifier::REVERSED),
-        "inactive tab is not reversed: {row:?}"
-    );
-    assert_eq!(
-        buffer[(second, 0)].bg,
-        Color::Rgb(137, 180, 250),
-        "active tab uses the accent block: {row:?}"
-    );
-    assert_eq!(
-        buffer[(second, 0)].fg,
-        Color::Rgb(24, 24, 37),
-        "active tab text is panel_bg: {row:?}"
-    );
-    assert!(
-        buffer[(second, 0)].modifier.contains(Modifier::BOLD),
-        "active tab text is bold: {row:?}"
-    );
-    assert!(
-        !buffer[(second, 0)].modifier.contains(Modifier::REVERSED),
-        "no reversed row remains: {row:?}"
+        !header.contains("claude"),
+        "the detail was dropped: {header:?}"
     );
 }
 
 #[test]
-fn zoom_shows_only_the_focused_pane_with_the_bars_intact() {
-    let (mut workspace, _, second) = two_panes();
-    assert!(workspace.toggle_zoom());
-    let (buffer, rendered) = render_ws(&workspace, &UiState::default(), 40, 12);
-    let rows = lines(&buffer);
-    assert_eq!(
-        workspace.active_tab().and_then(|tab| tab.zoomed),
-        Some(second)
+fn a_narrow_header_never_hard_clips_the_name() {
+    // 16 columns: the full name still wins over the word and the address.
+    let mut workspace = Workspace::new();
+    let request = workspace.start_request(StartKind::Initial);
+    let first = workspace.insert_terminal(&request, "t1".to_owned(), "build".to_owned());
+    workspace.set_status(first, Some("idle".into()));
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 16, 12);
+    let header = lines(&buffer)[1].clone();
+    assert!(header.contains("› 01 build"), "{header:?}");
+    assert!(
+        !header.contains("buil ") && !header.contains("buil│"),
+        "the name is not cut before the border: {header:?}"
     );
-    assert!(rows[0].starts_with(" space 1 │ 1 tab 1"));
-    assert!(rows[1].starts_with("┌ t2 "));
-    assert!(!rows.iter().any(|row| row.contains("t1")), "{rows:?}");
-    assert!(rows[11].contains("^b ? help"));
-    assert_eq!(rendered.focused.map(|(pane, _)| pane), Some(second));
+
+    // 11 columns: the name no longer fits, so it ends with an ellipsis rather
+    // than being clipped at the rect edge.
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 11, 12);
+    let header = lines(&buffer)[1].clone();
+    assert!(header.contains("bui…"), "{header:?}");
+}
+
+#[test]
+fn a_header_label_that_exactly_fills_the_room_keeps_its_address() {
+    let mut workspace = Workspace::new();
+    let request = workspace.start_request(StartKind::Initial);
+    let first = workspace.insert_terminal(&request, "t7".to_owned(), "app".to_owned());
+    workspace.set_title(first, "ui".into());
+    // Inner width 15 = prefix 5 + gap 1 + address 2 + label 7 ("app: ui").
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 17, 12);
+    let header = lines(&buffer)[1].clone();
+    assert!(header.contains("› 01 app: ui"), "{header:?}");
+    assert_eq!(
+        header.matches("app: ui").count(),
+        1,
+        "the label is drawn once, undamaged: {header:?}"
+    );
+    assert!(header.contains("t7"), "the address still fits: {header:?}");
+}
+
+#[test]
+fn a_fresh_pane_shows_its_default_address_once() {
+    let (workspace, _) = one_pane();
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 120, 20);
+    let header = lines(&buffer)[0].clone();
+    assert!(header.contains("› 01"), "{header:?}");
+    assert_eq!(
+        header.matches("t1").count(),
+        1,
+        "the default name is the address and appears once: {header:?}"
+    );
+
+    // A custom name keeps its own identity beside the address.
+    let mut custom = Workspace::new();
+    let request = custom.start_request(StartKind::Initial);
+    custom.insert_terminal(&request, "t7".to_owned(), "build".to_owned());
+    let (buffer, _) = render_ws(&custom, &UiState::default(), 120, 20);
+    let header = lines(&buffer)[0].clone();
+    assert!(header.contains("› 01 build"), "{header:?}");
+    assert!(header.contains("t7"), "{header:?}");
+}
+
+#[test]
+fn the_pane_header_and_the_narrow_chip_use_the_agent_rows_derived_word() {
+    // Core reports `done`; the person has seen it, so the index calls it
+    // idle. The pane chrome must not disagree with the index.
+    let (mut workspace, first) = one_pane();
+    workspace.set_status(first, Some("done".into()));
+    let rows = vec![agent(
+        first,
+        "t1",
+        "idle",
+        Priority::Idle,
+        "Build",
+        "claude",
+    )];
+
+    let (buffer, _) = render_agents(&workspace, &UiState::default(), 120, 20, &rows);
+    let header = lines(&buffer)[0].clone();
+    assert!(header.contains("idle"), "{header:?}");
+    assert!(!header.contains("done"), "{header:?}");
+
+    let (buffer, _) = render_agents(&workspace, &UiState::default(), 60, 12, &rows);
+    let chip = lines(&buffer)[0].clone();
+    assert!(chip.contains("01 t1") && chip.contains("idle"), "{chip:?}");
+    assert!(!chip.contains("done"), "{chip:?}");
+}
+
+#[test]
+fn an_exited_pane_shows_the_client_fact_and_never_invents_status() {
+    let (mut workspace, first) = one_pane();
+    workspace.mark_finished(first, 3);
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 60, 12);
+    let header = lines(&buffer)[1].clone();
+    assert!(header.contains("exited 3"), "{header:?}");
+    assert_eq!(
+        buffer[(header.find("exited").expect("fact") as u16, 1)].fg,
+        Color::Rgb(0xdc, 0x92, 0x92),
+        "the exit fact is red"
+    );
+    assert!(
+        !header.contains("SHELL") && !header.contains("idle"),
+        "no status is invented: {header:?}"
+    );
+}
+
+#[test]
+fn the_bottom_line_follows_the_focused_pane_without_a_runtime_identity() {
+    // `render` leaves View.identity empty (a bare frame), so the status line
+    // must derive from the same-frame focused pane rather than any other one.
+    let (workspace, first, second) = two_panes();
+    assert_eq!(workspace.focused_pane(), Some(second));
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 80, 12);
+    let rows = lines(&buffer);
+    assert!(rows[1].contains("› 02"), "focused header: {:?}", rows[1]);
+    assert!(
+        rows[0].contains("02 t2"),
+        "the chip row names the focused pane: {:?}",
+        rows[0]
+    );
+    let bottom = rows[11].clone();
+    assert!(
+        bottom.starts_with(" NORMAL  t2"),
+        "the fallback identity follows the focused pane: {bottom:?}"
+    );
+    assert!(
+        !bottom.contains("t1"),
+        "the bottom line never names the unfocused pane: {bottom:?}"
+    );
+
+    let mut workspace = workspace;
+    assert!(workspace.focus_pane(first));
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 80, 12);
+    let bottom = lines(&buffer)[11].clone();
+    assert!(bottom.starts_with(" NORMAL  t1"), "{bottom:?}");
+}
+
+#[test]
+fn the_bottom_line_carries_the_mode_the_identity_and_the_hints() {
+    let (workspace, first) = one_pane();
+    let theme = Theme::default();
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 120, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.starts_with(" NORMAL  t1"), "{row:?}");
+    assert!(row.contains("^b a rail"), "{row:?}");
+    assert!(row.contains("^b z zoom"), "{row:?}");
+    assert!(row.contains("^b ? help"), "{row:?}");
+    assert!(
+        !row.contains("space 1"),
+        "no active space repetition: {row:?}"
+    );
+    assert!(!row.contains("tab 1"), "no tab name repetition: {row:?}");
+    assert_eq!(buffer[(0, 11)].bg, theme.accent, "the mode chip is accent");
+    assert_eq!(buffer[(0, 11)].fg, theme.panel_bg);
+    assert!(buffer[(0, 11)].modifier.contains(Modifier::BOLD));
+
+    let ui = UiState {
+        prefix: true,
+        ..UiState::default()
+    };
+    let (buffer, _) = render_ws(&workspace, &ui, 120, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.starts_with(" PREFIX  t1"), "{row:?}");
+    assert!(row.contains("esc cancel"), "{row:?}");
+    let mut ui = UiState {
+        selecting: Some(first),
+        ..UiState::default()
+    };
+    let (buffer, _) = render_ws(&workspace, &ui, 120, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.starts_with(" COPY  t1"), "{row:?}");
+    assert!(row.contains("y copy"), "{row:?}");
+    ui.selecting = None;
+    ui.resize = true;
+    let (buffer, _) = render_ws(&workspace, &ui, 120, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.starts_with(" RESIZE  t1"), "{row:?}");
+    assert!(row.contains("h/l width"), "{row:?}");
+
+    // A zoomed tab names ZOOM; no mode strip exists to overwrite a pane row.
+    let (mut workspace, _) = one_pane();
+    add(&mut workspace, StartKind::Split(Axis::Columns), "t2");
+    assert!(workspace.toggle_zoom());
+    let (buffer, _) = render_ws(&workspace, &UiState::default(), 120, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.starts_with(" ZOOM"), "{row:?}");
+    assert!(row.contains("unzoom"), "{row:?}");
+    assert!(
+        lines(&buffer)[10].chars().nth(30) == Some('└'),
+        "the pane keeps its row"
+    );
+}
+
+#[test]
+fn the_bottom_line_keeps_the_mode_and_identity_at_eighty_columns_and_drops_hints() {
+    let (workspace, _) = one_pane();
+    let mut ui = UiState {
+        message: Some("left t7 running (hc attach t7) · a long transient notice".into()),
+        ..UiState::default()
+    };
+    let (buffer, _) = render_ws(&workspace, &ui, 80, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.starts_with(" NORMAL  t1"), "{row:?}");
+    assert!(
+        row.contains("left t7 running"),
+        "the message stays: {row:?}"
+    );
+    assert!(
+        !row.contains("^b a rail") && !row.contains("^b z zoom"),
+        "the hints are the first thing truncated: {row:?}"
+    );
+
+    ui.message = None;
+    ui.connection = Connection::Reconnecting { attempt: 2 };
+    let (buffer, _) = render_ws(&workspace, &ui, 80, 12);
+    let row = lines(&buffer)[11].clone();
+    assert!(row.starts_with(" NORMAL  t1"), "{row:?}");
+    assert!(row.contains("reconnecting (attempt 2)"), "{row:?}");
 }
 
 #[test]
@@ -270,16 +517,12 @@ fn an_empty_workspace_says_how_to_start() {
         rows.iter().any(|row| row.contains("prefix v: new pane")),
         "{rows:?}"
     );
-    assert!(
-        rows.iter().any(|row| row.contains("prefix c: new tab")),
-        "{rows:?}"
-    );
-    assert!(rows[11].contains("space 1 / tab 1 / empty"));
+    assert!(rows[11].starts_with(" NORMAL  empty"), "{:?}", rows[11]);
     assert_eq!(rendered.focused, None);
 }
 
 #[test]
-fn the_rename_prompt_replaces_the_status_bar_and_places_the_cursor() {
+fn the_rename_prompt_replaces_the_bottom_line_and_places_the_cursor() {
     let (workspace, _) = one_pane();
     let space = workspace.active_space_id();
     let tab = workspace.active_tab_id().expect("tab");
@@ -291,7 +534,7 @@ fn the_rename_prompt_replaces_the_status_bar_and_places_the_cursor() {
     let rows = lines(&buffer);
     assert!(rows[11].contains("rename tab: tab 1"), "{rows:?}");
     assert_eq!(rendered.prompt_cursor, Some((17, 11)));
-    assert!(!rows[11].contains("^b ? help"));
+    assert!(!rows[11].contains("NORMAL"));
 
     let prompt = ui.prompt.as_mut().expect("prompt");
     prompt.edit(crate::workspace::state::Edit::Home);
@@ -300,75 +543,31 @@ fn the_rename_prompt_replaces_the_status_bar_and_places_the_cursor() {
 }
 
 #[test]
-fn help_is_an_overlay_listing_the_prefix_keys() {
+fn help_names_the_rail_drawer_and_the_tab_selector() {
     let (workspace, _) = one_pane();
     let ui = UiState {
         help: true,
         ..UiState::default()
     };
-    let (buffer, rendered) = render_ws(&workspace, &ui, 100, 30);
+    let (buffer, rendered) = render_ws(&workspace, &ui, 100, 40);
     let text = lines(&buffer).join("\n");
-    assert!(text.contains("help"), "{text}");
     assert!(text.contains("prefix Ctrl-b"), "{text}");
-    assert!(text.contains("e keep + close") && text.contains("X kill + close"));
-    assert!(text.contains("a sidebar") && text.contains("i peek agent"));
-    assert!(text.contains("g/G next/prev agent"));
-    assert!(text.contains("sidebar: j/k move") && text.contains("p pin / unpin"));
-    assert!(text.contains("r resize mode") && text.contains("h/l width"));
-    assert!(text.contains(": palette") && text.contains("f search scrollback"));
-    assert!(text.contains("selection: drag or h/j/k/l"));
-    assert!(text.contains("Shift-PgUp/PgDn scroll history"));
-    assert!(text.contains("drag a split gap to resize"));
+    assert!(
+        text.contains("switch layout/tab (compatibility)"),
+        "the old multi-tab path is discoverable: {text}"
+    );
+    assert!(text.contains("a rail / drawer"), "{text}");
+    assert!(text.contains("rail: j/k move"), "{text}");
+    assert!(text.contains("tabs: j/k move"), "{text}");
+    assert!(text.contains("resize mode (wide and unzoomed)"), "{text}");
+    assert!(text.contains("narrow: prefix a"), "{text}");
     assert!(text.contains("any key closes help"));
     assert_eq!(rendered.focused, None);
-    assert_eq!(rendered.prompt_cursor, None);
 }
 
 #[test]
-fn the_status_bar_shows_the_focused_title_status_and_message() {
-    let (mut workspace, first) = one_pane();
-    workspace.set_title(first, "vim".into());
-    workspace.set_status(first, Some("working".into()));
-    let (buffer, _) = render_ws(&workspace, &UiState::default(), 60, 12);
-    let row: String = (0..60).map(|x| buffer[(x, 11)].symbol()).collect();
-    assert!(
-        row.contains("space 1 / tab 1 / t1 · vim [working]"),
-        "{row:?}"
-    );
-
-    let mut ui = UiState {
-        message: Some("left t7 running (hc attach t7)".into()),
-        ..UiState::default()
-    };
-    let (buffer, _) = render_ws(&workspace, &ui, 60, 12);
-    let row: String = (0..60).map(|x| buffer[(x, 11)].symbol()).collect();
-    assert!(row.contains("left t7 running"), "{row:?}");
-
-    ui.message = None;
-    ui.prefix = true;
-    let (buffer, _) = render_ws(&workspace, &ui, 60, 12);
-    let strip: String = (0..60).map(|x| buffer[(x, 10)].symbol()).collect();
-    assert!(strip.contains(" PREFIX "), "{strip:?}");
-    assert!(
-        strip.contains("esc cancel") && strip.contains("^b send prefix"),
-        "{strip:?}"
-    );
-    let row: String = (0..60).map(|x| buffer[(x, 11)].symbol()).collect();
-    assert!(
-        !row.contains("prefix ^b…"),
-        "the old status-right hint left the status bar: {row:?}"
-    );
-
-    ui.prefix = false;
-    ui.connection = Connection::Reconnecting { attempt: 2 };
-    let (buffer, _) = render_ws(&workspace, &ui, 120, 12);
-    let row: String = (0..120).map(|x| buffer[(x, 11)].symbol()).collect();
-    assert!(row.contains("reconnecting (attempt 2)"), "{row:?}");
-}
-
-#[test]
-fn the_sidebar_lists_spaces_and_agents_with_status_colors() {
-    let (mut workspace, first, second) = two_panes();
+fn the_rail_lists_spaces_then_the_cross_space_agent_index() {
+    let (workspace, first, second) = two_panes();
     let mut rows = vec![
         agent(first, "t1", "blocked", Priority::Blocked, "Build", "claude"),
         agent(second, "t2", "done", Priority::Done, "Review", "codex"),
@@ -378,103 +577,75 @@ fn the_sidebar_lists_spaces_and_agents_with_status_colors() {
     let mut ui = UiState::default();
     ui.sidebar.open = true;
     ui.sidebar.selected = Some(crate::workspace::sidebar::Item::Agent(second));
-    let (buffer, rendered) = render_agents(&workspace, &ui, 80, 14, &rows);
+    let (buffer, rendered) = render_agents(&workspace, &ui, 120, 14, &rows);
     let text = lines(&buffer);
-    assert!(text[0].starts_with(" spaces"), "{text:?}");
-    assert!(text[1].contains("● 1 space 1"), "{text:?}");
-    assert!(text[2].starts_with(" agents"), "{text:?}");
-    assert!(text[3].contains("* Review done"), "{text:?}");
-    assert!(text[4].contains("Build blocked"), "{text:?}");
+    assert!(text[0].starts_with(" SPACES"), "{text:?}");
+    assert!(text[1].contains("01 space 1"), "{text:?}");
+    assert!(text[1].contains("1 tab"), "{text:?}");
+    assert!(
+        text[2].starts_with('─'),
+        "the section rule sits between SPACES and AGENTS: {text:?}"
+    );
+    assert!(text[3].starts_with(" AGENTS"), "{text:?}");
+    assert!(
+        text[4].contains("1 blocked") && text[4].contains("1 done unread"),
+        "the attention summary: {text:?}"
+    );
+    assert!(text[5].contains("* Review"), "{text:?}");
+    assert!(text[5].contains("done"), "{text:?}");
+    assert!(text[6].contains("space 1 · t2"), "row detail: {text:?}");
+    assert!(text[7].contains("Build"), "{text:?}");
+    assert!(text[7].contains("blocked"), "{text:?}");
+    assert!(
+        text[12].starts_with(" ^b a navigate · Enter jump"),
+        "the pinned footer: {text:?}"
+    );
+    assert!(text[13].starts_with(" NORMAL"), "the bottom line: {text:?}");
     assert_eq!(rendered.focused, None);
     assert_eq!(rendered.prompt_cursor, None);
+    assert_eq!(rendered.prompt_cursor, None);
 
-    // The active space is an accent label; headers are quiet overlay0.
-    let active = text[1].find('●').expect("active marker") as u16;
-    assert_eq!(buffer[(active, 1)].fg, Color::Rgb(137, 180, 250));
-    assert!(buffer[(active, 1)].modifier.contains(Modifier::BOLD));
-    assert_eq!(buffer[(1, 0)].fg, Color::Rgb(108, 112, 134));
-
-    // Core-reported words keep their colors; the selected agent row uses
-    // surface0 and keeps its word color.
-    let done = text[3].find("done").expect("done word") as u16;
-    let blocked = text[4].find("blocked").expect("blocked word") as u16;
-    assert_eq!(buffer[(done, 3)].fg, Color::Rgb(148, 226, 213));
-    assert_eq!(buffer[(blocked, 4)].fg, Color::Rgb(243, 139, 168));
-    let review = text[3].find("Review").expect("selected row") as u16;
-    let build = text[4].find("Build").expect("unselected row") as u16;
-    assert_eq!(
-        buffer[(review, 3)].bg,
-        Color::Rgb(49, 50, 68),
-        "the selected agent row uses surface0"
-    );
-    assert_eq!(
-        buffer[(build, 4)].bg,
-        Color::Rgb(24, 24, 37),
-        "the other agent row keeps the panel background"
+    // The active space is mint on its active background, with a left edge.
+    let active = text[1].find('▌').expect("active marker") as u16;
+    assert_eq!(buffer[(active, 1)].fg, Color::Rgb(0x9d, 0xdb, 0xc6));
+    assert_eq!(buffer[(active, 1)].bg, Color::Rgb(0x27, 0x3e, 0x36));
+    assert!(
+        buffer[(active + 2, 1)].modifier.contains(Modifier::BOLD),
+        "the active space name is bold"
     );
 
-    // A selected space row is also surface0, even when it is not active. The
-    // new space becomes active, so space 1 stays listed but loses the accent
-    // and the active marker.
-    let _second_space = add(&mut workspace, StartKind::Space, "s2");
-    let first_space = workspace.spaces()[0].id;
-    ui.sidebar.selected = Some(crate::workspace::sidebar::Item::Space(first_space));
-    let (buffer, _) = render_agents(&workspace, &ui, 80, 14, &rows);
-    let space = lines(&buffer)[1].find("space 1").expect("space row") as u16;
-    assert_eq!(buffer[(space, 1)].bg, Color::Rgb(49, 50, 68));
-    assert_eq!(
-        buffer[(space, 1)].fg,
-        Color::Rgb(205, 214, 244),
-        "a selected non-active space is not drawn as active"
-    );
-    assert_eq!(
-        buffer[(1, 1)].symbol(),
-        " ",
-        "the selected non-active space has no active marker"
-    );
+    // Core-reported words keep their role colors.
+    let done = text[5].find("done").expect("done word") as u16;
+    let blocked = text[7].find("blocked").expect("blocked word") as u16;
+    assert_eq!(buffer[(done, 5)].fg, Color::Rgb(0x9d, 0xdb, 0xc6));
+    assert_eq!(buffer[(blocked, 7)].fg, Color::Rgb(0xe6, 0xbd, 0x7c));
 }
 
 #[test]
-fn the_terminal_theme_reverses_sidebar_selections() {
-    let (mut workspace, first, second) = two_panes();
-    let rows = vec![
-        agent(first, "t1", "working", Priority::Working, "Build", "claude"),
-        agent(second, "t2", "done", Priority::Done, "Review", "codex"),
-    ];
+fn a_sidebars_folder_line_is_only_drawn_when_the_space_has_one() {
+    let (mut workspace, first) = one_pane();
+    let space = workspace.spaces()[0].id;
+    let rows = vec![agent(
+        first,
+        "t1",
+        "idle",
+        Priority::Idle,
+        "Build",
+        "claude",
+    )];
     let mut ui = UiState::default();
     ui.sidebar.open = true;
-    ui.sidebar.selected = Some(crate::workspace::sidebar::Item::Agent(first));
-    let (buffer, _) = render_agents_theme(&workspace, &ui, 80, 14, &rows, Theme::terminal());
-    let text = lines(&buffer);
-    let build = text[3].find("Build").expect("selected row") as u16;
-    let review = text[4].find("Review").expect("other row") as u16;
-    assert!(
-        buffer[(build, 3)].modifier.contains(Modifier::REVERSED),
-        "the terminal theme left the selected agent without a cue: {:?}",
-        buffer[(build, 3)]
-    );
-    assert!(
-        !buffer[(review, 4)].modifier.contains(Modifier::REVERSED),
-        "an unselected agent was reversed: {:?}",
-        buffer[(review, 4)]
-    );
-
-    // A selected non-active space also reverses instead of disappearing on a
-    // reset background.
-    let _second_space = add(&mut workspace, StartKind::Space, "s2");
-    let first_space = workspace.spaces()[0].id;
-    ui.sidebar.selected = Some(crate::workspace::sidebar::Item::Space(first_space));
-    let (buffer, _) = render_agents_theme(&workspace, &ui, 80, 14, &rows, Theme::terminal());
-    let space = lines(&buffer)[1].find("space 1").expect("space row") as u16;
-    assert!(
-        buffer[(space, 1)].modifier.contains(Modifier::REVERSED),
-        "the terminal theme left the selected space without a cue: {:?}",
-        buffer[(space, 1)]
-    );
+    let (buffer, _) = render_agents(&workspace, &ui, 120, 14, &rows);
+    let text = lines(&buffer).join("\n");
+    assert!(!text.contains("cwd"), "no empty path line: {text}");
+    workspace.set_space_folder(space, "/work/herdr");
+    let (buffer, _) = render_agents(&workspace, &ui, 120, 14, &rows);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("/work/herdr"), "the folder line: {text}");
 }
 
 #[test]
-fn a_narrow_terminal_hides_the_sidebar() {
+fn a_narrow_terminal_hides_the_rail_and_shows_the_pane_nav() {
     let (workspace, first, _) = two_panes();
     let rows = vec![agent(
         first,
@@ -487,111 +658,273 @@ fn a_narrow_terminal_hides_the_sidebar() {
     let (buffer, _) = render_agents(&workspace, &UiState::default(), 60, 12, &rows);
     let text = lines(&buffer);
     assert!(
-        !text.iter().any(|row| row.starts_with(" spaces")),
-        "no sidebar below 70 columns: {text:?}"
+        !text.iter().any(|row| row.contains(" SPACES")),
+        "no rail below 90 columns: {text:?}"
     );
-    assert!(!text.iter().any(|row| row.contains("Review")), "{text:?}");
-    assert!(text[0].starts_with(" space 1 "), "{text:?}");
+    assert!(
+        text[0].contains("01 t1") && text[0].contains("02 t2"),
+        "the pane-nav maps every pane: {text:?}"
+    );
+    assert!(
+        text[0].contains("01 t1"),
+        "the focused pane keeps its tree number: {text:?}"
+    );
 }
 
 #[test]
-fn agent_rows_budget_the_status_word_by_display_columns() {
-    let (workspace, first, second) = two_panes();
+fn the_narrow_drawer_draws_the_same_rail_over_the_panes() {
+    let (workspace, first, _) = two_panes();
+    let rows = vec![agent(
+        first,
+        "t1",
+        "done",
+        Priority::Done,
+        "Review",
+        "codex",
+    )];
+    let mut ui = UiState::default();
+    ui.sidebar.open = true;
+    let (buffer, _) = render_agents(&workspace, &ui, 60, 12, &rows);
+    let text = lines(&buffer);
+    assert!(
+        text[0].starts_with(" SPACES"),
+        "the drawer is the rail: {text:?}"
+    );
+    assert!(text[1].contains("space 1"), "{text:?}");
+    assert!(
+        text[0].chars().nth(19) == Some('│'),
+        "the drawer keeps the separator: {:?}",
+        text[0]
+    );
+    // The drawer ends above the bottom line, so its pinned footer is visible
+    // while the status row keeps its own hint.
+    assert!(
+        text[10].contains("navigate"),
+        "the drawer footer is painted above the status row: {text:?}"
+    );
+    assert!(
+        text[11].contains("rail · j/k move"),
+        "the status row keeps the drawer hint: {text:?}"
+    );
+    assert!(
+        !text[11].contains("navigate"),
+        "the status row does not overwrite the drawer footer: {text:?}"
+    );
+    // The panes were not shrunk: the pane-nav and workspace still span the
+    // whole width behind the drawer.
+    let rects = geometry::compute(workspace.active_tab(), Rect::new(0, 0, 60, 12));
+    assert_eq!(rects.workspace, Rect::new(0, 1, 60, 10));
+    assert_eq!(rects.pane_nav.width, 60);
+}
+
+#[test]
+fn the_narrow_drawer_clears_the_pane_and_clips_every_line() {
+    let (workspace, pane) = one_pane();
+    let area = Rect::new(0, 0, 80, 24);
+    let rects = geometry::compute(workspace.active_tab(), area);
+    let inner = geometry::inner(rects.pane(pane).expect("pane")).expect("inner");
+    let mut vt = Vt::new(inner.width, inner.height).expect("vt");
+    // A busy pane: a sentinel glyph, a wide character and a full-width fill.
+    // Any surviving pane cell inside the drawer is unmistakable.
+    let mut text = String::new();
+    for _ in 0..inner.height {
+        text.push('X');
+        text.push('漢');
+        text.push_str(&"X".repeat(usize::from(inner.width).saturating_sub(3)));
+        text.push_str("\r\n");
+    }
+    vt.feed(text.as_bytes());
+    let mut screens = BTreeMap::new();
+    screens.insert(pane, vt.snapshot().expect("snapshot"));
+    let theme = Theme::default();
+    let mut ui = UiState::default();
+    ui.sidebar.open = true;
+    // Two long agent rows exercise the clipped agent lines and right-aligned
+    // status words inside the drawer.
     let rows = vec![
         agent(
-            first,
+            pane,
             "t1",
-            "working",
-            Priority::Working,
-            "Building the UI",
+            "blocked",
+            Priority::Blocked,
+            "feature-authentication-build",
             "claude",
         ),
         agent(
-            second,
+            PaneId(999),
             "t2",
             "working",
             Priority::Working,
-            "Building",
-            "claude",
+            "another-very-long-agent-title",
+            "codex",
         ),
     ];
-    let (buffer, _) = render_agents(&workspace, &UiState::default(), 80, 14, &rows);
-    let text = lines(&buffer);
-    // The sidebar content is 19 cells at 80 columns; the 20th is the
-    // separator. The full word must fit, so the name gets 8 cells.
-    assert_eq!(
-        text[3].chars().take(19).collect::<String>(),
-        "   Buildin… working"
-    );
-    assert_eq!(
-        text[4].chars().take(19).collect::<String>(),
-        "   Building working",
-        "a title that exactly fits is not truncated"
-    );
-    for y in [3, 4] {
+    let view = View {
+        screens: &screens,
+        rows: &rows,
+        theme: &theme,
+        ..View::default()
+    };
+    let mut buffer = Buffer::empty(area);
+    render_with(&mut buffer, area, &workspace, &ui, &view);
+
+    let drawer = crate::workspace::sidebar::drawer_rect(area);
+    let separator = drawer.x + drawer.width - 1;
+    assert_eq!(separator, 19);
+    for y in drawer.y..drawer.y + drawer.height {
         assert_eq!(
-            buffer[(19, y)].symbol(),
+            buffer[(separator, y)].symbol(),
             "│",
-            "row {y} crossed the separator"
+            "row {y} keeps its separator"
         );
-        assert_eq!(buffer[(18, y)].symbol(), "g", "row {y} lost the word tail");
+        for x in drawer.x..separator {
+            let symbol = buffer[(x, y)].symbol();
+            assert!(
+                symbol != "X" && symbol != "漢",
+                "the drawer left a pane glyph at ({x},{y}): {symbol:?}"
+            );
+        }
     }
+    // The footer is the last drawer row (the status row is below the drawer),
+    // and it is ellipsized inside the content width.
+    let footer = lines(&buffer)[usize::from(drawer.height - 1)].clone();
+    assert!(footer.contains('…'), "the footer is ellipsized: {footer:?}");
+    assert_eq!(
+        footer.chars().nth(usize::from(separator)),
+        Some('│'),
+        "the footer stays inside the content width: {footer:?}"
+    );
+
+    // The wide rail uses the same drawing path and is unchanged: it sits left
+    // of the panes, keeps its separator and never touches pane content.
+    let mut wide_ui = UiState::default();
+    wide_ui.sidebar.open = true;
+    let (wide_buffer, _) = render_ws(&workspace, &wide_ui, 120, 40);
+    for y in 0..39 {
+        assert_eq!(wide_buffer[(29, y)].symbol(), "│", "wide separator row {y}");
+    }
+    assert!(lines(&wide_buffer)[0].contains(" SPACES"));
+    assert_eq!(
+        wide_buffer[(30, 0)].symbol(),
+        "┌",
+        "the pane starts after the rail"
+    );
 }
 
 #[test]
-fn wide_titles_keep_the_status_word_inside_the_panel() {
+fn the_tab_selector_lists_the_active_spaces_tabs_and_marks_the_active_one() {
+    let (mut workspace, _) = one_pane();
+    add(&mut workspace, StartKind::Tab, "t2");
+    add(&mut workspace, StartKind::Tab, "t3");
+    let space = workspace.active_space_id();
+    let ui = UiState {
+        tabs: Some(crate::workspace::state::TabsState { space, selected: 2 }),
+        ..UiState::default()
+    };
+    let (buffer, rendered) = render_ws(&workspace, &ui, 80, 20);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains(" tabs ·"), "{text}");
+    assert!(text.contains("3 tabs"), "{text}");
+    assert!(text.contains("1  tab 1"), "{text}");
+    assert!(text.contains("2  tab 2"), "{text}");
+    assert!(text.contains("3  tab 3"), "{text}");
+    assert!(text.contains("1 pane"), "{text}");
+    assert!(
+        text.contains("● 3  tab 3"),
+        "the active tab is marked: {text}"
+    );
+    assert!(text.contains("Enter switch"), "{text}");
+    assert_eq!(rendered.focused, None);
+    assert_eq!(rendered.prompt_cursor, None);
+}
+
+#[test]
+fn the_tab_selector_hint_ends_inside_the_popup_border() {
+    let (mut workspace, _) = one_pane();
+    add(&mut workspace, StartKind::Tab, "t2");
+    let space = workspace.active_space_id();
+    let ui = UiState {
+        tabs: Some(crate::workspace::state::TabsState { space, selected: 2 }),
+        ..UiState::default()
+    };
+    // The popup geometry draw_tabs uses: width min(area - 4, 64), centered,
+    // one row below the top; its first inner row is the hint.
+    let popup = |width: u16| {
+        let popup_width = width.saturating_sub(4).min(64);
+        let x = width.saturating_sub(popup_width) / 2;
+        (x, popup_width, 2u16)
+    };
+    let inner_text = |row: &str, x: u16, popup_width: u16| -> String {
+        row.chars()
+            .skip(usize::from(x) + 1)
+            .take(usize::from(popup_width) - 2)
+            .collect()
+    };
+
+    for width in [120, 80] {
+        let (buffer, _) = render_ws(&workspace, &ui, width, 20);
+        let (x, popup_width, y) = popup(width);
+        let row = lines(&buffer)[usize::from(y)].clone();
+        let right = usize::from(x + popup_width - 1);
+        assert_eq!(
+            row.chars().nth(right),
+            Some('│'),
+            "the popup border closes the row at {width}: {row:?}"
+        );
+        assert_eq!(
+            row.chars().nth(right - 1),
+            Some(' '),
+            "the hint ends inside the border at {width}: {row:?}"
+        );
+        let inner = inner_text(&row, x, popup_width);
+        assert!(
+            inner.contains("Esc close"),
+            "the hint is complete at {width}: {inner:?}"
+        );
+        assert!(!inner.contains('…'), "the hint fits at {width}: {inner:?}");
+    }
+
+    // A narrow popup ellipsizes the hint instead of cutting it at the border.
+    let width = 40;
+    let (buffer, _) = render_ws(&workspace, &ui, width, 20);
+    let (x, popup_width, y) = popup(width);
+    let row = lines(&buffer)[usize::from(y)].clone();
+    let right = usize::from(x + popup_width - 1);
+    assert_eq!(row.chars().nth(right), Some('│'), "{row:?}");
+    let inner = inner_text(&row, x, popup_width);
+    assert!(
+        inner.ends_with('…'),
+        "the narrow hint is ellipsized at the inner edge: {inner:?}"
+    );
+}
+
+#[test]
+fn wide_titles_keep_the_status_word_inside_the_rail() {
     let (workspace, first) = one_pane();
     let rows = vec![agent(
         first,
         "t1",
         "working",
         Priority::Working,
-        "构建界面现在",
+        "构建界面现在非常长的一个标题",
         "claude",
     )];
-    let (buffer, _) = render_agents(&workspace, &UiState::default(), 80, 14, &rows);
+    let mut ui = UiState::default();
+    ui.sidebar.open = true;
+    let (buffer, _) = render_agents(&workspace, &ui, 120, 14, &rows);
     let text = lines(&buffer).join("\n");
-    assert!(
-        text.contains('…'),
-        "the wide title was not truncated: {text}"
-    );
+    assert!(text.contains('…'), "the title was truncated: {text}");
     assert!(text.contains("working"), "the status word was lost: {text}");
+    let row = lines(&buffer)
+        .into_iter()
+        .find(|row| row.chars().take(29).collect::<String>().contains("working"))
+        .expect("agent row");
     assert_eq!(
-        buffer[(19, 3)].symbol(),
-        "│",
-        "the row crossed the separator: {text}"
+        row.chars().nth(29),
+        Some('│'),
+        "the row crossed the separator"
     );
-    let start = (0..19)
-        .find(|x| buffer[(*x, 3)].symbol() == "w")
-        .expect("status word");
-    for (offset, ch) in "working".chars().enumerate() {
-        assert_eq!(
-            buffer[(start + offset as u16, 3)].symbol(),
-            ch.to_string(),
-            "the status word is clipped: {text}"
-        );
-    }
-    assert!(start + 7 <= 19, "the word ends past the content: {text}");
-    let ellipsis = (0..19)
-        .find(|x| buffer[(*x, 3)].symbol() == "…")
-        .expect("ellipsis");
-    assert!(
-        ellipsis <= 11,
-        "the name budget exceeded its columns at cell {ellipsis}: {text}"
-    );
-}
-
-#[test]
-fn the_status_bar_shows_agent_turn_pin_and_seen_state() {
-    let (workspace, pane) = one_pane();
-    let rows = vec![agent(pane, "t1", "done", Priority::Done, "Review", "codex")];
-    let ui = UiState::default();
-    let (buffer, _) = render_agents(&workspace, &ui, 120, 12, &rows);
-    let row: String = (0..120).map(|x| buffer[(x, 11)].symbol()).collect();
-    assert!(row.contains("[done] · turn 4 · pinned · unseen"), "{row:?}");
-    assert!(row.contains("codex"), "{row:?}");
-    assert!(row.contains("1 done"), "attention count: {row:?}");
-    assert!(row.contains("^b ? help"), "{row:?}");
+    assert!(row.chars().take(29).collect::<String>().contains("working"));
 }
 
 #[test]
@@ -658,6 +991,22 @@ fn the_palette_filters_the_command_table_and_shows_key_hints() {
 }
 
 #[test]
+fn the_palette_names_the_tab_selector_as_the_compatibility_path() {
+    let (workspace, _) = one_pane();
+    let ui = UiState {
+        palette: Some(PaletteState {
+            line: Line::new("layout"),
+            ..PaletteState::default()
+        }),
+        ..UiState::default()
+    };
+    let (buffer, _) = render_ws(&workspace, &ui, 100, 30);
+    let text = lines(&buffer).join("\n");
+    assert!(text.contains("switch layout/tab (compatibility)"), "{text}");
+    assert!(text.contains("^b T"), "{text}");
+}
+
+#[test]
 fn the_palette_says_when_nothing_matches() {
     let (workspace, _) = one_pane();
     let state = PaletteState {
@@ -694,13 +1043,13 @@ fn the_search_bar_shows_the_query_and_match_counts() {
         "{row:?}"
     );
     assert!(
-        !row.contains("^b ? help"),
-        "the search bar owns the status row"
+        !row.contains("^b a rail"),
+        "the search bar owns the bottom line"
     );
     assert_eq!(
         rendered.prompt_cursor,
-        Some((31, 11)),
-        "after the sidebar, ' search: ' and the two-char query"
+        Some((11, 11)),
+        "after ' search: ' and the two-char query"
     );
     assert_eq!(rendered.focused, None);
 }
@@ -716,11 +1065,7 @@ fn the_search_bar_reports_progress_and_an_empty_query() {
     let (buffer, rendered) = render_ws(&workspace, &ui, 80, 12);
     let row = lines(&buffer)[11].clone();
     assert!(row.contains("type to search scrollback"), "{row:?}");
-    assert_eq!(
-        rendered.prompt_cursor,
-        Some((29, 11)),
-        "after the sidebar and ' search: '"
-    );
+    assert_eq!(rendered.prompt_cursor, Some((9, 11)), "after ' search: '");
 
     let mut search = SearchState::new(pane);
     search.line = Line::new("needle");
@@ -756,6 +1101,7 @@ fn a_local_selection_paints_its_cells_with_the_theme_selection_color() {
         machines: &[],
         preview: None,
         files: None,
+        identity: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
@@ -768,9 +1114,9 @@ fn a_local_selection_paints_its_cells_with_the_theme_selection_color() {
 }
 
 #[test]
-fn the_scroll_hint_replaces_the_idle_status_hint() {
+fn the_scroll_hint_replaces_the_context_hints_and_survives_a_narrow_line() {
     let (workspace, _) = one_pane();
-    let area = Rect::new(0, 0, 80, 12);
+    let area = Rect::new(0, 0, 120, 12);
     let rects = geometry::compute(workspace.active_tab(), area);
     let mut screens = BTreeMap::new();
     let inner = geometry::inner(rects.panes[0].1).expect("inner");
@@ -788,18 +1134,69 @@ fn the_scroll_hint_replaces_the_idle_status_hint() {
         machines: &[],
         preview: None,
         files: None,
+        identity: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
     let row = lines(&buffer)[11].clone();
     assert!(row.contains("scroll 2/18"), "{row:?}");
     assert!(row.contains("Shift-PgDn live"), "{row:?}");
+    assert!(
+        !row.contains("^b a rail"),
+        "the scroll position replaces the hints: {row:?}"
+    );
+
+    // At 80 columns the identity fills most of the line; the scroll position
+    // is truncated but still says the view is not live.
+    let area = Rect::new(0, 0, 80, 12);
+    let rects = geometry::compute(workspace.active_tab(), area);
+    let mut screens = BTreeMap::new();
+    let inner = geometry::inner(rects.panes[0].1).expect("inner");
+    let mut vt = Vt::new(inner.width, inner.height).expect("vt");
+    vt.feed(b"hi");
+    screens.insert(rects.panes[0].0, vt.snapshot().expect("snapshot"));
+    let view = View {
+        screens: &screens,
+        scroll_hint: Some("scroll 2/18 · Shift-PgDn live"),
+        identity: Some("t1 · claude · /Users/changyu/Project/herdr/herdr-terminal"),
+        ..view
+    };
+    let mut buffer = Buffer::empty(area);
+    render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
+    let row = lines(&buffer)[11].clone();
+    assert!(
+        row.contains("scroll 2/"),
+        "the scroll position survives: {row:?}"
+    );
+    assert!(
+        row.starts_with(" NORMAL  t1"),
+        "the identity survives: {row:?}"
+    );
+}
+
+#[test]
+fn the_runtime_identity_replaces_the_fallback_name() {
+    let (workspace, _) = one_pane();
+    let area = Rect::new(0, 0, 120, 12);
+    let theme = Theme::default();
+    let view = View {
+        identity: Some("t1 · claude · /work/herdr"),
+        theme: &theme,
+        ..View::default()
+    };
+    let mut buffer = Buffer::empty(area);
+    render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
+    let row = lines(&buffer)[11].clone();
+    assert!(
+        row.starts_with(" NORMAL  t1 · claude · /work/herdr"),
+        "the reported identity wins: {row:?}"
+    );
 }
 
 #[test]
 fn explicit_themes_style_the_chrome_consistently() {
     let (workspace, _) = one_pane();
-    let area = Rect::new(0, 0, 40, 12);
+    let area = Rect::new(0, 0, 120, 12);
     let rects = geometry::compute(workspace.active_tab(), area);
     let mut screens = BTreeMap::new();
     let inner = geometry::inner(rects.panes[0].1).expect("inner");
@@ -819,20 +1216,17 @@ fn explicit_themes_style_the_chrome_consistently() {
             machines: &[],
             preview: None,
             files: None,
+            identity: None,
         };
         let mut buffer = Buffer::empty(area);
         render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
-        let space = buffer[(1, 0)].fg;
-        let border = buffer[(0, 1)].fg;
-        let status_bg = buffer[(0, 11)].bg;
-        assert_eq!(space, theme.accent, "tab bar accent: {choice:?}");
-        assert_eq!(border, theme.accent, "focused border: {choice:?}");
-        assert_eq!(
-            status_bg,
-            theme.status.bg.expect("status background"),
-            "status bar: {choice:?}"
-        );
-        seen.push((space, border, status_bg));
+        let rail = buffer[(0, 0)].bg;
+        let header = buffer[(31, 0)].bg;
+        let bar = buffer[(50, 11)].bg;
+        assert_eq!(rail, theme.side, "rail background: {choice:?}");
+        assert_eq!(header, theme.active_bg, "focused header: {choice:?}");
+        assert_eq!(bar, theme.bar, "bottom line: {choice:?}");
+        seen.push((rail, header, bar));
     }
     assert_ne!(seen[0], seen[1], "dark and light differ");
 }
@@ -858,20 +1252,18 @@ fn the_terminal_grid_is_not_painted_by_the_theme() {
         machines: &[],
         preview: None,
         files: None,
+        identity: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &view);
     assert_eq!(buffer[(inner.x, inner.y)].symbol(), "h");
-    assert_ne!(
-        buffer[(inner.x, inner.y)].bg,
-        theme.status.bg.expect("status background")
-    );
+    assert_ne!(buffer[(inner.x, inner.y)].bg, theme.bar);
 }
 
 #[test]
 fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
     let (workspace, pane) = one_pane();
-    let area = Rect::new(0, 0, 40, 12);
+    let area = Rect::new(0, 0, 80, 12);
     let rects = geometry::compute(workspace.active_tab(), area);
     let inner = geometry::inner(rects.pane(pane).expect("pane")).expect("inner");
     let mut vt = Vt::new_with_scrollback(inner.width, inner.height, 100).expect("vt");
@@ -892,6 +1284,7 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
         machines: &[],
         preview: None,
         files: None,
+        identity: None,
     };
     let mut buffer = Buffer::empty(area);
     let started = std::time::Instant::now();
@@ -924,6 +1317,7 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
         machines: &[],
         preview: None,
         files: None,
+        identity: None,
     };
     let mut buffer = Buffer::empty(area);
     render_with(&mut buffer, area, &workspace, &UiState::default(), &stopped);

@@ -1,18 +1,21 @@
-//! Pure pane geometry: the tab bar, the status bar and the split rectangles.
+//! Pure pane geometry: the space rail, the bottom line, the narrow pane-nav
+//! and the split rectangles.
 //!
-//! The workspace area is what is left between the bars. Every split first
-//! gives its children a minimum, then distributes the remaining cells by
+//! The workspace area is what is left between the chrome rows. Every split
+//! first gives its children a minimum, then distributes the remaining cells by
 //! weight; gaps shrink before panes do. Rectangles include the pane border;
-//! the terminal grid is [`inner`].
+//! the terminal grid is [`inner`]. On a wide terminal the rail takes the left
+//! edge; on a narrow one the single pane-nav row sits above the pane area and
+//! only the focused pane is drawn. One source of rectangles serves drawing,
+//! hit testing, attach sizes and resize gaps.
 
-use super::model::{Axis, Direction, Layout, PaneId, Space, Tab, TabId};
+use super::model::{Axis, Direction, Layout, PaneId, Tab};
 use ratatui::layout::Rect;
-use ratatui::text::Span;
 
-/// The tab bar's height.
-pub const TAB_BAR_HEIGHT: u16 = 1;
 /// The status bar's height.
 pub const STATUS_HEIGHT: u16 = 1;
+/// The narrow pane-nav's height.
+pub const PANE_NAV_HEIGHT: u16 = 1;
 /// The gap between siblings, when there is room.
 pub const GAP: u16 = 1;
 /// A pane's smallest outer size (a border and one cell on each axis).
@@ -21,8 +24,14 @@ pub const MIN_PANE: u16 = 3;
 /// Where everything in the active tab goes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rects {
-    pub tab_bar: Rect,
+    /// The space rail's full-height column on a wide terminal; zero on a
+    /// narrow one (where it is an on-demand drawer instead).
+    pub rail: Rect,
+    /// The narrow pane-nav row; zero when the rail is visible or zoomed.
+    pub pane_nav: Rect,
+    /// The one-row bottom line, spanning the rail and the panes.
     pub status: Rect,
+    /// The pane area.
     pub workspace: Rect,
     /// Outer pane rectangles (borders included), in tree order.
     pub panes: Vec<(PaneId, Rect)>,
@@ -46,81 +55,134 @@ impl Rects {
     }
 }
 
-/// The tab bar, status bar and workspace area for a viewport. On a wide
-/// terminal the persistent sidebar takes the left edge first; the bars and
-/// panes start to its right.
-pub fn bars(viewport: Rect) -> (Rect, Rect, Rect) {
-    let sidebar = super::sidebar::width(viewport);
-    let viewport = Rect::new(
-        viewport.x.saturating_add(sidebar),
-        viewport.y,
-        viewport.width.saturating_sub(sidebar),
-        viewport.height,
-    );
-    let tab_height = TAB_BAR_HEIGHT.min(viewport.height);
-    let status_height = if viewport.height > tab_height {
-        STATUS_HEIGHT.min(viewport.height - tab_height)
-    } else {
-        0
-    };
-    let tab_bar = Rect::new(viewport.x, viewport.y, viewport.width, tab_height);
+/// The chrome and the pane area for a viewport. The bottom line is always one
+/// row across the whole viewport. A wide terminal puts the rail on the left
+/// and starts the panes at row zero; a narrow one puts the pane-nav above the
+/// panes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bars {
+    pub rail: Rect,
+    pub pane_nav: Rect,
+    pub status: Rect,
+    pub workspace: Rect,
+}
+
+pub fn bars(viewport: Rect) -> Bars {
+    let rail_width = super::sidebar::width(viewport);
+    let wide = rail_width > 0;
+    let status_height = STATUS_HEIGHT.min(viewport.height);
+    let body_height = viewport.height.saturating_sub(status_height);
     let status = Rect::new(
         viewport.x,
-        viewport
-            .y
-            .saturating_add(viewport.height)
-            .saturating_sub(status_height),
+        viewport.y.saturating_add(body_height),
         viewport.width,
         status_height,
     );
+    let rail = if wide {
+        Rect::new(viewport.x, viewport.y, rail_width, body_height)
+    } else {
+        Rect::new(viewport.x, viewport.y, 0, 0)
+    };
+    let pane_x = viewport.x.saturating_add(rail_width);
+    let pane_width = viewport.width.saturating_sub(rail_width);
+    let nav_height = if !wide && body_height > 1 {
+        PANE_NAV_HEIGHT.min(body_height)
+    } else {
+        0
+    };
+    let pane_nav = if nav_height > 0 {
+        Rect::new(pane_x, viewport.y, pane_width, nav_height)
+    } else {
+        Rect::new(pane_x, viewport.y, 0, 0)
+    };
     let workspace = Rect::new(
-        viewport.x,
-        viewport.y.saturating_add(tab_height),
-        viewport.width,
-        viewport
-            .height
-            .saturating_sub(tab_height)
-            .saturating_sub(status_height),
+        pane_x,
+        viewport.y.saturating_add(nav_height),
+        pane_width,
+        body_height.saturating_sub(nav_height),
     );
-    (tab_bar, status, workspace)
+    Bars {
+        rail,
+        pane_nav,
+        status,
+        workspace,
+    }
 }
 
-/// The layout of a tab, honouring zoom.
+/// The layout of a tab, honouring zoom and the narrow drawing rule.
 pub fn compute(tab: Option<&Tab>, viewport: Rect) -> Rects {
-    let (tab_bar, status, workspace) = bars(viewport);
+    let bars = bars(viewport);
+    let wide = bars.rail.width > 0;
+    let mut pane_nav = bars.pane_nav;
+    let mut workspace = bars.workspace;
     let mut panes = Vec::new();
     if let Some(tab) = tab
         && let Some(layout) = &tab.layout
     {
         match tab.zoomed {
-            Some(zoomed) if layout.contains(zoomed) => panes.push((zoomed, workspace)),
-            _ => place(layout, workspace, &mut panes),
+            Some(zoomed) if layout.contains(zoomed) => {
+                if !wide && pane_nav.height > 0 {
+                    // Zoom may hide the pane-nav; the focused pane takes its
+                    // row too.
+                    workspace = Rect::new(
+                        workspace.x,
+                        pane_nav.y,
+                        workspace.width,
+                        workspace.height.saturating_add(pane_nav.height),
+                    );
+                    pane_nav = Rect::new(pane_nav.x, pane_nav.y, 0, 0);
+                }
+                panes.push((zoomed, workspace));
+            }
+            _ if wide => place(layout, workspace, &mut panes),
+            _ => {
+                // Narrow: only the focused pane is drawn; the rest keep
+                // running and keep their last grid size.
+                let drawn = tab
+                    .focused
+                    .filter(|pane| layout.contains(*pane))
+                    .or_else(|| layout.first_leaf());
+                if let Some(pane) = drawn {
+                    panes.push((pane, workspace));
+                }
+            }
         }
     }
     Rects {
-        tab_bar,
-        status,
+        rail: bars.rail,
+        pane_nav,
+        status: bars.status,
         workspace,
         panes,
     }
 }
 
-/// The full layout, ignoring zoom. Focus and move directions use this so a
-/// zoomed pane can still be left with the keyboard.
+/// The full layout, ignoring zoom and the narrow drawing rule. Focus and move
+/// directions use this so a zoomed or hidden pane can still be reached.
 pub fn compute_without_zoom(tab: Option<&Tab>, viewport: Rect) -> Rects {
-    let (tab_bar, status, workspace) = bars(viewport);
+    let bars = bars(viewport);
     let mut panes = Vec::new();
     if let Some(tab) = tab
         && let Some(layout) = &tab.layout
     {
-        place(layout, workspace, &mut panes);
+        place(layout, bars.workspace, &mut panes);
     }
     Rects {
-        tab_bar,
-        status,
-        workspace,
+        rail: bars.rail,
+        pane_nav: bars.pane_nav,
+        status: bars.status,
+        workspace: bars.workspace,
         panes,
     }
+}
+
+/// A pane's number in split-tree order, starting at one. It is stable while
+/// focus moves and while a narrow window draws only the focused pane.
+pub fn pane_number(tab: Option<&Tab>, pane: PaneId) -> Option<usize> {
+    tab?.panes()
+        .iter()
+        .position(|candidate| *candidate == pane)
+        .map(|index| index + 1)
 }
 
 /// A draggable split boundary: one gap cell column or row between two
@@ -140,7 +202,7 @@ pub struct Gap {
 /// the boundaries of a zoomed layout are not on screen.
 pub fn gaps(tab: Option<&Tab>, viewport: Rect) -> Vec<Gap> {
     let mut out = Vec::new();
-    let (_, _, workspace) = bars(viewport);
+    let workspace = bars(viewport).workspace;
     if let Some(tab) = tab
         && let Some(layout) = &tab.layout
     {
@@ -203,44 +265,6 @@ fn collect_gaps(layout: &Layout, area: Rect, path: &mut Vec<usize>, out: &mut Ve
         path.pop();
         at = at.saturating_add(span).saturating_add(gap);
     }
-}
-
-/// The clickable tab rectangles in the tab bar, in the same order and widths
-/// as the drawn tab bar. The space name and the separator after it are not
-/// tabs.
-pub fn tab_spans(space: &Space, area: Rect) -> Vec<(TabId, Rect)> {
-    if area.width == 0 || area.height == 0 {
-        return Vec::new();
-    }
-    let end = area.x.saturating_add(area.width);
-    let mut x = area
-        .x
-        .saturating_add(width(&format!(" {} ", space.name)))
-        .saturating_add(width("│"));
-    let mut spans = Vec::new();
-    for (index, tab) in space.tabs.iter().enumerate() {
-        let text = format!(" {} {} ", index + 1, tab.name);
-        let span = width(&text);
-        if x >= end {
-            break;
-        }
-        let visible = span.min(end - x);
-        spans.push((tab.id, Rect::new(x, area.y, visible, area.height)));
-        x = x.saturating_add(span);
-    }
-    spans
-}
-
-/// The tab under a screen cell in the tab bar.
-pub fn tab_at(space: &Space, area: Rect, x: u16, y: u16) -> Option<TabId> {
-    tab_spans(space, area)
-        .into_iter()
-        .find(|(_, rect)| contains(*rect, x, y))
-        .map(|(id, _)| id)
-}
-
-fn width(text: &str) -> u16 {
-    u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX)
 }
 
 /// A pane's terminal grid: the rectangle inside its border, when it has room.

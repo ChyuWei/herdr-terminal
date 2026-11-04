@@ -944,7 +944,7 @@ impl Workspace {
         if tab.zoomed.is_some() {
             return false;
         }
-        let (_, _, workspace) = geometry::bars(viewport);
+        let workspace = geometry::bars(viewport).workspace;
         let Some(root) = tab.layout.as_ref() else {
             return false;
         };
@@ -1208,6 +1208,23 @@ impl Workspace {
             return false;
         }
         space.name = name.to_owned();
+        true
+    }
+
+    /// Sets the space's folder line. The rail shows it only when non-empty;
+    /// it is never derived from a pane's cwd.
+    pub fn set_space_folder(&mut self, space: SpaceId, folder: &str) -> bool {
+        let Some(record) = self
+            .spaces
+            .iter_mut()
+            .find(|candidate| candidate.id == space)
+        else {
+            return false;
+        };
+        if record.folder == folder {
+            return false;
+        }
+        record.folder = folder.to_owned();
         true
     }
 

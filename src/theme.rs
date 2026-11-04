@@ -1,24 +1,30 @@
 //! UI themes and color-depth mapping.
 //!
 //! Terminal cells keep their own colors; a theme styles only the chrome:
-//! tab bar, pane borders, status bar, sidebar, peek, help, palette, search and
-//! local selection. The default is Catppuccin Mocha; `light` is Catppuccin
-//! Latte. `terminal` keeps the earlier look, which used the outer terminal's
-//! own named palette. Explicit colors are mapped down for 16-color and
-//! 256-color terminals.
+//! the space rail, pane frames, the bottom line, overlays, peek, help,
+//! palette, search and local selection. The default (and `dark`) is the
+//! design's dark palette; `light` is the design's light palette. The two
+//! Catppuccin palettes keep their old names for people who prefer them, and
+//! `terminal` keeps the earlier look in the outer terminal's own named
+//! palette. Explicit colors are mapped down for 16-color and 256-color
+//! terminals.
 
 use ratatui::style::{Color, Modifier, Style};
 
 /// The theme name from config.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ThemeChoice {
-    /// Catppuccin Mocha.
+    /// The design's dark palette.
     #[default]
     Default,
-    /// Catppuccin Mocha under its explicit name.
+    /// The design's dark palette under its explicit name.
     Dark,
-    /// Catppuccin Latte.
+    /// The design's light palette.
     Light,
+    /// The old Catppuccin Mocha look.
+    Catppuccin,
+    /// The old Catppuccin Latte look.
+    CatppuccinLatte,
     /// The earlier look in the outer terminal's own named palette.
     Terminal,
 }
@@ -26,9 +32,11 @@ pub enum ThemeChoice {
 impl ThemeChoice {
     pub fn parse(value: &str) -> Option<ThemeChoice> {
         match value {
-            "default" | "catppuccin" => Some(ThemeChoice::Default),
+            "default" => Some(ThemeChoice::Default),
             "dark" => Some(ThemeChoice::Dark),
-            "light" | "catppuccin-latte" => Some(ThemeChoice::Light),
+            "light" => Some(ThemeChoice::Light),
+            "catppuccin" => Some(ThemeChoice::Catppuccin),
+            "catppuccin-latte" => Some(ThemeChoice::CatppuccinLatte),
             "terminal" => Some(ThemeChoice::Terminal),
             _ => None,
         }
@@ -39,6 +47,8 @@ impl ThemeChoice {
             ThemeChoice::Default => "default",
             ThemeChoice::Dark => "dark",
             ThemeChoice::Light => "light",
+            ThemeChoice::Catppuccin => "catppuccin",
+            ThemeChoice::CatppuccinLatte => "catppuccin-latte",
             ThemeChoice::Terminal => "terminal",
         }
     }
@@ -83,13 +93,33 @@ pub fn depth_from(colorterm: Option<&str>, term: Option<&str>) -> ColorDepth {
 /// drawing code never asks which theme is active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
+    /// The outer page background behind the chrome.
+    pub page: Color,
     /// The chrome background behind bars, panels and overlays.
     pub panel_bg: Color,
-    /// Raised rows: inactive tabs, selected sidebar rows.
-    pub surface0: Color,
-    /// Hairlines: unfocused borders and separators.
-    pub surface1: Color,
+    /// The rail's background, a step apart from the panes.
+    pub side: Color,
+    /// The bottom line's background.
+    pub bar: Color,
+    /// Hairlines: frames, separators and unfocused borders.
+    pub line: Color,
     /// Secondary text: hints, section headers, idle agents.
+    pub muted: Color,
+    /// Dim text, quieter than muted.
+    pub dim: Color,
+    /// The focus and emphasis color (the design's mint).
+    pub mint: Color,
+    /// The color of a blocked agent.
+    pub amber: Color,
+    /// The color of a working agent.
+    pub blue: Color,
+    /// The background of the active space and the focused agent row.
+    pub active_bg: Color,
+    /// Raised rows: selected sidebar rows and inactive tabs.
+    pub surface0: Color,
+    /// Older name for the hairline color.
+    pub surface1: Color,
+    /// Older name for the muted text color.
     pub overlay0: Color,
     /// Muted text, between secondary and primary.
     pub overlay1: Color,
@@ -117,7 +147,7 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Theme {
-        mocha()
+        design_dark()
     }
 }
 
@@ -126,7 +156,17 @@ impl Theme {
     /// bars, kept for `theme: "terminal"`.
     pub fn terminal() -> Theme {
         Theme {
+            page: Color::Reset,
             panel_bg: Color::Reset,
+            side: Color::Reset,
+            bar: Color::Reset,
+            line: Color::DarkGray,
+            muted: Color::Cyan,
+            dim: Color::DarkGray,
+            mint: Color::Cyan,
+            amber: Color::Yellow,
+            blue: Color::LightBlue,
+            active_bg: Color::DarkGray,
             surface0: Color::Reset,
             surface1: Color::DarkGray,
             overlay0: Color::Cyan,
@@ -175,16 +215,117 @@ impl Theme {
     /// nothing is inferred from a screen.
     pub fn status_word(&self, word: &str) -> Color {
         match word {
-            "working" => self.green,
-            "blocked" | "error" => self.red,
-            "done" => self.teal,
-            "idle" => self.overlay1,
-            _ => self.subtext0,
+            "working" => self.blue,
+            "blocked" => self.amber,
+            "error" => self.red,
+            "done" => self.mint,
+            "idle" => self.dim,
+            _ => self.muted,
         }
     }
 }
 
-/// The Catppuccin Mocha roles.
+/// The approved design's dark roles.
+fn design_dark() -> Theme {
+    let page = Color::Rgb(0x10, 0x14, 0x16);
+    let bg = Color::Rgb(0x17, 0x1c, 0x1f);
+    let side = Color::Rgb(0x1c, 0x23, 0x26);
+    let bar = Color::Rgb(0x20, 0x28, 0x2c);
+    let line = Color::Rgb(0x30, 0x3d, 0x42);
+    let text = Color::Rgb(0xd4, 0xdf, 0xe1);
+    let muted = Color::Rgb(0x8a, 0x9b, 0x9f);
+    let dim = Color::Rgb(0x64, 0x77, 0x7d);
+    let mint = Color::Rgb(0x9d, 0xdb, 0xc6);
+    let active_bg = Color::Rgb(0x27, 0x3e, 0x36);
+    let amber = Color::Rgb(0xe6, 0xbd, 0x7c);
+    let blue = Color::Rgb(0x99, 0xbd, 0xde);
+    let red = Color::Rgb(0xdc, 0x92, 0x92);
+    Theme {
+        page,
+        panel_bg: bg,
+        side,
+        bar,
+        line,
+        muted,
+        dim,
+        mint,
+        amber,
+        blue,
+        active_bg,
+        surface0: bar,
+        surface1: line,
+        overlay0: muted,
+        overlay1: dim,
+        text,
+        subtext0: muted,
+        accent: mint,
+        green: mint,
+        yellow: amber,
+        red,
+        mauve: blue,
+        peach: amber,
+        teal: mint,
+        status: Style::default().fg(text).bg(bar),
+        tab_active: Style::default()
+            .fg(bg)
+            .bg(mint)
+            .add_modifier(Modifier::BOLD),
+        tab_inactive: Style::default().fg(muted).bg(bar),
+        selection: active_bg,
+    }
+}
+
+/// The approved design's light roles.
+fn design_light() -> Theme {
+    let page = Color::Rgb(0xe9, 0xed, 0xeb);
+    let bg = Color::Rgb(0xf7, 0xf8, 0xf4);
+    let side = Color::Rgb(0xef, 0xf2, 0xee);
+    let bar = Color::Rgb(0xe5, 0xeb, 0xe5);
+    let line = Color::Rgb(0xcb, 0xd6, 0xce);
+    let text = Color::Rgb(0x26, 0x3c, 0x37);
+    let muted = Color::Rgb(0x59, 0x70, 0x67);
+    let dim = Color::Rgb(0x71, 0x86, 0x7e);
+    let mint = Color::Rgb(0x23, 0x6b, 0x55);
+    let active_bg = Color::Rgb(0xdc, 0xe9, 0xdf);
+    let amber = Color::Rgb(0x9c, 0x64, 0x21);
+    let blue = Color::Rgb(0x3b, 0x6a, 0x91);
+    let red = Color::Rgb(0xae, 0x4b, 0x4b);
+    Theme {
+        page,
+        panel_bg: bg,
+        side,
+        bar,
+        line,
+        muted,
+        dim,
+        mint,
+        amber,
+        blue,
+        active_bg,
+        surface0: bar,
+        surface1: line,
+        overlay0: muted,
+        overlay1: dim,
+        text,
+        subtext0: muted,
+        accent: mint,
+        green: mint,
+        yellow: amber,
+        red,
+        mauve: blue,
+        peach: amber,
+        teal: mint,
+        status: Style::default().fg(text).bg(bar),
+        tab_active: Style::default()
+            .fg(bg)
+            .bg(mint)
+            .add_modifier(Modifier::BOLD),
+        tab_inactive: Style::default().fg(muted).bg(bar),
+        selection: active_bg,
+    }
+}
+
+/// The Catppuccin Mocha roles, kept for the explicit `catppuccin` theme.
 fn mocha() -> Theme {
     let panel_bg = Color::Rgb(0x18, 0x18, 0x25);
     let surface0 = Color::Rgb(0x31, 0x32, 0x44);
@@ -195,7 +336,17 @@ fn mocha() -> Theme {
     let subtext0 = Color::Rgb(0xa6, 0xad, 0xc8);
     let accent = Color::Rgb(0x89, 0xb4, 0xfa);
     Theme {
+        page: Color::Rgb(0x1e, 0x1e, 0x2e),
         panel_bg,
+        side: Color::Rgb(0x18, 0x18, 0x25),
+        bar: Color::Rgb(0x11, 0x11, 0x1b),
+        line: surface1,
+        muted: overlay0,
+        dim: overlay1,
+        mint: Color::Rgb(0x94, 0xe2, 0xd5),
+        amber: Color::Rgb(0xf9, 0xe2, 0xaf),
+        blue: accent,
+        active_bg: surface0,
         surface0,
         surface1,
         overlay0,
@@ -219,7 +370,7 @@ fn mocha() -> Theme {
     }
 }
 
-/// The Catppuccin Latte roles.
+/// The Catppuccin Latte roles, kept for `catppuccin-latte`.
 fn latte() -> Theme {
     let panel_bg = Color::Rgb(0xe6, 0xe9, 0xef);
     let surface0 = Color::Rgb(0xcc, 0xd0, 0xda);
@@ -230,7 +381,17 @@ fn latte() -> Theme {
     let subtext0 = Color::Rgb(0x6c, 0x6f, 0x85);
     let accent = Color::Rgb(0x1e, 0x66, 0xf5);
     Theme {
+        page: Color::Rgb(0xef, 0xf1, 0xf5),
         panel_bg,
+        side: Color::Rgb(0xe6, 0xe9, 0xef),
+        bar: Color::Rgb(0xdc, 0xe0, 0xe8),
+        line: surface1,
+        muted: overlay0,
+        dim: overlay1,
+        mint: Color::Rgb(0x17, 0x92, 0x99),
+        amber: Color::Rgb(0xdf, 0x8e, 0x1d),
+        blue: accent,
+        active_bg: surface0,
         surface0,
         surface1,
         overlay0,
@@ -257,14 +418,26 @@ fn latte() -> Theme {
 /// Builds the theme for a choice and terminal depth.
 pub fn theme(choice: ThemeChoice, depth: ColorDepth) -> Theme {
     match choice {
-        ThemeChoice::Default | ThemeChoice::Dark => map(mocha(), depth),
-        ThemeChoice::Light => map(latte(), depth),
+        ThemeChoice::Default | ThemeChoice::Dark => map(design_dark(), depth),
+        ThemeChoice::Light => map(design_light(), depth),
+        ThemeChoice::Catppuccin => map(mocha(), depth),
+        ThemeChoice::CatppuccinLatte => map(latte(), depth),
         ThemeChoice::Terminal => Theme::terminal(),
     }
 }
 
 fn map(mut theme: Theme, depth: ColorDepth) -> Theme {
+    theme.page = convert(theme.page, depth);
     theme.panel_bg = convert(theme.panel_bg, depth);
+    theme.side = convert(theme.side, depth);
+    theme.bar = convert(theme.bar, depth);
+    theme.line = convert(theme.line, depth);
+    theme.muted = convert(theme.muted, depth);
+    theme.dim = convert(theme.dim, depth);
+    theme.mint = convert(theme.mint, depth);
+    theme.amber = convert(theme.amber, depth);
+    theme.blue = convert(theme.blue, depth);
+    theme.active_bg = convert(theme.active_bg, depth);
     theme.surface0 = convert(theme.surface0, depth);
     theme.surface1 = convert(theme.surface1, depth);
     theme.overlay0 = convert(theme.overlay0, depth);
@@ -377,48 +550,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_theme_is_catppuccin_mocha() {
+    fn the_default_theme_is_the_design_dark_palette() {
         let theme = theme(ThemeChoice::Default, ColorDepth::TrueColor);
-        assert_eq!(theme.panel_bg, Color::Rgb(0x18, 0x18, 0x25));
-        assert_eq!(theme.surface0, Color::Rgb(0x31, 0x32, 0x44));
-        assert_eq!(theme.surface1, Color::Rgb(0x45, 0x47, 0x5a));
-        assert_eq!(theme.overlay0, Color::Rgb(0x6c, 0x70, 0x86));
-        assert_eq!(theme.overlay1, Color::Rgb(0x7f, 0x84, 0x9c));
-        assert_eq!(theme.text, Color::Rgb(0xcd, 0xd6, 0xf4));
-        assert_eq!(theme.subtext0, Color::Rgb(0xa6, 0xad, 0xc8));
-        assert_eq!(theme.accent, Color::Rgb(0x89, 0xb4, 0xfa));
-        assert_eq!(theme.green, Color::Rgb(0xa6, 0xe3, 0xa1));
-        assert_eq!(theme.yellow, Color::Rgb(0xf9, 0xe2, 0xaf));
-        assert_eq!(theme.red, Color::Rgb(0xf3, 0x8b, 0xa8));
-        assert_eq!(theme.mauve, Color::Rgb(0xcb, 0xa6, 0xf7));
-        assert_eq!(theme.peach, Color::Rgb(0xfa, 0xb3, 0x87));
-        assert_eq!(theme.teal, Color::Rgb(0x94, 0xe2, 0xd5));
+        assert_eq!(theme.page, Color::Rgb(0x10, 0x14, 0x16));
+        assert_eq!(theme.panel_bg, Color::Rgb(0x17, 0x1c, 0x1f));
+        assert_eq!(theme.side, Color::Rgb(0x1c, 0x23, 0x26));
+        assert_eq!(theme.bar, Color::Rgb(0x20, 0x28, 0x2c));
+        assert_eq!(theme.line, Color::Rgb(0x30, 0x3d, 0x42));
+        assert_eq!(theme.text, Color::Rgb(0xd4, 0xdf, 0xe1));
+        assert_eq!(theme.muted, Color::Rgb(0x8a, 0x9b, 0x9f));
+        assert_eq!(theme.dim, Color::Rgb(0x64, 0x77, 0x7d));
+        assert_eq!(theme.mint, Color::Rgb(0x9d, 0xdb, 0xc6));
+        assert_eq!(theme.active_bg, Color::Rgb(0x27, 0x3e, 0x36));
+        assert_eq!(theme.amber, Color::Rgb(0xe6, 0xbd, 0x7c));
+        assert_eq!(theme.blue, Color::Rgb(0x99, 0xbd, 0xde));
+        assert_eq!(theme.red, Color::Rgb(0xdc, 0x92, 0x92));
+        assert_eq!(theme.accent, theme.mint, "focus uses the mint role");
         assert!(!theme.status.add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(theme.status.bg, Some(theme.panel_bg));
+        assert_eq!(theme.status.bg, Some(theme.bar));
         assert_eq!(theme.tab_active.bg, Some(theme.accent));
         assert_eq!(theme.tab_active.fg, Some(theme.panel_bg));
         assert_eq!(theme.tab_inactive.bg, Some(theme.surface0));
     }
 
     #[test]
-    fn theme_names_keep_their_old_meanings_and_accept_catppuccin_aliases() {
+    fn theme_names_map_to_the_approved_palettes_and_keep_the_old_aliases() {
         assert_eq!(ThemeChoice::parse("default"), Some(ThemeChoice::Default));
         assert_eq!(ThemeChoice::parse("dark"), Some(ThemeChoice::Dark));
         assert_eq!(ThemeChoice::parse("light"), Some(ThemeChoice::Light));
-        assert_eq!(ThemeChoice::parse("terminal"), Some(ThemeChoice::Terminal));
-        assert_eq!(ThemeChoice::parse("catppuccin"), Some(ThemeChoice::Default));
+        assert_eq!(
+            ThemeChoice::parse("catppuccin"),
+            Some(ThemeChoice::Catppuccin)
+        );
         assert_eq!(
             ThemeChoice::parse("catppuccin-latte"),
-            Some(ThemeChoice::Light)
+            Some(ThemeChoice::CatppuccinLatte)
         );
+        assert_eq!(ThemeChoice::parse("terminal"), Some(ThemeChoice::Terminal));
         assert_eq!(ThemeChoice::parse("neon"), None);
         assert_eq!(ThemeChoice::Default.label(), "default");
+        assert_eq!(ThemeChoice::Dark.label(), "dark");
+        assert_eq!(ThemeChoice::Catppuccin.label(), "catppuccin");
+        assert_eq!(ThemeChoice::CatppuccinLatte.label(), "catppuccin-latte");
         assert_eq!(ThemeChoice::Terminal.label(), "terminal");
 
         let default = theme(ThemeChoice::Default, ColorDepth::TrueColor);
         let dark = theme(ThemeChoice::Dark, ColorDepth::TrueColor);
-        assert_eq!(default, dark, "dark is the explicit Mocha name");
-        assert_ne!(default, theme(ThemeChoice::Light, ColorDepth::TrueColor));
+        assert_eq!(default, dark, "dark is the explicit name of the default");
+        let light = theme(ThemeChoice::Light, ColorDepth::TrueColor);
+        assert_eq!(light.page, Color::Rgb(0xe9, 0xed, 0xeb));
+        assert_ne!(default, light);
+
+        let mocha = theme(ThemeChoice::Catppuccin, ColorDepth::TrueColor);
+        assert_eq!(mocha.panel_bg, Color::Rgb(0x18, 0x18, 0x25));
+        let latte = theme(ThemeChoice::CatppuccinLatte, ColorDepth::TrueColor);
+        assert_eq!(latte.panel_bg, Color::Rgb(0xe6, 0xe9, 0xef));
     }
 
     #[test]
@@ -488,11 +674,26 @@ mod tests {
 
     #[test]
     fn every_palette_role_degrades_without_leaving_rgb_behind() {
-        for choice in [ThemeChoice::Default, ThemeChoice::Light] {
+        for choice in [
+            ThemeChoice::Default,
+            ThemeChoice::Light,
+            ThemeChoice::Catppuccin,
+            ThemeChoice::CatppuccinLatte,
+        ] {
             for depth in [ColorDepth::Ansi256, ColorDepth::Ansi16] {
                 let theme = theme(choice, depth);
                 for color in [
+                    theme.page,
                     theme.panel_bg,
+                    theme.side,
+                    theme.bar,
+                    theme.line,
+                    theme.muted,
+                    theme.dim,
+                    theme.mint,
+                    theme.amber,
+                    theme.blue,
+                    theme.active_bg,
                     theme.surface0,
                     theme.surface1,
                     theme.overlay0,
@@ -534,11 +735,14 @@ mod tests {
     #[test]
     fn status_words_use_only_the_core_reported_word() {
         let theme = Theme::default();
-        assert_eq!(theme.status_word("working"), theme.green);
-        assert_eq!(theme.status_word("blocked"), theme.red);
+        assert_eq!(theme.status_word("working"), theme.blue);
+        assert_eq!(theme.status_word("blocked"), theme.amber);
         assert_eq!(theme.status_word("error"), theme.red);
-        assert_eq!(theme.status_word("done"), theme.teal);
-        assert_eq!(theme.status_word("idle"), theme.overlay1);
-        assert_eq!(theme.status_word("thinking"), theme.subtext0);
+        assert_eq!(theme.status_word("done"), theme.mint);
+        assert_eq!(theme.status_word("idle"), theme.dim);
+        assert_eq!(theme.status_word("thinking"), theme.muted);
+        // The design roles are distinct, so the words never read alike.
+        assert_ne!(theme.status_word("working"), theme.status_word("blocked"));
+        assert_ne!(theme.status_word("done"), theme.status_word("idle"));
     }
 }

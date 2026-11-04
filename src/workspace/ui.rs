@@ -1,15 +1,18 @@
 //! Composing the workspace into a ratatui buffer.
 //!
 //! Pure presentation: the runtime supplies one VT snapshot per visible pane.
-//! The sidebar occupies the left edge on wide terminals, the tab bar sits on
-//! the first row of the remaining area, the status bar on the last, and panes
-//! get the space between. A mode strip overlays the bottom pane row rather
-//! than shrinking the panes. Borders use the pane rectangle; the terminal
-//! grid uses its inner rectangle. No core, VT or terminal is touched here.
+//! On a wide terminal the space rail takes the left edge and the panes start
+//! at the first row; on a narrow one the rail is hidden behind a drawer and a
+//! single pane-nav row maps the tab. Every pane carries its identity in its
+//! top border row. One bottom line spans the whole viewport with the mode,
+//! the focused terminal and the context hints. Borders use the pane
+//! rectangle; the terminal grid uses its inner rectangle. No core, VT or
+//! terminal is touched here.
 
-use super::agents::{self, AgentRow};
+use super::agents::AgentRow;
 use super::file::Pane;
 use super::geometry::{self, Rects};
+use super::panenav;
 use super::state::{Connection, UiState};
 
 mod machine_ui;
@@ -26,7 +29,7 @@ use crate::theme::Theme;
 use crate::vt::Screen as VtScreen;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use std::collections::BTreeMap;
@@ -34,14 +37,17 @@ use std::collections::BTreeMap;
 /// The help text. It is also the golden-tested documented key map.
 pub const HELP: &[&str] = &[
     "prefix Ctrl-b      ? help          q detach   any key closes help",
-    "c new tab          C new space",
+    "c new tab          C new space     T switch layout/tab (compatibility)",
     "n / p tab          N / P space     1..9 select tab",
     "v split left/right s split top/bottom",
     "h/j/k/l focus      H/J/K/L move",
     "z zoom             x close",
     "e keep + close     X kill + close",
     ", rename tab       . rename space",
-    "a sidebar          i peek agent    g/G next/prev agent",
+    "a rail / drawer    i peek agent    g/G next/prev agent",
+    "rail: j/k move  g/G first/last  Enter switch/jump  Esc/a close",
+    "p pin / unpin  u mark unread  i peek  any key closes peek",
+    "tabs: j/k move  Enter switch  Esc/q close",
     "t terminal manager (all live terminals in core)",
     "manager: j/k move  g/G first/last  Enter show/hide",
     "/ filter  p preview (read-only)  Esc close manager",
@@ -49,9 +55,7 @@ pub const HELP: &[&str] = &[
     "machines: n new terminal there · / filter · Esc close · add takes target only",
     "o file viewer       e edit in $VISUAL/$EDITOR, diff before write",
     "file: Enter read · e edit · w write · q discard · Esc close",
-    "sidebar: j/k move  g/G first/last  Enter switch/jump  Esc/a close",
-    "p pin / unpin  u mark unread  i peek  any key closes peek",
-    "r resize mode",
+    "r resize mode (wide and unzoomed)",
     "resize: h/l width  j/k height  Shift for 5  Esc/q done",
     "Ctrl-] detach      prefix twice sends Ctrl-b",
     ": palette          f search scrollback",
@@ -60,7 +64,8 @@ pub const HELP: &[&str] = &[
     "other keys leave selection; paste is ignored while selecting",
     "Shift-PgUp/PgDn scroll history      Shift-Home/End top/bottom",
     "drag a split gap to resize          wheel scrolls local history",
-    "mouse: click focuses pane/tab       drag selects; Shift-drag local",
+    "narrow: prefix a opens the rail over the panes; Esc closes it",
+    "mouse: click a space, agent, pane or chip to focus",
 ];
 
 /// Where the cursor belongs after a frame.
@@ -94,6 +99,9 @@ pub struct View<'a> {
     pub preview: Option<&'a VtScreen>,
     /// The file overlay's viewer or pending diff.
     pub files: Option<&'a Pane>,
+    /// The focused terminal's identity for the bottom line: the address and
+    /// whatever core reported about it, joined with ` · `.
+    pub identity: Option<&'a str>,
 }
 
 impl Default for View<'_> {
@@ -115,6 +123,7 @@ impl Default for View<'_> {
             machines: &MACHINE_ROWS,
             preview: None,
             files: None,
+            identity: None,
         }
     }
 }
@@ -145,20 +154,32 @@ pub fn render_with(
 ) -> Render {
     let theme = view.theme;
     let rects = geometry::compute(workspace.active_tab(), area);
+    buffer.set_style(area, Style::default().bg(theme.page));
     draw_panes(
         buffer,
         workspace,
         &rects,
         view.screens,
         view.selections,
+        view.rows,
         theme,
     );
-    draw_tab_bar(buffer, workspace, rects.tab_bar, theme);
+    draw_pane_nav(buffer, workspace, rects.pane_nav, view.rows, theme);
     if rects.panes.is_empty() && rects.workspace.height > 0 {
         draw_empty(buffer, rects.workspace, theme);
     }
-    sidebar::draw_sidebar(buffer, area, workspace, ui, view.rows, theme);
-    draw_strip(buffer, &rects, ui, theme);
+    // The rail is drawn beside the panes when wide; on a narrow terminal the
+    // same model is an on-demand drawer over them.
+    let rail = if rects.rail.width > 0 {
+        rects.rail
+    } else if ui.sidebar.open {
+        super::sidebar::drawer_rect(area)
+    } else {
+        Rect::new(area.x, area.y, 0, 0)
+    };
+    if rail.width > 0 {
+        sidebar::draw_sidebar(buffer, rail, workspace, ui, view.rows, theme);
+    }
     let mut rendered = Render {
         focused: workspace.focused_pane().and_then(|id| {
             rects
@@ -196,6 +217,11 @@ pub fn render_with(
     if ui.files.open {
         rendered.prompt_cursor = overlays::draw_file(buffer, area, ui, view.files, theme);
         rendered.focused = None;
+    }
+    if ui.tabs.is_some() {
+        overlays::draw_tabs(buffer, area, workspace, ui, theme);
+        rendered.focused = None;
+        rendered.prompt_cursor = None;
     }
     if let Some(preview) = &ui.preview {
         overlays::draw_preview(buffer, area, preview, view.preview, theme);
@@ -276,77 +302,97 @@ pub fn preview_grid_size(area: Rect) -> (u16, u16) {
     (grid.width, grid.height)
 }
 
-fn draw_tab_bar(buffer: &mut Buffer, workspace: &Workspace, area: Rect, theme: &Theme) {
+/// The narrow pane-nav: one compact chip per pane of the active tab, in split
+/// tree order. The row is the map of the tab while only the focused pane is
+/// drawn; every chip is clickable, and a long list scrolls a whole-chip
+/// window so focus stays visible and the row never overflows.
+fn draw_pane_nav(
+    buffer: &mut Buffer,
+    workspace: &Workspace,
+    area: Rect,
+    rows: &[AgentRow],
+    theme: &Theme,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    buffer.set_style(area, theme.panel());
-    let space = workspace.active_space();
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", space.name),
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.panel_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("│", Style::default().fg(theme.surface1).bg(theme.panel_bg)),
-    ];
-    for (index, tab) in space.tabs.iter().enumerate() {
-        let style = if tab.id == space.active {
-            theme.tab_active
-        } else {
-            theme.tab_inactive
+    buffer.set_style(area, Style::default().bg(theme.bar));
+    let entries = panenav::entries(workspace, rows);
+    let Some(tab) = workspace.active_tab() else {
+        return;
+    };
+    for chip in panenav::layout(&entries, tab.focused, area) {
+        let (base, word) = match chip.word.as_deref() {
+            Some(word) => (
+                chip.label
+                    .strip_suffix(word)
+                    .map(|base| base.trim_end().to_owned())
+                    .unwrap_or_else(|| chip.label.clone()),
+                Some(word),
+            ),
+            None => (chip.label.clone(), None),
         };
-        spans.push(Span::styled(format!(" {} {} ", index + 1, tab.name), style));
+        let (text, background) = if chip.focused {
+            (
+                Style::default()
+                    .fg(theme.bar)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                theme.accent,
+            )
+        } else {
+            (Style::default().fg(theme.muted).bg(theme.bar), theme.bar)
+        };
+        let mut spans = vec![Span::styled(base, text)];
+        if let Some(word) = word {
+            let color = if chip.focused || word.starts_with("exited ") {
+                theme.bar
+            } else {
+                theme.status_word(word)
+            };
+            spans.push(Span::styled(
+                format!(" {word}"),
+                Style::default().fg(color).bg(background),
+            ));
+        }
+        Paragraph::new(Line::from(spans)).render(chip.rect, buffer);
     }
-    Paragraph::new(Line::from(spans))
-        .style(theme.panel())
-        .render(area, buffer);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_panes(
     buffer: &mut Buffer,
     workspace: &Workspace,
     rects: &Rects,
     screens: &BTreeMap<PaneId, VtScreen>,
     selections: &BTreeMap<PaneId, Vec<(u16, u16, u16)>>,
+    rows: &[AgentRow],
     theme: &Theme,
 ) {
     let focused = workspace.focused_pane();
+    let tab = workspace.active_tab();
     for (pane_id, rect) in &rects.panes {
         let Some(pane) = workspace.pane(*pane_id) else {
             continue;
         };
         let is_focused = focused == Some(*pane_id);
         let border = Style::default()
-            .fg(if is_focused {
-                theme.accent
-            } else {
-                theme.surface1
-            })
+            .fg(if is_focused { theme.accent } else { theme.line })
             .bg(theme.panel_bg);
-        let title = border.add_modifier(if is_focused {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
-        let mut label = super::machines::qualified_name(
-            &pane.address,
-            &if pane.title.is_empty() || pane.title == pane.name {
-                pane.name.clone()
-            } else {
-                format!("{}: {}", pane.name, pane.title)
-            },
-        );
-        if let Some(code) = pane.exit {
-            label.push_str(&format!(" [exited {code}]"));
-        }
         Block::new()
             .borders(Borders::ALL)
             .border_style(border)
-            .title(Line::from(Span::styled(format!(" {label} "), title)))
             .render(*rect, buffer);
+        let word = panenav::word(&pane.status, rows, *pane_id);
+        draw_pane_header(
+            buffer,
+            *rect,
+            pane,
+            word.as_deref(),
+            geometry::pane_number(tab, *pane_id).unwrap_or(1),
+            is_focused,
+            theme,
+        );
         let Some(inner) = geometry::inner(*rect) else {
             continue;
         };
@@ -357,6 +403,166 @@ fn draw_panes(
             draw_selection(buffer, inner, spans, theme);
         }
     }
+}
+
+/// The identity row inside a pane's top border: focused marker, pane number
+/// and name on the left; the OSC 7501 word and the address on the right. The
+/// address is dropped first, then the title detail; the number, name and word
+/// survive longest. An exited pane shows the client's own `exited N` fact in
+/// red instead of a status word.
+fn draw_pane_header(
+    buffer: &mut Buffer,
+    rect: Rect,
+    pane: &super::model::Pane,
+    word: Option<&str>,
+    number: usize,
+    focused: bool,
+    theme: &Theme,
+) {
+    if rect.width <= 2 || rect.height == 0 {
+        return;
+    }
+    let area = Rect::new(
+        rect.x.saturating_add(1),
+        rect.y,
+        rect.width.saturating_sub(2),
+        1,
+    );
+    let background = if focused {
+        theme.active_bg
+    } else {
+        theme.panel_bg
+    };
+    buffer.set_style(area, Style::default().bg(background));
+    // The block drew a border rule through this row; the identity replaces it
+    // with a clean band before the left and right segments are drawn.
+    for x in area.x..area.x.saturating_add(area.width) {
+        if let Some(cell) = buffer.cell_mut((x, area.y)) {
+            cell.set_symbol(" ")
+                .set_style(Style::default().bg(background));
+        }
+    }
+    let name = pane.name.clone();
+    // A name that is just the address is not worth repeating: the readable
+    // title leads and the address stays in the right segment. When there is
+    // no title either, the left identity is only the number and the address
+    // is still shown once, on the right. A name the person chose keeps both.
+    let detail = if name == pane.address {
+        if pane.title.is_empty() || pane.title == name {
+            String::new()
+        } else {
+            pane.title.clone()
+        }
+    } else if pane.title.is_empty() || pane.title == pane.name {
+        name.clone()
+    } else {
+        format!("{name}: {}", pane.title)
+    };
+    let (word, word_color) = match pane.exit {
+        Some(code) => (format!("exited {code}"), theme.red),
+        None => match word {
+            Some(word) => (word.to_owned(), theme.status_word(word)),
+            None => (String::new(), theme.muted),
+        },
+    };
+    let has_word = !word.is_empty();
+    let address = pane.address.as_str();
+    let width = area.width as usize;
+    // The marker, a space, the two-digit number and its trailing space.
+    let fixed = 5;
+    let gap = 1;
+    let word_width = span_width(&word);
+    let address_width = if address.is_empty() {
+        0
+    } else {
+        usize::from(has_word) + span_width(address)
+    };
+    // The gap before the right segment is only spent when one exists.
+    let room = |right: usize| width.saturating_sub(fixed + usize::from(right > 0) * gap + right);
+    // Prefer the richest header that still leaves room to read a name.
+    let stages = [
+        (
+            detail.clone(),
+            word_width + address_width,
+            has_word,
+            !address.is_empty(),
+        ),
+        (detail, word_width, has_word, false),
+        (name.clone(), word_width, has_word, false),
+        (name.clone(), 0, false, false),
+    ];
+    let (mut label, right_width, show_word, show_address) = stages
+        .into_iter()
+        .find(|(candidate, right, _, _)| {
+            width >= fixed + usize::from(*right > 0) * gap + right
+                && room(*right) >= span_width(candidate)
+        })
+        .unwrap_or((name, 0, false, false));
+    label = panenav::truncate(&label, room(right_width));
+
+    let marker = if focused { "›" } else { " " };
+    let marker_style = Style::default()
+        .fg(if focused { theme.accent } else { theme.dim })
+        .bg(background);
+    let number_style = Style::default()
+        .fg(if focused { theme.accent } else { theme.muted })
+        .bg(background)
+        .add_modifier(if focused {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let name_style = Style::default()
+        .fg(if focused { theme.mint } else { theme.subtext0 })
+        .bg(background)
+        .add_modifier(if focused {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let left_width = width.saturating_sub(right_width + usize::from(right_width > 0) * gap);
+    let left = Rect::new(area.x, area.y, left_width as u16, 1);
+    Paragraph::new(Line::from(vec![
+        Span::styled(marker.to_owned(), marker_style),
+        Span::styled(format!(" {number:02} "), number_style),
+        Span::styled(label, name_style),
+    ]))
+    .render(left, buffer);
+    if right_width == 0 {
+        return;
+    }
+    let right = Rect::new(
+        area.x
+            .saturating_add(left_width as u16)
+            .saturating_add(gap as u16),
+        area.y,
+        right_width as u16,
+        1,
+    );
+    let mut spans = Vec::new();
+    if show_word {
+        spans.push(Span::styled(
+            word,
+            Style::default().fg(word_color).bg(background),
+        ));
+    }
+    if show_address {
+        if show_word {
+            spans.push(Span::styled(
+                " ",
+                Style::default().fg(theme.dim).bg(background),
+            ));
+        }
+        spans.push(Span::styled(
+            address.to_owned(),
+            Style::default().fg(theme.dim).bg(background),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).render(right, buffer);
+}
+
+fn span_width(text: &str) -> usize {
+    Span::raw(text).width()
 }
 
 /// Patches the selection color over the terminal cells the local selection
@@ -404,9 +610,10 @@ fn draw_empty(buffer: &mut Buffer, area: Rect, theme: &Theme) {
         .render(at, buffer);
 }
 
-/// Draws the status bar (or the rename prompt or search bar in its place) and
-/// returns the field cursor. The status bar never reverses the row: values
-/// use the accent, secondary text and hints use overlay0.
+/// Draws the single bottom line: the mode chip, the focused terminal's
+/// identity and the context hints. A rename prompt or the search bar replaces
+/// the line. The left side is drawn first, so at a narrow width the hints are
+/// what disappear; the mode and the focused identity stay.
 fn draw_status(
     buffer: &mut Buffer,
     workspace: &Workspace,
@@ -415,29 +622,27 @@ fn draw_status(
     theme: &Theme,
     view: &View<'_>,
 ) -> Option<(u16, u16)> {
-    let rows = view.rows;
-    let scroll_hint = view.scroll_hint;
     if area.width == 0 || area.height == 0 {
         return None;
     }
     if let Some(search) = &ui.search {
         return draw_search(buffer, area, search, theme);
     }
-    buffer.set_style(area, theme.status);
-    let background = theme.panel_bg;
-    let hint = Style::default().fg(theme.overlay0).bg(background);
-    let value = Style::default().fg(theme.accent).bg(background);
-    let body = Style::default().fg(theme.text).bg(background);
+    let background = theme.bar;
+    buffer.set_style(area, Style::default().bg(background));
+    let hint = Style::default().fg(theme.muted).bg(background);
+    let value = Style::default().fg(theme.text).bg(background);
+    let dim = Style::default().fg(theme.dim).bg(background);
     if let Some(prompt) = &ui.prompt {
         let text = prompt.text();
-        // The prompt label itself is the chip: accent background, panel text.
+        // The prompt label itself is the chip: accent background, bar text.
         let chip = Style::default()
             .fg(theme.panel_bg)
             .bg(theme.accent)
             .add_modifier(Modifier::BOLD);
         let line = Line::from(vec![
             Span::styled(prompt.label(), chip),
-            Span::styled(text, body.add_modifier(Modifier::BOLD)),
+            Span::styled(text, value.add_modifier(Modifier::BOLD)),
         ]);
         Paragraph::new(line).render(area, buffer);
         let before: String = prompt.text[..prompt.cursor].iter().collect();
@@ -449,129 +654,171 @@ fn draw_status(
         return Some((x, area.y));
     }
 
-    let space = workspace.active_space();
-    let tab = workspace.active_tab();
-    let tab_name = tab.map(|tab| tab.name.as_str()).unwrap_or("tab");
-    let focused = workspace.focused_pane().and_then(|id| workspace.pane(id));
-    let pane_name = focused
-        .map(|pane| super::machines::qualified_name(&pane.address, &pane.name))
-        .unwrap_or_else(|| "empty".to_owned());
-    let row = focused.and_then(|pane| rows.iter().find(|row| row.pane == pane.id));
-
-    let mut left_spans = vec![
-        Span::styled(" ", hint),
-        Span::styled(space.name.clone(), value),
-        Span::styled(" / ", hint),
-        Span::styled(tab_name.to_owned(), value),
-        Span::styled(" / ", hint),
-        Span::styled(pane_name, value),
-    ];
+    let mode = Mode::current(workspace, ui);
+    let chip = Style::default()
+        .fg(theme.panel_bg)
+        .bg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let mut left = vec![Span::styled(format!(" {} ", mode.label()), chip)];
+    // The runtime supplies the reported identity; a bare frame (tests, simple
+    // callers) still names the focused terminal from the pane record.
+    let identity = view.identity.map(str::to_owned).or_else(|| {
+        workspace
+            .focused_pane()
+            .and_then(|id| workspace.pane(id))
+            .map(|pane| {
+                let name = if pane.title.is_empty() || pane.title == pane.name {
+                    pane.name.clone()
+                } else {
+                    format!("{}: {}", pane.name, pane.title)
+                };
+                if name == pane.address {
+                    pane.address.clone()
+                } else {
+                    format!("{} · {name}", pane.address)
+                }
+            })
+    });
+    match &identity {
+        Some(identity) => left.push(Span::styled(format!(" {identity}"), value)),
+        None => left.push(Span::styled(" empty", dim)),
+    }
     if let Some(message) = &ui.message {
-        left_spans.push(Span::styled(" · ", hint));
-        left_spans.push(Span::styled(message.clone(), hint));
-    } else if let Some(row) = row {
-        if !row.title.is_empty() {
-            left_spans.push(Span::styled(" · ", hint));
-            left_spans.push(Span::styled(row.title.clone(), body));
-        }
-        left_spans.push(Span::styled(" [", hint));
-        left_spans.push(Span::styled(
-            row.word.clone(),
-            Style::default()
-                .fg(theme.status_word(&row.word))
-                .bg(background),
-        ));
-        left_spans.push(Span::styled("]", hint));
-        left_spans.push(Span::styled(format!(" · turn {}", row.turn), hint));
-        if row.pinned {
-            left_spans.push(Span::styled(" · pinned", hint));
-        }
-        if !row.seen {
-            left_spans.push(Span::styled(" · unseen", hint));
-        }
-        if !row.app().is_empty() {
-            left_spans.push(Span::styled(format!(" · {}", row.app()), hint));
-        }
-        if let Some(progress) = row.status.as_ref().and_then(|status| status.progress) {
-            left_spans.push(Span::styled(format!(" {progress}%"), value));
-        }
-    } else if let Some(pane) = focused {
-        if !pane.title.is_empty() {
-            left_spans.push(Span::styled(" · ", hint));
-            left_spans.push(Span::styled(pane.title.clone(), body));
-        }
-        if let Some(status) = &pane.status {
-            left_spans.push(Span::styled(" [", hint));
-            left_spans.push(Span::styled(
-                status.clone(),
-                Style::default()
-                    .fg(theme.status_word(status))
-                    .bg(background),
-            ));
-            left_spans.push(Span::styled("]", hint));
-        }
+        left.push(Span::styled(format!(" · {message}"), hint));
     }
-    let mut right = match ui.connection {
-        Connection::Reconnecting { attempt: 0 } => "reconnecting…".to_owned(),
-        Connection::Reconnecting { attempt } => format!("reconnecting (attempt {attempt})"),
-        Connection::Live if ui.preview.is_some() => {
-            "preview · read-only · any key closes".to_owned()
-        }
-        Connection::Live if ui.manager.open => {
-            "terminals · Enter show/hide · p preview · Esc close".to_owned()
-        }
-        Connection::Live if ui.machines.open => {
-            "machines · Enter connect · a add · n terminal · Esc close".to_owned()
-        }
-        Connection::Live if ui.files.open => overlays::file_hint(ui, view.files).to_owned(),
-        Connection::Live if ui.peek.is_some() => "peek · any key closes".to_owned(),
-        Connection::Live if ui.sidebar.open => "sidebar · Esc closes".to_owned(),
-        Connection::Live => "^b ? help".to_owned(),
-    };
-    if let Some(hint) = scroll_hint
-        && matches!(ui.connection, Connection::Live)
-    {
-        right = format!("{hint} · {right}");
+
+    let (mut right, mut right_style) =
+        right_hint(workspace, ui, mode, view.files, theme, background);
+    let scrolled = view
+        .scroll_hint
+        .filter(|_| matches!(ui.connection, Connection::Live));
+    if let Some(scroll) = scrolled {
+        // A scroll position is state, not a hint: it replaces the context
+        // hints instead of competing with them for the last columns.
+        right = scroll.to_owned();
+        right_style = hint;
     }
-    if let Some(attention) = agents::attention(rows).text() {
-        right = format!("{attention} · {right}");
-    }
-    let right_style = if matches!(ui.connection, Connection::Live) {
-        hint
-    } else {
-        Style::default().fg(theme.yellow).bg(background)
-    };
     let area_width = area.width as usize;
-    let right_width = Span::raw(right.as_str()).width();
-    if right_width + 1 >= area_width {
-        // The right hint is the one that must survive a narrow bar.
-        Paragraph::new(Line::from(Span::styled(right, right_style)))
-            .style(theme.status)
-            .render(area, buffer);
-        return None;
+    let left_width: usize = left.iter().map(Span::width).sum();
+    Paragraph::new(Line::from(left)).render(area, buffer);
+    // The hints are the first thing to go when the line is tight. A scroll
+    // position is the exception: it is truncated to the free columns so the
+    // user can still tell that the view is not live.
+    let mut right_width = span_width(&right);
+    if scrolled.is_some() && left_width + 1 + right_width > area_width {
+        let available = area_width.saturating_sub(left_width + 2);
+        right = super::panenav::truncate(&right, available);
+        right_width = span_width(&right);
     }
-    // Reserve the right edge for the hint and clip the left side first, so a
-    // long message never hides the key that gets the person out of a mode.
-    let left_width = area_width - right_width - 1;
-    Paragraph::new(Line::from(left_spans))
-        .style(theme.status)
-        .render(
-            Rect::new(area.x, area.y, left_width as u16, area.height),
-            buffer,
+    if right_width + 1 < area_width && left_width + 1 + right_width <= area_width {
+        let hint_area = Rect::new(
+            area.x.saturating_add((area_width - right_width - 1) as u16),
+            area.y,
+            (right_width + 1) as u16,
+            1,
         );
-    let hint_area = Rect::new(
-        area.x.saturating_add(left_width as u16),
-        area.y,
-        area.width.saturating_sub(left_width as u16),
-        area.height,
-    );
-    Paragraph::new(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(right, right_style),
-    ]))
-    .style(theme.status)
-    .render(hint_area, buffer);
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(right, right_style),
+        ]))
+        .render(hint_area, buffer);
+    }
     None
+}
+
+/// The one mode the bottom line names, most specific first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Prefix,
+    Copy,
+    Resize,
+    Zoom,
+}
+
+impl Mode {
+    fn current(workspace: &Workspace, ui: &UiState) -> Mode {
+        if ui.resize {
+            Mode::Resize
+        } else if ui.selecting.is_some() {
+            Mode::Copy
+        } else if ui.prefix {
+            Mode::Prefix
+        } else if workspace
+            .active_tab()
+            .and_then(|tab| tab.zoomed)
+            .is_some_and(|pane| workspace.active_tab().is_some_and(|tab| tab.contains(pane)))
+        {
+            Mode::Zoom
+        } else {
+            Mode::Normal
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Normal => "NORMAL",
+            Mode::Prefix => "PREFIX",
+            Mode::Copy => "COPY",
+            Mode::Resize => "RESIZE",
+            Mode::Zoom => "ZOOM",
+        }
+    }
+}
+
+/// The right side of the bottom line: a mode's essential keys, or the current
+/// context (connection, overlay or the default hints). Transient overrides
+/// keep priority, as before.
+fn right_hint(
+    _workspace: &Workspace,
+    ui: &UiState,
+    mode: Mode,
+    files: Option<&Pane>,
+    theme: &Theme,
+    background: Color,
+) -> (String, Style) {
+    if let Connection::Reconnecting { attempt } = ui.connection {
+        let text = if attempt == 0 {
+            "reconnecting…".to_owned()
+        } else {
+            format!("reconnecting (attempt {attempt})")
+        };
+        return (text, Style::default().fg(theme.yellow).bg(background));
+    }
+    let hint = Style::default().fg(theme.muted).bg(background);
+    match mode {
+        Mode::Prefix => {
+            return ("esc cancel · ^b prefix · ? keys".to_owned(), hint);
+        }
+        Mode::Copy => {
+            return ("h/j/k/l move · y copy · Esc cancel".to_owned(), hint);
+        }
+        Mode::Resize => {
+            return (
+                "h/l width · j/k height · Shift 5 · Esc done".to_owned(),
+                hint,
+            );
+        }
+        Mode::Normal | Mode::Zoom => {}
+    }
+    let text = if ui.preview.is_some() {
+        "preview · read-only · any key closes"
+    } else if ui.manager.open {
+        "terminals · Enter show/hide · p preview · Esc close"
+    } else if ui.machines.open {
+        "machines · Enter connect · a add · n terminal · Esc close"
+    } else if ui.files.open {
+        return (overlays::file_hint(ui, files).to_owned(), hint);
+    } else if ui.peek.is_some() {
+        "peek · any key closes"
+    } else if ui.sidebar.open {
+        "rail · j/k move · Enter jump · Esc closes"
+    } else if mode == Mode::Zoom {
+        "^b z unzoom  ^b ? help"
+    } else {
+        "^b a rail  ^b z zoom  ^b ? help"
+    };
+    (text.to_owned(), hint)
 }
 
 /// The search bar drawn in the status row: a chip label, the literal query,
@@ -625,104 +872,6 @@ fn draw_search(
         .saturating_add(Span::raw(before.as_str()).width() as u16)
         .min(area.x.saturating_add(area.width.saturating_sub(1)));
     Some((x, area.y))
-}
-
-/// The one-row mode strip. It overlays the last pane row and leaves the
-/// status bar underneath, so opening or closing a mode never resizes a
-/// terminal.
-fn draw_strip(buffer: &mut Buffer, rects: &Rects, ui: &UiState, theme: &Theme) {
-    let Some(rect) = strip_rect(rects) else {
-        return;
-    };
-    let mode = if ui.resize {
-        Some(Mode::Resize)
-    } else if ui.selecting.is_some() {
-        Some(Mode::Copy)
-    } else if ui.prefix {
-        Some(Mode::Prefix)
-    } else {
-        None
-    };
-    let Some(mode) = mode else {
-        return;
-    };
-    buffer.set_style(rect, theme.panel());
-    let hint = Style::default().fg(theme.overlay0).bg(theme.panel_bg);
-    let key = Style::default().fg(theme.accent).bg(theme.panel_bg);
-    let (chip_label, chip_color) = match mode {
-        Mode::Prefix => (" PREFIX ", theme.accent),
-        Mode::Copy => (" COPY ", theme.mauve),
-        Mode::Resize => (" RESIZE ", theme.yellow),
-    };
-    let chip = Style::default()
-        .fg(theme.panel_bg)
-        .bg(chip_color)
-        .add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::styled(chip_label, chip)];
-    match mode {
-        Mode::Prefix => {
-            spans.extend([
-                Span::styled("esc", key),
-                Span::styled(" cancel · ", hint),
-                Span::styled("^b", key),
-                Span::styled(" send prefix · ", hint),
-                Span::styled("?", key),
-                Span::styled(" keybinds", hint),
-            ]);
-        }
-        Mode::Copy => {
-            spans.extend([
-                Span::styled("h/j/k/l", key),
-                Span::styled(" or ", hint),
-                Span::styled("w/b/e", key),
-                Span::styled(" · ", hint),
-                Span::styled("v/space", key),
-                Span::styled(" select · ", hint),
-                Span::styled("y/enter", key),
-                Span::styled(" copy · ", hint),
-                Span::styled("/?", key),
-                Span::styled(" search · ", hint),
-                Span::styled("esc", key),
-                Span::styled(" cancel", hint),
-            ]);
-        }
-        Mode::Resize => {
-            spans.extend([
-                Span::styled("h/l", key),
-                Span::styled(" width · ", hint),
-                Span::styled("j/k", key),
-                Span::styled(" height · ", hint),
-                Span::styled("esc", key),
-                Span::styled(" done", hint),
-            ]);
-        }
-    }
-    Paragraph::new(Line::from(spans))
-        .style(theme.panel())
-        .render(rect, buffer);
-}
-
-#[derive(Clone, Copy)]
-enum Mode {
-    Prefix,
-    Copy,
-    Resize,
-}
-
-/// The strip covers the last row of the pane area, never the status bar.
-fn strip_rect(rects: &Rects) -> Option<Rect> {
-    if rects.workspace.width == 0 || rects.workspace.height == 0 {
-        return None;
-    }
-    Some(Rect::new(
-        rects.workspace.x,
-        rects
-            .workspace
-            .y
-            .saturating_add(rects.workspace.height.saturating_sub(1)),
-        rects.workspace.width,
-        1,
-    ))
 }
 
 #[cfg(test)]
