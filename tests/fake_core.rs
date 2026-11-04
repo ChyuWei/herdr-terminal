@@ -230,6 +230,18 @@ fn run_tests() {
     #[cfg(unix)]
     workspace_mouse_clicks_focus_panes_and_select_tabs();
     #[cfg(unix)]
+    workspace_sidebar_mouse_selects_spaces_and_jumps_to_agents();
+    #[cfg(unix)]
+    workspace_sidebar_keys_walk_and_act();
+    #[cfg(unix)]
+    workspace_sidebar_is_unavailable_on_narrow_terminals();
+    #[cfg(unix)]
+    workspace_hiding_the_sidebar_releases_its_focus();
+    #[cfg(unix)]
+    workspace_narrow_restore_does_not_focus_the_sidebar();
+    #[cfg(unix)]
+    workspace_resize_mode_moves_the_focused_split_and_leaves_cleanly();
+    #[cfg(unix)]
     workspace_a_fresh_press_leaves_a_selection_and_routes_normally();
     #[cfg(unix)]
     workspace_an_ordinary_key_leaves_selection_and_reaches_the_program();
@@ -237,6 +249,10 @@ fn run_tests() {
     workspace_a_selection_exit_key_forwards_its_release();
     #[cfg(unix)]
     workspace_a_drag_selection_extends_and_copies_the_range();
+    #[cfg(unix)]
+    workspace_search_from_copy_mode_ends_the_copy_strip();
+    #[cfg(unix)]
+    workspace_mouse_selection_leaves_resize_mode();
     #[cfg(unix)]
     workspace_dragging_a_split_sends_exact_resize_frames();
     #[cfg(unix)]
@@ -348,7 +364,8 @@ impl FakeScreen {
 
     /// The default workspace with extra environment (an editor, a temp cwd).
     fn spawn_workspace_env(scratch: &Scratch, scenario: &str, env: &[(&str, &str)]) -> FakeScreen {
-        Self::spawn_parts_size_env(scratch, scenario, &[], &[], None, 100, 30, env)
+        // Wide enough that long temp paths in notices are not clipped.
+        Self::spawn_parts_size_env(scratch, scenario, &[], &[], None, 140, 30, env)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -430,6 +447,16 @@ impl FakeScreen {
     fn send(&mut self, bytes: &[u8]) {
         self.input.write_all(bytes).expect("write to the screen");
         self.input.flush().expect("flush the screen");
+    }
+
+    /// Resizes the outer PTY and the local replay VT together. A test PTY is
+    /// not the child's controlling terminal, so TIOCSWINSZ alone does not
+    /// deliver SIGWINCH; the test sends it explicitly.
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.pty.resize(cols, rows);
+        self.probe.signal(libc::SIGWINCH);
+        self.cols = cols;
+        self.rows = rows;
     }
 
     /// Types printable ASCII into the client as separate key events.
@@ -1010,7 +1037,7 @@ fn workspace_a_background_exit_does_not_steal_the_active_tab() {
     let started = runs();
     assert_eq!(
         started[2]["params"]["size"],
-        json!({"cols": 78, "rows": 20}),
+        json!({"cols": 58, "rows": 20}),
         "the background replacement starts at its own tab's size"
     );
 
@@ -1092,7 +1119,7 @@ fn workspace_a_local_replacement_ignores_the_focused_panes_cwd() {
 #[cfg(unix)]
 fn workspace_an_instantly_exiting_replacement_is_not_respawned() {
     let scratch = Scratch::new("respawn-chain");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "respawn-chain");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "respawn-chain", 120, 30);
     assert!(
         screen.wait_text("exits immediately", secs(10)),
         "the broken-shell message was not shown; screen={:?} stderr={:?}",
@@ -3440,8 +3467,8 @@ fn workspace_sends_each_new_terminals_attach_size_to_run() {
     assert_eq!(initial.len(), 1, "only the initial shell has run");
     assert_eq!(
         initial[0]["params"]["size"],
-        json!({"cols": 78, "rows": 20}),
-        "the initial shell must fill the pane inside the 80x24 viewport"
+        json!({"cols": 58, "rows": 20}),
+        "the initial shell must fill the pane right of the 20-column sidebar"
     );
 
     workspace.command(b'v');
@@ -3453,8 +3480,8 @@ fn workspace_sends_each_new_terminals_attach_size_to_run() {
     let runs = runs();
     assert_eq!(
         runs[1]["params"]["size"],
-        json!({"cols": 37, "rows": 20}),
-        "the split's right-hand pane is 37 cells wide"
+        json!({"cols": 27, "rows": 20}),
+        "the split's right-hand pane is 27 cells wide"
     );
 
     workspace.send(&[0x1d]);
@@ -3495,7 +3522,7 @@ fn workspace_an_explicit_program_gets_the_new_tab_attach_size() {
     assert_eq!(runs.len(), 1, "the explicit program must start once");
     assert_eq!(
         runs[0]["params"]["size"],
-        json!({"cols": 78, "rows": 20}),
+        json!({"cols": 58, "rows": 20}),
         "the new tab must start at the pane it will attach at"
     );
     assert_eq!(
@@ -4362,7 +4389,7 @@ fn workspace_merges_a_concurrent_change_in_another_space() {
 fn workspace_keeps_local_on_a_same_tab_conflict_and_recovers_the_other_pane() {
     let scratch = Scratch::new("doc-conflict-tab");
     scratch.seed_doc(doc_one_pane(), 5);
-    let mut workspace = FakeScreen::spawn_workspace(&scratch, "doc-conflict-tab");
+    let mut workspace = FakeScreen::spawn_workspace_wide(&scratch, "doc-conflict-tab", 140, 30);
     assert!(
         workspace.wait_text("PANE-ONE", secs(10)),
         "the restored pane was not drawn; screen={:?} stderr={:?}",
@@ -4847,7 +4874,7 @@ fn attach_count(scratch: &Scratch, address: &str) -> usize {
 #[cfg(unix)]
 fn workspace_marks_visible_turns_seen_and_alerts_for_hidden_finishes() {
     let scratch = Scratch::new("agents-turn");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-turn");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-turn", 140, 30);
     assert!(
         wait_for_text(&screen, "[idle]"),
         "the reported agent was not shown: {:?}",
@@ -4883,11 +4910,22 @@ fn workspace_marks_visible_turns_seen_and_alerts_for_hidden_finishes() {
 
     // Same turn, focus away and back: the seen write is not repeated.
     screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"), "sidebar did not open");
+    assert!(
+        wait_for_text(&screen, "sidebar · Esc closes"),
+        "the sidebar did not take focus: {:?}",
+        screen.rendered()
+    );
     screen.send(b"\x1b");
     assert!(
-        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
-        "sidebar did not close: {:?}",
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "the sidebar did not give focus back: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains(" agents"),
+        "the panel itself must stay visible: {:?}",
         screen.rendered()
     );
     // Another event at the same turn gives the refreshed row a visible change
@@ -4906,12 +4944,12 @@ fn workspace_marks_visible_turns_seen_and_alerts_for_hidden_finishes() {
     );
 }
 
-/// While the sidebar covers the panes, a busy agent finishing is one notice and
-/// one BEL, and its new turn stays unseen.
+/// While another tab hides a busy agent, its finish is one notice and one
+/// BEL, and its new turn stays unseen even with the sidebar focused.
 #[cfg(unix)]
 fn workspace_alerts_once_for_a_hidden_finish_and_keeps_the_turn_unseen() {
     let scratch = Scratch::new("agents-hidden");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-hidden-done");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-hidden-done", 140, 30);
     assert!(wait_for_text(&screen, "[blocked]"));
 
     // A new tab makes t1 hidden and gives the working t2 the whole tab.
@@ -4926,11 +4964,15 @@ fn workspace_alerts_once_for_a_hidden_finish_and_keeps_the_turn_unseen() {
         "visible t2 turn 1 not seen"
     );
 
-    // Back to the first tab; the sidebar then covers both panes.
+    // Back to the first tab; the other tab's agent is out of sight.
     screen.command(b'1');
     assert!(wait_for_text(&screen, "Build"));
     screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"));
+    assert!(
+        wait_for_text(&screen, "sidebar · Esc closes"),
+        "the sidebar did not take focus: {:?}",
+        screen.rendered()
+    );
     let version = scratch.doc_version();
     let writes = doc_set_calls(&scratch);
 
@@ -4945,11 +4987,6 @@ fn workspace_alerts_once_for_a_hidden_finish_and_keeps_the_turn_unseen() {
     assert!(
         wait_for_text(&screen, "finished"),
         "the hidden finish had no notice: {:?}",
-        screen.rendered()
-    );
-    assert!(
-        wait_for_text(&screen, "unseen"),
-        "the hidden turn was marked seen: {:?}",
         screen.rendered()
     );
     assert!(
@@ -4971,18 +5008,16 @@ fn workspace_alerts_once_for_a_hidden_finish_and_keeps_the_turn_unseen() {
 #[cfg(unix)]
 fn workspace_honors_another_clients_pin_label() {
     let scratch = Scratch::new("agents-pin-event");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-pin-event");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-pin-event", 120, 30);
     assert!(wait_for_text(&screen, "[blocked]"));
     screen.command(b'v');
     assert!(wait_for_text(&screen, "PANE-TWO"));
 
-    screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"));
     let version = scratch.doc_version();
     assert!(
         common::wait_until(secs(10), || {
             let text = screen.rendered();
-            match (text.find("Review"), text.find("Build")) {
+            match (text.find("* Review"), text.find("Build blocked")) {
                 (Some(review), Some(build)) => review < build,
                 _ => false,
             }
@@ -4991,7 +5026,7 @@ fn workspace_honors_another_clients_pin_label() {
         screen.rendered()
     );
     assert!(
-        screen.rendered().contains("* idle"),
+        screen.rendered().contains("* Review idle"),
         "the pin marker is missing: {:?}",
         screen.rendered()
     );
@@ -5010,7 +5045,7 @@ fn workspace_honors_another_clients_pin_label() {
 #[cfg(unix)]
 fn workspace_pins_unpins_and_marks_unread_with_exact_labels() {
     let scratch = Scratch::new("agents-pin");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-pin");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-pin", 120, 30);
     assert!(wait_for_text(&screen, "[blocked]"));
     assert!(
         wait_for_seen(&scratch, "t1", 2),
@@ -5020,8 +5055,12 @@ fn workspace_pins_unpins_and_marks_unread_with_exact_labels() {
     let version = scratch.doc_version();
     let writes = doc_set_calls(&scratch);
     screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"));
-    assert_doc_untouched(&scratch, version, writes, "opening the sidebar");
+    assert!(
+        wait_for_text(&screen, "sidebar · Esc closes"),
+        "the sidebar did not take focus: {:?}",
+        screen.rendered()
+    );
+    assert_doc_untouched(&scratch, version, writes, "focusing the sidebar");
     let version = scratch.doc_version();
     let writes = doc_set_calls(&scratch);
 
@@ -5070,7 +5109,7 @@ fn workspace_pins_unpins_and_marks_unread_with_exact_labels() {
 #[cfg(unix)]
 fn workspace_sidebar_toggle_and_close_do_not_write_the_document() {
     let scratch = Scratch::new("agents-sidebar-doc");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-turn");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-turn", 120, 30);
     assert!(wait_for_text(&screen, "[idle]"));
     assert!(
         wait_doc_has(&scratch, "t1"),
@@ -5081,37 +5120,46 @@ fn workspace_sidebar_toggle_and_close_do_not_write_the_document() {
     let writes = doc_set_calls(&scratch);
 
     screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"));
-    assert_doc_untouched(&scratch, version, writes, "opening the sidebar");
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+    assert_doc_untouched(&scratch, version, writes, "focusing the sidebar");
 
     screen.command(b'a');
     assert!(
-        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
-        "the sidebar did not close with a: {:?}",
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "the sidebar did not give focus back with a: {:?}",
         screen.rendered()
     );
-    assert_doc_untouched(&scratch, version, writes, "closing the sidebar with a");
+    assert!(
+        screen.rendered().contains(" agents"),
+        "the panel itself must stay visible: {:?}",
+        screen.rendered()
+    );
+    assert_doc_untouched(&scratch, version, writes, "giving focus back with a");
 
     screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"));
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
     screen.send(b"\x1b");
     assert!(
-        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
-        "the sidebar did not close with Esc: {:?}",
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "the sidebar did not give focus back with Esc: {:?}",
         screen.rendered()
     );
-    assert_doc_untouched(&scratch, version, writes, "closing the sidebar with Esc");
+    assert_doc_untouched(&scratch, version, writes, "giving focus back with Esc");
 }
 
-/// Sidebar keys are modal: an unhandled key is consumed, the sidebar stays
-/// open, and the same key reaches the pane once the sidebar closes.
+/// Sidebar keys are modal: an unhandled key is consumed, the sidebar keeps
+/// focus, and the same key reaches the pane once focus returns.
 #[cfg(unix)]
 fn workspace_sidebar_consumes_unhandled_keys() {
     let scratch = Scratch::new("agents-sidebar-keys");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-turn");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-turn", 120, 30);
     assert!(wait_for_text(&screen, "[idle]"));
     screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"));
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
 
     let before = attach_keys(&scratch).len();
     screen.send(b"z");
@@ -5136,8 +5184,8 @@ fn workspace_sidebar_consumes_unhandled_keys() {
         attach_keys(&scratch)
     );
     assert!(
-        screen.rendered().contains("agents"),
-        "the sidebar closed on an unhandled key: {:?}",
+        screen.rendered().contains("sidebar · Esc closes"),
+        "the sidebar lost focus on an unhandled key: {:?}",
         screen.rendered()
     );
     assert!(
@@ -5148,13 +5196,15 @@ fn workspace_sidebar_consumes_unhandled_keys() {
 
     screen.send(b"\x1b");
     assert!(
-        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
-        "the sidebar did not close: {:?}",
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "the sidebar did not give focus back: {:?}",
         screen.rendered()
     );
     assert!(
         !screen.rendered().contains("working"),
-        "the agent changed while the sidebar was open: {:?}",
+        "the agent changed while the sidebar had focus: {:?}",
         screen.rendered()
     );
     screen.send(b"z");
@@ -5175,7 +5225,7 @@ fn workspace_sidebar_consumes_unhandled_keys() {
 #[cfg(unix)]
 fn workspace_sidebar_and_peek_do_not_resize_panes() {
     let scratch = Scratch::new("agents-resize");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-two");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-two", 120, 30);
     assert!(wait_for_text(&screen, "[blocked]"));
     screen.command(b'v');
     assert!(wait_for_text(&screen, "PANE-TWO"));
@@ -5187,23 +5237,25 @@ fn workspace_sidebar_and_peek_do_not_resize_panes() {
     let resizes = resize_frames(&scratch);
 
     screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"));
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
     assert_eq!(
         resize_frames(&scratch),
         resizes,
-        "opening the sidebar resized a pane: {:?}",
+        "focusing the sidebar resized a pane: {:?}",
         scratch.entries()
     );
     screen.send(b"\x1b");
     assert!(
-        common::wait_until(secs(5), || !screen.rendered().contains("agents")),
-        "the sidebar did not close: {:?}",
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "the sidebar did not give focus back: {:?}",
         screen.rendered()
     );
     assert_eq!(
         resize_frames(&scratch),
         resizes,
-        "closing the sidebar resized a pane: {:?}",
+        "blurring the sidebar resized a pane: {:?}",
         scratch.entries()
     );
 
@@ -5278,7 +5330,7 @@ fn workspace_startup_baseline_does_not_alert_for_blocked_agents() {
 #[cfg(unix)]
 fn workspace_reconnect_baseline_does_not_replay_an_alert() {
     let scratch = Scratch::new("agents-reconnect-baseline");
-    let screen = FakeScreen::spawn_workspace(&scratch, "agents-reconnect-blocked");
+    let screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-reconnect-blocked", 120, 30);
     assert!(
         common::wait_until(secs(10), || generation_count(&scratch) >= 2),
         "the client did not reconnect: {:?}",
@@ -5307,7 +5359,7 @@ fn workspace_reconnect_baseline_does_not_replay_an_alert() {
 #[cfg(unix)]
 fn workspace_missed_baseline_does_not_replay_an_alert() {
     let scratch = Scratch::new("agents-missed-baseline");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-missed-blocked");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-missed-blocked", 120, 30);
     assert!(wait_for_text(&screen, "[blocked]"));
     screen.send(b"x");
     assert!(
@@ -5338,7 +5390,7 @@ fn workspace_missed_baseline_does_not_replay_an_alert() {
 #[cfg(unix)]
 fn workspace_jumps_to_an_agent_and_marks_it_seen() {
     let scratch = Scratch::new("agents-jump");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-jump");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-jump", 120, 30);
     assert!(wait_for_text(&screen, "[blocked]"));
     screen.command(b'c');
     assert!(wait_for_text(&screen, "PANE-TWO"));
@@ -5385,7 +5437,7 @@ fn workspace_jumps_to_an_agent_and_marks_it_seen() {
 #[cfg(unix)]
 fn workspace_peeks_an_agent_without_reading_its_screen() {
     let scratch = Scratch::new("agents-peek");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-two");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-two", 120, 30);
     assert!(wait_for_text(&screen, "[blocked]"));
     screen.command(b'v');
     assert!(wait_for_text(&screen, "PANE-TWO"));
@@ -5429,7 +5481,7 @@ fn workspace_peeks_an_agent_without_reading_its_screen() {
 #[cfg(unix)]
 fn workspace_retries_a_failed_seen_write_with_a_bounded_delay() {
     let scratch = Scratch::new("agents-fail");
-    let mut screen = FakeScreen::spawn_workspace(&scratch, "agents-fail");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-fail", 120, 30);
     assert!(
         wait_for_text(&screen, "could not mark t1 seen"),
         "no failure was reported: {:?}",
@@ -5445,10 +5497,10 @@ fn workspace_retries_a_failed_seen_write_with_a_bounded_delay() {
         "the retry never succeeded: {:?}",
         label_calls(&scratch)
     );
-    // Opening the sidebar is a later observable action; by then the bounded
+    // Focusing the sidebar is a later observable action; by then the bounded
     // retries must have stopped at three attempts.
     screen.command(b'a');
-    assert!(wait_for_text(&screen, "agents"));
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
     assert_eq!(
         label_calls(&scratch).len(),
         3,
@@ -5463,7 +5515,7 @@ fn workspace_retries_a_failed_seen_write_with_a_bounded_delay() {
 #[cfg(unix)]
 fn workspace_gives_up_after_a_timed_out_seen_write() {
     let scratch = Scratch::new("agents-slow-fail");
-    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-slow-fail", 160, 30);
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-slow-fail", 220, 40);
     assert!(
         wait_for_text(&screen, "could not mark t1 seen"),
         "the 2 s label timeout was not reported: {:?}",
@@ -5507,7 +5559,7 @@ fn workspace_gives_up_after_a_timed_out_seen_write() {
 #[cfg(unix)]
 fn workspace_reconnects_after_a_lost_label_write() {
     let scratch = Scratch::new("agents-lost");
-    let screen = FakeScreen::spawn_workspace(&scratch, "agents-lost");
+    let screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-lost", 120, 30);
     assert!(
         wait_for_text(&screen, "reconnected to core"),
         "the client did not recover: {:?}",
@@ -5548,7 +5600,12 @@ fn workspace_restores_an_open_sidebar_from_the_local_view() {
     let mut screen = FakeScreen::spawn_workspace_as(&scratch, "doc-view", "work");
     assert!(
         screen.wait_text("no agents yet", secs(10)),
-        "the persisted sidebar was not drawn open before any key: {:?}",
+        "the sidebar was not drawn before any key: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.wait_text("sidebar · Esc closes", secs(10)),
+        "the persisted sidebar focus was not applied before any key: {:?}",
         screen.rendered()
     );
     assert_eq!(
@@ -5557,8 +5614,15 @@ fn workspace_restores_an_open_sidebar_from_the_local_view() {
         "restoring the sidebar flag must not write the document"
     );
 
-    // Closing it reveals the tab the rest of the local view selected.
+    // Giving focus back leaves the tab the rest of the local view selected.
     screen.command(b'a');
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "the sidebar did not give focus back: {:?}",
+        screen.rendered()
+    );
     assert!(
         screen.wait_text("TAB-TWO", secs(5)),
         "the rest of the local view was lost: {:?}",
@@ -5601,7 +5665,7 @@ fn workspace_mouse_clicks_focus_panes_and_select_tabs() {
     // A grid click moves the focus back to the first pane. It is a plain
     // focus click: no selection mode, no Esc, and typing reaches the program
     // immediately.
-    screen.send(click(10, 5).as_bytes());
+    screen.send(click(30, 5).as_bytes());
     assert!(
         wait_for_text(&screen, "/ t1"),
         "clicking the left pane did not focus it: {:?}",
@@ -5618,7 +5682,7 @@ fn workspace_mouse_clicks_focus_panes_and_select_tabs() {
         program_input(&scratch)
     );
     assert!(
-        !screen.rendered().contains("selection:"),
+        !screen.rendered().contains(" COPY "),
         "a plain click entered selection mode: {:?}",
         screen.rendered()
     );
@@ -5640,7 +5704,7 @@ fn workspace_mouse_clicks_focus_panes_and_select_tabs() {
     let version = scratch.doc_version();
     let writes = doc_set_calls(&scratch);
 
-    screen.send(click(10, 0).as_bytes());
+    screen.send(click(30, 0).as_bytes());
     assert!(
         wait_for_text(&screen, "PANE-ONE"),
         "clicking the first tab did not show it: {:?} stderr={:?}",
@@ -5648,7 +5712,7 @@ fn workspace_mouse_clicks_focus_panes_and_select_tabs() {
         screen.errors()
     );
     assert!(wait_for_text(&screen, "/ t1"), "{:?}", screen.rendered());
-    screen.send(click(19, 0).as_bytes());
+    screen.send(click(39, 0).as_bytes());
     assert!(
         wait_for_text(&screen, "PANE-THREE"),
         "clicking the second tab did not show it: {:?}",
@@ -5656,6 +5720,404 @@ fn workspace_mouse_clicks_focus_panes_and_select_tabs() {
     );
     assert!(wait_for_text(&screen, "/ t3"), "{:?}", screen.rendered());
     assert_doc_untouched(&scratch, version, writes, "tab selection");
+}
+
+/// The sidebar is a first-class mouse target: a space row switches spaces, an
+/// agent row jumps to its pane, and both work while the panel has keyboard
+/// focus (the click then gives focus back).
+#[cfg(unix)]
+fn workspace_sidebar_mouse_selects_spaces_and_jumps_to_agents() {
+    let scratch = Scratch::new("sidebar-click-spaces");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "m6-multi", 120, 30);
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'C');
+    assert!(
+        wait_for_text(&screen, "space 2 / tab 2"),
+        "the new space did not become active: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "the new space's pane did not paint: {:?}",
+        screen.rendered()
+    );
+
+    // Space 1 is the first row under the "spaces" header.
+    screen.send(click(5, 1).as_bytes());
+    assert!(
+        wait_for_text(&screen, "space 1 / tab 1"),
+        "clicking the space row did not switch spaces: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "the first space's terminal was not shown: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(5, 2).as_bytes());
+    assert!(
+        wait_for_text(&screen, "space 2 / tab 2"),
+        "clicking the second space row did not switch back: {:?}",
+        screen.rendered()
+    );
+    screen.send(&[0x1d]);
+    assert_eq!(screen.wait_exit(secs(5)).expect("detach").code(), Some(0));
+
+    // Agent rows jump: blocked Build is first, done Review second.
+    let scratch = Scratch::new("sidebar-click-agents");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-two", 120, 30);
+    assert!(wait_for_text(&screen, "[blocked]"));
+    screen.command(b'v');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "{:?}",
+        screen.rendered()
+    );
+    assert!(wait_for_text(&screen, "/ t2"), "{:?}", screen.rendered());
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+
+    screen.send(click(5, 3).as_bytes());
+    assert!(
+        wait_for_text(&screen, "/ t1"),
+        "clicking the Build row did not jump to t1: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "the agent click did not give focus back to the pane: {:?}",
+        screen.rendered()
+    );
+    screen.send(click(5, 4).as_bytes());
+    assert!(
+        wait_for_text(&screen, "/ t2"),
+        "clicking the Review row did not jump to t2: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "the second agent click did not give focus back: {:?}",
+        screen.rendered()
+    );
+    screen.send(&[0x1d]);
+    assert_eq!(screen.wait_exit(secs(5)).expect("detach").code(), Some(0));
+}
+
+/// The sidebar's documented keys are wired: j/k move the selection, g/G jump
+/// to the first/last item, Enter switches a space or jumps to an agent, i
+/// peeks, p pins, u marks unread and Esc gives the keyboard back.
+#[cfg(unix)]
+fn workspace_sidebar_keys_walk_and_act() {
+    let scratch = Scratch::new("sidebar-key-walk");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-two", 120, 30);
+    assert!(
+        wait_for_text(&screen, "[blocked]"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'v');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "{:?}",
+        screen.rendered()
+    );
+    assert!(wait_for_text(&screen, "/ t2"), "{:?}", screen.rendered());
+
+    // `a` selects the focused agent (Review); k moves to Build and Enter jumps.
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+    screen.send(b"k");
+    screen.send(b"\r");
+    assert!(
+        wait_for_text(&screen, "/ t1"),
+        "k did not select the first agent: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "Enter on an agent kept the panel focused: {:?}",
+        screen.rendered()
+    );
+
+    // j moves down again; Enter jumps to Review.
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+    screen.send(b"j");
+    screen.send(b"\r");
+    assert!(
+        wait_for_text(&screen, "/ t2"),
+        "j did not select the next agent: {:?}",
+        screen.rendered()
+    );
+
+    // g selects the first item (space 1) and j walks to Build.
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+    screen.send(b"g");
+    screen.send(b"j");
+    screen.send(b"\r");
+    assert!(
+        wait_for_text(&screen, "/ t1"),
+        "g/j did not walk to the first agent: {:?}",
+        screen.rendered()
+    );
+
+    // G selects the last item (Review).
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+    screen.send(b"G");
+    screen.send(b"\r");
+    assert!(
+        wait_for_text(&screen, "/ t2"),
+        "G did not select the last row: {:?}",
+        screen.rendered()
+    );
+
+    // i peeks the selected agent; any key closes the peek and the panel stays.
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+    screen.send(b"i");
+    assert!(
+        wait_for_text(&screen, "peek · any key closes"),
+        "i did not peek the selected agent: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"x");
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("peek · any key closes")
+        }),
+        "the peek did not close: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("sidebar · Esc closes"),
+        "closing the peek lost the sidebar: {:?}",
+        screen.rendered()
+    );
+
+    // p pins Review; u writes its seen label one turn lower.
+    screen.send(b"p");
+    assert!(
+        common::wait_until(secs(5), || {
+            label_calls(&scratch).iter().any(|call| {
+                call["params"]["terminal"] == json!("t2")
+                    && call["params"]["labels"] == json!({"herdr.pinned": "1"})
+            })
+        }),
+        "p did not pin the selected agent: {:?}",
+        label_calls(&scratch)
+    );
+    screen.send(b"u");
+    assert!(
+        common::wait_until(secs(5), || {
+            label_calls(&scratch).iter().any(|call| {
+                call["params"]["terminal"] == json!("t2")
+                    && call["params"]["labels"] == json!({"herdr.seen": "0"})
+            })
+        }),
+        "u did not mark the selected agent unread: {:?}",
+        label_calls(&scratch)
+    );
+
+    // Esc gives the keyboard back.
+    screen.send(b"\x1b");
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "Esc kept the panel focused: {:?}",
+        screen.rendered()
+    );
+    screen.send(&[0x1d]);
+    assert_eq!(screen.wait_exit(secs(5)).expect("detach").code(), Some(0));
+
+    // Enter on a space switches to it and keeps the panel focused.
+    let scratch = Scratch::new("sidebar-key-walk-space");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "m6-multi", 120, 30);
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'C');
+    assert!(
+        wait_for_text(&screen, "space 2 / tab 2"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+    screen.send(b"g");
+    screen.send(b"\r");
+    assert!(
+        wait_for_text(&screen, "space 1 / tab 1"),
+        "Enter did not switch to the selected space: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        screen.rendered().contains("sidebar · Esc closes"),
+        "switching a space closed the panel: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"\x1b");
+    assert!(
+        common::wait_until(secs(5), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "Esc kept the panel focused after a space switch: {:?}",
+        screen.rendered()
+    );
+    screen.send(&[0x1d]);
+    assert_eq!(screen.wait_exit(secs(5)).expect("detach").code(), Some(0));
+}
+
+/// Below 70 columns there is no room for the panel: `prefix a` explains that
+/// instead of opening an unusable one.
+#[cfg(unix)]
+fn workspace_sidebar_is_unavailable_on_narrow_terminals() {
+    let scratch = Scratch::new("sidebar-narrow");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "agents-turn", 69, 24);
+    assert!(wait_for_text(&screen, "[idle]"), "{:?}", screen.rendered());
+    assert!(
+        !screen.rendered().contains(" spaces"),
+        "a narrow terminal drew the sidebar: {:?}",
+        screen.rendered()
+    );
+    screen.command(b'a');
+    assert!(
+        wait_for_text(&screen, "needs a terminal"),
+        "no narrow-terminal notice: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("sidebar · Esc closes"),
+        "a narrow terminal focused a hidden sidebar: {:?}",
+        screen.rendered()
+    );
+    // The failed toggle leaves no mode behind: a plain key still reaches t1.
+    screen.send(b"z");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "z")
+        }),
+        "the key after a failed toggle did not reach t1: {:?}",
+        program_input(&scratch)
+    );
+}
+
+/// Narrowing below the sidebar threshold releases its keyboard focus, so the
+/// keys it used to swallow reach the pane. Widening again shows the panel
+/// without silently taking focus back.
+#[cfg(unix)]
+fn workspace_hiding_the_sidebar_releases_its_focus() {
+    let scratch = Scratch::new("sidebar-hidden-focus");
+    let mut screen = FakeScreen::spawn_workspace_wide(&scratch, "m6-multi", 120, 30);
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'a');
+    assert!(wait_for_text(&screen, "sidebar · Esc closes"));
+
+    screen.resize(60, 30);
+    assert!(
+        common::wait_until(secs(10), || {
+            !screen.rendered().contains("sidebar · Esc closes")
+        }),
+        "hiding the sidebar left its focus hint: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"j");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "j")
+        }),
+        "a key was still swallowed by the hidden sidebar: {:?}",
+        program_input(&scratch)
+    );
+
+    screen.resize(120, 30);
+    // Wait for the panel and the ordinary hint in the same frame: the status
+    // bar swaps "sidebar · Esc closes" for "^b ? help" when the panel is not
+    // focused, and reading a partially drawn frame could still show the old
+    // hint. The hint must never come back once the panel is visible.
+    assert!(
+        common::wait_until(secs(10), || {
+            let rendered = screen.rendered();
+            rendered.contains(" no agents yet")
+                && rendered.contains("^b ? help")
+                && !rendered.contains("sidebar · Esc closes")
+        }),
+        "the reappeared panel did not settle unfocused: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"k");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "k")
+        }),
+        "the reappeared panel kept the keys: {:?}",
+        program_input(&scratch)
+    );
+}
+
+/// A saved `sidebar_open` is ignored on a narrow startup: there would be no
+/// panel to see, so it must not cover or swallow the pane's keys.
+#[cfg(unix)]
+fn workspace_narrow_restore_does_not_focus_the_sidebar() {
+    let scratch = Scratch::new("sidebar-narrow-restore");
+    scratch.seed_doc(doc_two_tabs(), 3);
+    scratch.seed_view(
+        "work",
+        json!({
+            "version": 1,
+            "active_space": "1",
+            "active_tabs": {"1": "31"},
+            "tabs": {
+                "30": {"focused": "3", "zoomed": null, "history": ["3"]},
+                "31": {"focused": "4", "zoomed": null, "history": ["4"]},
+            },
+            "sidebar_open": true,
+        }),
+    );
+    let mut screen =
+        FakeScreen::spawn_parts_size(&scratch, "doc-view", &[], &[], Some("work"), 60, 24);
+    assert!(
+        screen.wait_text("TAB-TWO", secs(10)),
+        "the restored pane did not paint: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains("sidebar · Esc closes"),
+        "a narrow startup focused a hidden sidebar: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"j");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch).iter().any(|(_, text)| text == "j")
+        }),
+        "a restored hidden sidebar swallowed the first key: {:?}",
+        program_input(&scratch)
+    );
 }
 
 /// A selection never makes the mouse modal: a fresh press on the same pane,
@@ -5678,26 +6140,26 @@ fn workspace_a_fresh_press_leaves_a_selection_and_routes_normally() {
     assert!(wait_for_text(&screen, "/ t2"), "{:?}", screen.rendered());
 
     // Focus the first pane and drag a local selection there.
-    screen.send(click(10, 5).as_bytes());
+    screen.send(click(30, 5).as_bytes());
     assert!(
         wait_for_text(&screen, "/ t1"),
         "the click did not focus t1: {:?}",
         screen.rendered()
     );
-    screen.send(sgr(0, false, 10, 5).as_bytes());
-    screen.send(sgr(32, false, 14, 5).as_bytes());
-    screen.send(sgr(0, true, 14, 5).as_bytes());
+    screen.send(sgr(0, false, 30, 5).as_bytes());
+    screen.send(sgr(32, false, 34, 5).as_bytes());
+    screen.send(sgr(0, true, 34, 5).as_bytes());
     assert!(
-        wait_for_text(&screen, "selection:"),
+        wait_for_text(&screen, " COPY "),
         "the drag did not start a selection: {:?}",
         screen.rendered()
     );
 
     // A fresh click in the same pane ends the selection; the click and the
     // next key are both processed.
-    screen.send(click(10, 6).as_bytes());
+    screen.send(click(30, 6).as_bytes());
     assert!(
-        common::wait_until(secs(10), || !screen.rendered().contains("selection:")),
+        common::wait_until(secs(10), || !screen.rendered().contains(" COPY ")),
         "a fresh click did not leave selection mode: {:?}",
         screen.rendered()
     );
@@ -5721,34 +6183,34 @@ fn workspace_a_fresh_press_leaves_a_selection_and_routes_normally() {
         screen.rendered()
     );
     assert!(wait_for_text(&screen, "/ t3"), "{:?}", screen.rendered());
-    screen.send(click(10, 0).as_bytes());
+    screen.send(click(30, 0).as_bytes());
     assert!(
         wait_for_text(&screen, "PANE-ONE"),
         "the first tab was not selected: {:?}",
         screen.rendered()
     );
-    screen.send(click(10, 5).as_bytes());
+    screen.send(click(30, 5).as_bytes());
     assert!(
         wait_for_text(&screen, "/ t1"),
         "t1 was not focused: {:?}",
         screen.rendered()
     );
-    screen.send(sgr(0, false, 10, 5).as_bytes());
-    screen.send(sgr(32, false, 14, 5).as_bytes());
-    screen.send(sgr(0, true, 14, 5).as_bytes());
+    screen.send(sgr(0, false, 30, 5).as_bytes());
+    screen.send(sgr(32, false, 34, 5).as_bytes());
+    screen.send(sgr(0, true, 34, 5).as_bytes());
     assert!(
-        wait_for_text(&screen, "selection:"),
+        wait_for_text(&screen, " COPY "),
         "the second drag did not start a selection: {:?}",
         screen.rendered()
     );
-    screen.send(click(19, 0).as_bytes());
+    screen.send(click(39, 0).as_bytes());
     assert!(
         wait_for_text(&screen, "PANE-THREE"),
         "a tab click during selection did not select the tab: {:?}",
         screen.rendered()
     );
     assert!(
-        common::wait_until(secs(10), || !screen.rendered().contains("selection:")),
+        common::wait_until(secs(10), || !screen.rendered().contains(" COPY ")),
         "the tab click did not leave selection mode: {:?}",
         screen.rendered()
     );
@@ -5776,15 +6238,15 @@ fn workspace_a_drag_selection_extends_and_copies_the_range() {
         screen.rendered()
     );
 
-    // "hello" starts at the first inner cell, screen (1,2) in the single
+    // "hello" starts at the first inner cell, screen (21,2) in the single
     // pane; drag from h to o in two steps, so the first drag starts the
     // selection and the second one must extend it.
-    screen.send(sgr(0, false, 1, 2).as_bytes());
-    screen.send(sgr(32, false, 3, 2).as_bytes());
-    screen.send(sgr(32, false, 5, 2).as_bytes());
-    screen.send(sgr(0, true, 5, 2).as_bytes());
+    screen.send(sgr(0, false, 21, 2).as_bytes());
+    screen.send(sgr(32, false, 23, 2).as_bytes());
+    screen.send(sgr(32, false, 25, 2).as_bytes());
+    screen.send(sgr(0, true, 25, 2).as_bytes());
     assert!(
-        wait_for_text(&screen, "selection:"),
+        wait_for_text(&screen, " COPY "),
         "the drag did not start a selection: {:?}",
         screen.rendered()
     );
@@ -5801,6 +6263,117 @@ fn workspace_a_drag_selection_extends_and_copies_the_range() {
     assert!(
         wait_for_text(&screen, "copied 5 characters"),
         "the drag selection copied the wrong number of characters: {:?}",
+        screen.rendered()
+    );
+}
+
+/// Opening the search overlay from copy mode ends the selection, so the COPY
+/// strip and the search bar never share the bottom rows.
+#[cfg(unix)]
+fn workspace_search_from_copy_mode_ends_the_copy_strip() {
+    let scratch = Scratch::new("m6-copy-search");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-copy");
+    assert!(
+        wait_for_text(&screen, "hello"),
+        "the copy fixture did not paint: {:?}",
+        screen.rendered()
+    );
+    screen.send(sgr(0, false, 21, 2).as_bytes());
+    screen.send(sgr(32, false, 25, 2).as_bytes());
+    screen.send(sgr(0, true, 25, 2).as_bytes());
+    assert!(
+        wait_for_text(&screen, " COPY "),
+        "the drag did not start a selection: {:?}",
+        screen.rendered()
+    );
+
+    screen.send(b"/");
+    assert!(
+        wait_for_text(&screen, "search:"),
+        "the copy-mode search key did not open the bar: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains(" COPY ")),
+        "the copy strip stayed under the search bar: {:?}",
+        screen.rendered()
+    );
+    screen.send(&[0x1b]);
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("search:")),
+        "the search bar did not close: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains(" COPY "),
+        "copy mode returned after search closed: {:?}",
+        screen.rendered()
+    );
+}
+
+/// A mouse selection is COPY mode: it ends resize first, so the strip always
+/// names the mode that consumes the next key.
+#[cfg(unix)]
+fn workspace_mouse_selection_leaves_resize_mode() {
+    let scratch = Scratch::new("m6-resize-copy");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "the split fixture did not paint: {:?}",
+        screen.rendered()
+    );
+    screen.command(b'v');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'r');
+    assert!(
+        wait_for_text(&screen, " RESIZE "),
+        "{:?}",
+        screen.rendered()
+    );
+    let resizes = resize_payloads(&scratch).len();
+
+    // The right pane's inner grid starts at (52, 2).
+    screen.send(sgr(0, false, 52, 2).as_bytes());
+    screen.send(sgr(32, false, 55, 2).as_bytes());
+    screen.send(sgr(0, true, 55, 2).as_bytes());
+    assert!(
+        wait_for_text(&screen, " COPY "),
+        "the drag did not start a selection: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains(" RESIZE ")),
+        "the resize strip survived the selection: {:?}",
+        screen.rendered()
+    );
+
+    // h is COPY's extend-left here; it must not resize the split or reach the
+    // program. y is a barrier proving h was handled by the selection.
+    screen.send(b"h");
+    screen.send(b"y");
+    assert!(
+        wait_for_text(&screen, "copied"),
+        "the copy barrier did not run: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        resize_payloads(&scratch).len(),
+        resizes,
+        "a COPY key resized a pane: {:?}",
+        resize_payloads(&scratch)
+    );
+    assert!(
+        !program_input(&scratch).iter().any(|(_, text)| text == "h"),
+        "a COPY key reached the program: {:?}",
+        program_input(&scratch)
+    );
+    assert!(
+        !screen.rendered().contains(" RESIZE "),
+        "COPY handed the strip back to resize: {:?}",
         screen.rendered()
     );
 }
@@ -5824,21 +6397,21 @@ fn workspace_dragging_a_split_sends_exact_resize_frames() {
     );
     assert!(
         common::wait_until(secs(10), || {
-            resize_payloads(&scratch).contains(&(38, 20))
+            resize_payloads(&scratch).contains(&(28, 20))
         }),
         "the split did not resize the left pane to its inner size: {:?}",
         resize_payloads(&scratch)
     );
     let before = resize_payloads(&scratch).len();
 
-    // The gap is the single column between the 40- and 39-cell panes.
-    screen.send(sgr(0, false, 40, 10).as_bytes());
-    screen.send(sgr(32, false, 44, 10).as_bytes());
-    screen.send(sgr(0, true, 44, 10).as_bytes());
+    // The gap is the single column between the 30- and 29-cell panes.
+    screen.send(sgr(0, false, 50, 10).as_bytes());
+    screen.send(sgr(32, false, 54, 10).as_bytes());
+    screen.send(sgr(0, true, 54, 10).as_bytes());
     assert!(
         common::wait_until(secs(10), || {
             let payloads = resize_payloads(&scratch);
-            payloads.contains(&(42, 20)) && payloads.contains(&(33, 20))
+            payloads.contains(&(32, 20)) && payloads.contains(&(23, 20))
         }),
         "the drag did not resize both panes: {:?}",
         resize_payloads(&scratch)
@@ -5849,6 +6422,259 @@ fn workspace_dragging_a_split_sends_exact_resize_frames() {
         "a 4-cell drag sent extra RESIZE frames: {:?}",
         resize_payloads(&scratch)
     );
+}
+
+/// `prefix r` moves the focused pane's boundary one cell with h/l and j/k,
+/// five with Shift. Esc and q leave; any other key leaves without acting and
+/// never reaches the program. Zoomed and single-pane tabs refuse the mode, and
+/// an overlay or mode switch clears it.
+#[cfg(unix)]
+fn workspace_resize_mode_moves_the_focused_split_and_leaves_cleanly() {
+    let scratch = Scratch::new("m6-resize-mode");
+    let mut screen = FakeScreen::spawn_workspace(&scratch, "m6-multi");
+    assert!(
+        wait_for_text(&screen, "PANE-ONE"),
+        "{:?}",
+        screen.rendered()
+    );
+    screen.command(b'v');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "{:?}",
+        screen.rendered()
+    );
+    // The new pane attaches at its size; only the existing pane needs a
+    // RESIZE during the split.
+    assert!(
+        common::wait_until(secs(10), || {
+            resize_payloads(&scratch).contains(&(28, 20))
+        }),
+        "the split did not size the first pane: {:?}",
+        resize_payloads(&scratch)
+    );
+    // The left pane is focused so h/l act on its right boundary.
+    screen.send(click(30, 5).as_bytes());
+    assert!(
+        wait_for_text(&screen, "/ t1"),
+        "the click did not focus t1: {:?}",
+        screen.rendered()
+    );
+    let settled = resize_payloads(&scratch).len();
+
+    screen.command(b'r');
+    assert!(
+        wait_for_text(&screen, " RESIZE "),
+        "{:?}",
+        screen.rendered()
+    );
+    assert!(
+        wait_for_text(&screen, "h/l width"),
+        "{:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        resize_payloads(&scratch).len(),
+        settled,
+        "entering resize mode resized a pane"
+    );
+
+    // One cell right widens the focused pane and narrows its sibling.
+    screen.send(b"l");
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 2),
+        "l did not resize both panes exactly once: {:?}",
+        resize_payloads(&scratch)
+    );
+    let payloads = resize_payloads(&scratch);
+    assert_eq!(
+        &payloads[payloads.len() - 2..],
+        &[(29, 20), (26, 20)],
+        "one cell right: {:?}",
+        payloads
+    );
+
+    screen.send(b"h");
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 4),
+        "h did not resize back: {:?}",
+        resize_payloads(&scratch)
+    );
+    let payloads = resize_payloads(&scratch);
+    assert_eq!(&payloads[payloads.len() - 2..], &[(28, 20), (27, 20)]);
+
+    // Shift moves five cells.
+    screen.send(b"L");
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 6),
+        "L did not resize: {:?}",
+        resize_payloads(&scratch)
+    );
+    let payloads = resize_payloads(&scratch);
+    assert_eq!(
+        &payloads[payloads.len() - 2..],
+        &[(33, 20), (22, 20)],
+        "Shift-L moves five cells: {:?}",
+        payloads
+    );
+    screen.send(b"H");
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 8),
+        "H did not resize back: {:?}",
+        resize_payloads(&scratch)
+    );
+
+    // A row key in a columns-only tab is a no-op that stays in the mode: j
+    // and k change nothing, and a following l still moves the same boundary.
+    screen.send(b"j");
+    screen.send(b"k");
+    screen.send(b"l");
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 10),
+        "j/k left resize mode or resized on their own: {:?}",
+        resize_payloads(&scratch)
+    );
+    let payloads = resize_payloads(&scratch);
+    assert_eq!(
+        &payloads[payloads.len() - 2..],
+        &[(29, 20), (26, 20)],
+        "l after j/k moved the same boundary: {:?}",
+        payloads
+    );
+    screen.send(b"h");
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 12),
+        "h did not resize back after j/k: {:?}",
+        resize_payloads(&scratch)
+    );
+    assert!(
+        !program_input(&scratch)
+            .iter()
+            .any(|(_, text)| text == "j" || text == "k"),
+        "j/k reached the program: {:?}",
+        program_input(&scratch)
+    );
+
+    // Esc leaves; the next key reaches the program.
+    screen.send(b"\x1b");
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains(" RESIZE ")),
+        "Esc did not leave resize mode: {:?}",
+        screen.rendered()
+    );
+    screen.send(b"x");
+    assert!(
+        common::wait_until(secs(10), || {
+            program_input(&scratch)
+                .iter()
+                .any(|(target, text)| target == "t1" && text == "x")
+        }),
+        "the key after Esc did not reach the program: {:?}",
+        program_input(&scratch)
+    );
+
+    // q also leaves.
+    screen.command(b'r');
+    assert!(wait_for_text(&screen, " RESIZE "));
+    screen.send(b"q");
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains(" RESIZE ")),
+        "q did not leave resize mode: {:?}",
+        screen.rendered()
+    );
+
+    // Any other key leaves without acting and is swallowed.
+    screen.command(b'r');
+    assert!(wait_for_text(&screen, " RESIZE "));
+    screen.send(b"z");
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains(" RESIZE ")),
+        "z did not leave resize mode: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !program_input(&scratch)
+            .iter()
+            .any(|(target, text)| target == "t1" && text == "z"),
+        "an exit key was forwarded to the program: {:?}",
+        program_input(&scratch)
+    );
+    assert_eq!(
+        resize_payloads(&scratch).len(),
+        settled + 12,
+        "leaving the mode resized a pane"
+    );
+
+    // A zoomed tab refuses the mode. Zooming itself resizes the visible pane;
+    // the refusal must add nothing.
+    screen.command(b'z');
+    assert!(
+        common::wait_until(secs(10), || !screen.rendered().contains("PANE-TWO")),
+        "zoom did not hide the other pane: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 13),
+        "zoom did not resize the visible pane: {:?}",
+        resize_payloads(&scratch)
+    );
+    screen.command(b'r');
+    assert!(
+        wait_for_text(&screen, "resize is unavailable"),
+        "a zoomed tab did not refuse resize mode: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        !screen.rendered().contains(" RESIZE "),
+        "a zoomed tab entered resize mode: {:?}",
+        screen.rendered()
+    );
+    assert_eq!(
+        resize_payloads(&scratch).len(),
+        settled + 13,
+        "the zoom refusal resized a pane: {:?}",
+        resize_payloads(&scratch)
+    );
+    screen.command(b'z');
+    assert!(
+        wait_for_text(&screen, "PANE-TWO"),
+        "leaving zoom did not restore the other pane: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 14),
+        "leaving zoom did not resize the pane back: {:?}",
+        resize_payloads(&scratch)
+    );
+
+    // One pane is nothing to resize. Closing the focused pane widens its
+    // sibling; the refusal after that must add nothing.
+    screen.command(b'x');
+    assert!(
+        wait_for_text(&screen, "/ t2"),
+        "closing the focused pane did not leave the sibling: {:?}",
+        screen.rendered()
+    );
+    assert!(
+        common::wait_until(secs(10), || resize_payloads(&scratch).len() == settled + 15),
+        "the closed pane's sibling was not resized: {:?}",
+        resize_payloads(&scratch)
+    );
+    screen.command(b'r');
+    assert!(
+        wait_for_text(&screen, "nothing to resize"),
+        "a single pane entered resize mode: {:?}",
+        screen.rendered()
+    );
+    assert!(!screen.rendered().contains(" RESIZE "));
+    assert_eq!(
+        resize_payloads(&scratch).len(),
+        settled + 15,
+        "the single-pane refusal resized a pane: {:?}",
+        resize_payloads(&scratch)
+    );
+
+    screen.send(&[0x1d]);
+    assert_eq!(screen.wait_exit(secs(5)).expect("detach").code(), Some(0));
 }
 
 /// The wheel scrolls a non-tracking program's local history and any key
@@ -5877,7 +6703,7 @@ fn workspace_wheel_scrolls_local_history_and_any_key_returns_live() {
     let writes = doc_set_calls(&scratch);
     let resizes = resize_frames(&scratch);
 
-    screen.send(wheel_up(10, 5).as_bytes());
+    screen.send(wheel_up(30, 5).as_bytes());
     assert!(
         common::wait_until(secs(10), || {
             let rendered = screen.rendered();
@@ -5938,7 +6764,7 @@ fn workspace_the_live_cursor_is_hidden_in_history_and_returns_at_the_bottom() {
     // The fixture leaves the cursor three rows above the bottom, so after a
     // three-line wheel scroll the terminal's own cursor is still inside the
     // viewport. Only the live-bottom rule hides it.
-    screen.send(wheel_up(10, 5).as_bytes());
+    screen.send(wheel_up(30, 5).as_bytes());
     assert!(
         wait_for_text(&screen, "scroll "),
         "the wheel did not scroll local history: {:?}",
@@ -5973,7 +6799,7 @@ fn workspace_forwards_mouse_to_a_tracking_program_and_consumes_chrome() {
         screen.rendered()
     );
 
-    screen.send(wheel_up(10, 5).as_bytes());
+    screen.send(wheel_up(30, 5).as_bytes());
     assert!(
         common::wait_until(secs(10), || {
             program_input(&scratch)
@@ -5983,7 +6809,7 @@ fn workspace_forwards_mouse_to_a_tracking_program_and_consumes_chrome() {
         "the wheel was not forwarded to the tracking program: {:?}",
         program_input(&scratch)
     );
-    screen.send(click(10, 6).as_bytes());
+    screen.send(click(30, 6).as_bytes());
     assert!(
         common::wait_until(secs(10), || {
             program_input(&scratch)
@@ -5996,9 +6822,9 @@ fn workspace_forwards_mouse_to_a_tracking_program_and_consumes_chrome() {
     let after_grid = program_input(&scratch).len();
 
     // Tab bar, status bar and pane border are chrome: focus or selection only.
-    screen.send(click(10, 0).as_bytes());
-    screen.send(click(10, 23).as_bytes());
-    screen.send(click(0, 5).as_bytes());
+    screen.send(click(30, 0).as_bytes());
+    screen.send(click(30, 23).as_bytes());
+    screen.send(click(20, 5).as_bytes());
     screen.send(b"z");
     assert!(
         common::wait_until(secs(10), || {
@@ -6033,11 +6859,11 @@ fn workspace_shift_drag_selects_locally_over_a_tracking_program() {
     );
     let before = program_input(&scratch).len();
 
-    screen.send(sgr(4, false, 10, 6).as_bytes());
-    screen.send(sgr(36, false, 14, 6).as_bytes());
-    screen.send(sgr(4, true, 14, 6).as_bytes());
+    screen.send(sgr(4, false, 30, 6).as_bytes());
+    screen.send(sgr(36, false, 34, 6).as_bytes());
+    screen.send(sgr(4, true, 34, 6).as_bytes());
     assert!(
-        wait_for_text(&screen, "selection:"),
+        wait_for_text(&screen, " COPY "),
         "Shift-drag did not start a local selection: {:?}",
         screen.rendered()
     );
@@ -6050,7 +6876,7 @@ fn workspace_shift_drag_selects_locally_over_a_tracking_program() {
 
     screen.send(&[0x1b]);
     assert!(
-        common::wait_until(secs(10), || !screen.rendered().contains("selection:")),
+        common::wait_until(secs(10), || !screen.rendered().contains(" COPY ")),
         "Esc did not leave the selection: {:?}",
         screen.rendered()
     );
@@ -6075,9 +6901,9 @@ fn workspace_shift_click_is_local_over_a_tracking_program() {
         screen.rendered()
     );
 
-    screen.send(sgr(4, false, 10, 6).as_bytes());
-    screen.send(sgr(4, true, 10, 6).as_bytes());
-    screen.send(click(10, 7).as_bytes());
+    screen.send(sgr(4, false, 30, 6).as_bytes());
+    screen.send(sgr(4, true, 30, 6).as_bytes());
+    screen.send(click(30, 7).as_bytes());
     assert!(
         common::wait_until(secs(10), || {
             program_input(&scratch)
@@ -6098,7 +6924,7 @@ fn workspace_shift_click_is_local_over_a_tracking_program() {
         "the Shift-click reached the tracking program: {forwarded:?}"
     );
     assert!(
-        !screen.rendered().contains("selection:"),
+        !screen.rendered().contains(" COPY "),
         "a Shift-click entered selection mode: {:?}",
         screen.rendered()
     );
@@ -6118,11 +6944,11 @@ fn workspace_an_ordinary_key_leaves_selection_and_reaches_the_program() {
 
     screen.command(b'[');
     assert!(
-        wait_for_text(&screen, "selection:"),
+        wait_for_text(&screen, " COPY "),
         "selection mode did not open: {:?}",
         screen.rendered()
     );
-    screen.send(wheel_up(10, 5).as_bytes());
+    screen.send(wheel_up(30, 5).as_bytes());
     assert!(
         common::wait_until(secs(10), || {
             let rendered = screen.rendered();
@@ -6132,20 +6958,20 @@ fn workspace_an_ordinary_key_leaves_selection_and_reaches_the_program() {
         screen.rendered()
     );
     assert!(
-        screen.rendered().contains("selection:"),
+        screen.rendered().contains(" COPY "),
         "scrolling ended the selection: {:?}",
         screen.rendered()
     );
 
-    screen.send(b"w");
+    screen.send(b"z");
     assert!(
         common::wait_until(secs(10), || {
             let rendered = screen.rendered();
             program_input(&scratch)
                 .iter()
-                .any(|(target, text)| target == "t1" && text == "w")
+                .any(|(target, text)| target == "t1" && text == "z")
                 && rendered.contains("LIVE-BOTTOM")
-                && !rendered.contains("selection:")
+                && !rendered.contains(" COPY ")
                 && !rendered.contains("scroll ")
         }),
         "the ordinary key did not leave selection at the live bottom: {:?} input={:?}",
@@ -6159,7 +6985,7 @@ fn workspace_an_ordinary_key_leaves_selection_and_reaches_the_program() {
         .collect();
     assert_eq!(
         forwarded,
-        vec!["w".to_string()],
+        vec!["z".to_string()],
         "the ordinary key was not forwarded exactly once: {forwarded:?}"
     );
     assert!(
@@ -6182,35 +7008,35 @@ fn workspace_a_selection_exit_key_forwards_its_release() {
     );
     screen.command(b'[');
     assert!(
-        wait_for_text(&screen, "selection:"),
+        wait_for_text(&screen, " COPY "),
         "selection mode did not open: {:?}",
         screen.rendered()
     );
 
-    // Kitty CSI u: 'w' press (event type 1), then its release (type 3). A
+    // Kitty CSI u: 'q' press (event type 1), then its release (type 3). A
     // plain printable press stays legacy text; the release is the CSI u form.
-    screen.send(b"\x1b[119;1:1u");
+    screen.send(b"\x1b[113;1:1u");
     assert!(
         common::wait_until(secs(10), || {
             program_input(&scratch)
                 .iter()
-                .any(|(target, text)| target == "t1" && text == "w")
+                .any(|(target, text)| target == "t1" && text == "q")
         }),
         "the kitty press was not forwarded: {:?}",
         program_input(&scratch)
     );
-    screen.send(b"\x1b[119;1:3u");
+    screen.send(b"\x1b[113;1:3u");
     assert!(
         common::wait_until(secs(10), || {
             program_input(&scratch)
                 .iter()
-                .any(|(target, text)| target == "t1" && text == "\x1b[119;1:3u")
+                .any(|(target, text)| target == "t1" && text == "\x1b[113;1:3u")
         }),
         "the kitty release was not forwarded: {:?}",
         program_input(&scratch)
     );
     assert!(
-        common::wait_until(secs(10), || !screen.rendered().contains("selection:")),
+        common::wait_until(secs(10), || !screen.rendered().contains(" COPY ")),
         "the kitty key did not leave selection mode: {:?}",
         screen.rendered()
     );
@@ -6238,9 +7064,9 @@ fn workspace_overlays_consume_mouse_without_input_or_resize() {
         "the palette did not open: {:?}",
         screen.rendered()
     );
-    screen.send(click(10, 5).as_bytes());
-    screen.send(wheel_up(10, 5).as_bytes());
-    screen.send(click(10, 0).as_bytes());
+    screen.send(click(30, 5).as_bytes());
+    screen.send(wheel_up(30, 5).as_bytes());
+    screen.send(click(30, 0).as_bytes());
     screen.send(&[0x1b]);
     assert!(
         common::wait_until(secs(10), || !screen.rendered().contains("palette ·")),
@@ -6254,8 +7080,8 @@ fn workspace_overlays_consume_mouse_without_input_or_resize() {
         "the search bar did not open: {:?}",
         screen.rendered()
     );
-    screen.send(click(10, 5).as_bytes());
-    screen.send(wheel_up(10, 5).as_bytes());
+    screen.send(click(30, 5).as_bytes());
+    screen.send(wheel_up(30, 5).as_bytes());
     screen.send(&[0x1b]);
     assert!(
         common::wait_until(secs(10), || !screen.rendered().contains("search:")),
@@ -6423,7 +7249,7 @@ fn workspace_copy_emits_osc52_and_empty_selection_copies_nothing() {
 
     screen.command(b'[');
     assert!(
-        wait_for_text(&screen, "selection:"),
+        wait_for_text(&screen, " COPY "),
         "selection mode did not open: {:?}",
         screen.rendered()
     );

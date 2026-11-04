@@ -26,6 +26,7 @@ mod mouse;
 mod overlays;
 mod panes;
 mod reconnect;
+mod resize;
 mod sync;
 
 use super::machines::MachineRow;
@@ -36,6 +37,7 @@ use super::geometry;
 use super::local::ViewStore;
 use super::manager::ManagerRow;
 use super::model::{PaneId, StartRequest, Workspace};
+use super::sidebar;
 use super::state::UiState;
 use super::sync::DocState;
 use super::ui;
@@ -333,6 +335,9 @@ impl<'a> Screen<'a> {
         };
         let workspace_panes: Vec<PaneId> = screen.workspace.panes().map(|pane| pane.id).collect();
         screen.seen.extend(workspace_panes);
+        // A saved focus from a wide terminal must not survive on a narrow
+        // one: the panel is width-driven, so there would be nothing to draw.
+        screen.release_hidden_sidebar();
         for (pane, session) in sessions {
             screen.add_link(pane, session)?;
         }
@@ -432,6 +437,16 @@ impl<'a> Screen<'a> {
 
     fn area(&self) -> Rect {
         Rect::new(0, 0, self.size.0, self.size.1)
+    }
+
+    /// Releases sidebar keyboard focus when the panel no longer fits. The
+    /// panel is visible by width, not by focus: hiding it must also stop it
+    /// covering the panes and swallowing keys, and a later widening must not
+    /// silently restore a focus the person can no longer see.
+    pub(super) fn release_hidden_sidebar(&mut self) {
+        if self.ui.sidebar.open && sidebar::width(self.area()) == 0 {
+            self.close_sidebar();
+        }
     }
 
     fn rects(&self) -> geometry::Rects {

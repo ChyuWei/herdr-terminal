@@ -34,6 +34,8 @@ impl Screen<'_> {
             next: Instant::now(),
         });
         self.ui.connection = Connection::Reconnecting { attempt: 0 };
+        // Resize and selection act on streams the dead connection owned.
+        self.clear_modes();
         self.ui.prefix = false;
         self.ui.help = false;
         self.ui.prompt = None;
@@ -81,6 +83,7 @@ impl Screen<'_> {
                     }
                     Event::Resize(cols, rows) if cols > 0 && rows > 0 => {
                         self.size = (cols, rows);
+                        self.release_hidden_sidebar();
                         self.dirty = true;
                     }
                     _ => {}

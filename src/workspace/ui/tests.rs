@@ -3,8 +3,9 @@ use crate::theme::{ColorDepth, ThemeChoice, theme};
 use crate::vt::Vt;
 use crate::workspace::agents::{AgentRow, Priority, sort_rows};
 use crate::workspace::commands::RenameTarget;
+use crate::workspace::manager;
 use crate::workspace::model::{Axis, PaneId, StartKind, Workspace};
-use crate::workspace::state::{Line, PaletteState, Prompt, SearchState, UiState};
+use crate::workspace::state::{Line, PaletteState, PreviewState, Prompt, SearchState, UiState};
 use ratatui::style::Color;
 use std::collections::BTreeMap;
 
@@ -106,6 +107,17 @@ fn render_agents(
     height: u16,
     rows: &[AgentRow],
 ) -> (Buffer, Render) {
+    render_agents_theme(workspace, ui, width, height, rows, Theme::default())
+}
+
+fn render_agents_theme(
+    workspace: &Workspace,
+    ui: &UiState,
+    width: u16,
+    height: u16,
+    rows: &[AgentRow],
+    theme: Theme,
+) -> (Buffer, Render) {
     let area = Rect::new(0, 0, width, height);
     let rects = geometry::compute(workspace.active_tab(), area);
     let mut screens = BTreeMap::new();
@@ -122,7 +134,6 @@ fn render_agents(
         screens.insert(*pane, vt.snapshot().expect("snapshot"));
     }
     let mut buffer = Buffer::empty(area);
-    let theme = Theme::default();
     let empty = BTreeMap::new();
     let view = View {
         screens: &screens,
@@ -146,7 +157,7 @@ fn a_single_pane_matches_the_hand_written_frame() {
     let rows = lines(&buffer);
     let blank_body = format!("│{}│", " ".repeat(38));
     let expected = vec![
-        format!(" space 1  1 tab 1{}", " ".repeat(23)),
+        format!(" space 1 │ 1 tab 1{}", " ".repeat(22)),
         format!("┌ t1 {}┐", "─".repeat(34)),
         format!("│hi{}│", " ".repeat(36)),
         blank_body.clone(),
@@ -172,31 +183,59 @@ fn the_focused_border_is_highlighted_and_the_other_is_dim() {
     let (workspace, first, second) = two_panes();
     assert_eq!(workspace.focused_pane(), Some(second));
     let (buffer, rendered) = render_ws(&workspace, &UiState::default(), 40, 12);
-    assert_eq!(buffer[(0, 1)].fg, Color::DarkGray, "left pane, unfocused");
-    assert_eq!(buffer[(21, 1)].fg, Color::Cyan, "right pane, focused");
+    assert_eq!(
+        buffer[(0, 1)].fg,
+        Color::Rgb(69, 71, 90),
+        "left pane, unfocused (surface1)"
+    );
+    assert_eq!(
+        buffer[(21, 1)].fg,
+        Color::Rgb(137, 180, 250),
+        "right pane, focused (accent)"
+    );
     assert_eq!(rendered.focused, Some((second, Rect::new(22, 2, 17, 8))));
     let _ = first;
 }
 
 #[test]
-fn the_active_tab_is_the_reversed_one() {
+fn the_active_tab_uses_the_accent_block_and_the_others_stay_quiet() {
     let (mut workspace, _) = one_pane();
     add(&mut workspace, StartKind::Tab, "t2");
     let (buffer, _) = render_ws(&workspace, &UiState::default(), 40, 12);
     let row: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
-    let first = row.find("1 tab 1").expect("first tab");
-    let second = row.find("2 tab 2").expect("second tab");
-    assert!(
-        !buffer[(first as u16, 0)]
-            .modifier
-            .contains(Modifier::REVERSED),
-        "inactive tab is not highlighted: {row:?}"
+    let first = row.find("1 tab 1").expect("first tab") as u16;
+    let second = row.find("2 tab 2").expect("second tab") as u16;
+    assert_eq!(
+        buffer[(first, 0)].bg,
+        Color::Rgb(49, 50, 68),
+        "inactive tab uses surface0: {row:?}"
+    );
+    assert_eq!(
+        buffer[(first, 0)].fg,
+        Color::Rgb(166, 173, 200),
+        "inactive tab text is subtext0: {row:?}"
     );
     assert!(
-        buffer[(second as u16, 0)]
-            .modifier
-            .contains(Modifier::REVERSED),
-        "active tab is highlighted: {row:?}"
+        !buffer[(first, 0)].modifier.contains(Modifier::REVERSED),
+        "inactive tab is not reversed: {row:?}"
+    );
+    assert_eq!(
+        buffer[(second, 0)].bg,
+        Color::Rgb(137, 180, 250),
+        "active tab uses the accent block: {row:?}"
+    );
+    assert_eq!(
+        buffer[(second, 0)].fg,
+        Color::Rgb(24, 24, 37),
+        "active tab text is panel_bg: {row:?}"
+    );
+    assert!(
+        buffer[(second, 0)].modifier.contains(Modifier::BOLD),
+        "active tab text is bold: {row:?}"
+    );
+    assert!(
+        !buffer[(second, 0)].modifier.contains(Modifier::REVERSED),
+        "no reversed row remains: {row:?}"
     );
 }
 
@@ -210,7 +249,7 @@ fn zoom_shows_only_the_focused_pane_with_the_bars_intact() {
         workspace.active_tab().and_then(|tab| tab.zoomed),
         Some(second)
     );
-    assert!(rows[0].starts_with(" space 1  1 tab 1"));
+    assert!(rows[0].starts_with(" space 1 │ 1 tab 1"));
     assert!(rows[1].starts_with("┌ t2 "));
     assert!(!rows.iter().any(|row| row.contains("t1")), "{rows:?}");
     assert!(rows[11].contains("^b ? help"));
@@ -272,9 +311,10 @@ fn help_is_an_overlay_listing_the_prefix_keys() {
     assert!(text.contains("help"), "{text}");
     assert!(text.contains("prefix Ctrl-b"), "{text}");
     assert!(text.contains("e keep + close") && text.contains("X kill + close"));
-    assert!(text.contains("a agents") && text.contains("i peek agent"));
+    assert!(text.contains("a sidebar") && text.contains("i peek agent"));
     assert!(text.contains("g/G next/prev agent"));
     assert!(text.contains("sidebar: j/k move") && text.contains("p pin / unpin"));
+    assert!(text.contains("r resize mode") && text.contains("h/l width"));
     assert!(text.contains(": palette") && text.contains("f search scrollback"));
     assert!(text.contains("selection: drag or h/j/k/l"));
     assert!(text.contains("Shift-PgUp/PgDn scroll history"));
@@ -307,19 +347,28 @@ fn the_status_bar_shows_the_focused_title_status_and_message() {
     ui.message = None;
     ui.prefix = true;
     let (buffer, _) = render_ws(&workspace, &ui, 60, 12);
+    let strip: String = (0..60).map(|x| buffer[(x, 10)].symbol()).collect();
+    assert!(strip.contains(" PREFIX "), "{strip:?}");
+    assert!(
+        strip.contains("esc cancel") && strip.contains("^b send prefix"),
+        "{strip:?}"
+    );
     let row: String = (0..60).map(|x| buffer[(x, 11)].symbol()).collect();
-    assert!(row.contains("prefix ^b…"), "{row:?}");
+    assert!(
+        !row.contains("prefix ^b…"),
+        "the old status-right hint left the status bar: {row:?}"
+    );
 
     ui.prefix = false;
     ui.connection = Connection::Reconnecting { attempt: 2 };
-    let (buffer, _) = render_ws(&workspace, &ui, 80, 12);
-    let row: String = (0..80).map(|x| buffer[(x, 11)].symbol()).collect();
+    let (buffer, _) = render_ws(&workspace, &ui, 120, 12);
+    let row: String = (0..120).map(|x| buffer[(x, 11)].symbol()).collect();
     assert!(row.contains("reconnecting (attempt 2)"), "{row:?}");
 }
 
 #[test]
-fn the_sidebar_shows_word_pin_title_facts_and_attention() {
-    let (workspace, first, second) = two_panes();
+fn the_sidebar_lists_spaces_and_agents_with_status_colors() {
+    let (mut workspace, first, second) = two_panes();
     let mut rows = vec![
         agent(first, "t1", "blocked", Priority::Blocked, "Build", "claude"),
         agent(second, "t2", "done", Priority::Done, "Review", "codex"),
@@ -328,39 +377,207 @@ fn the_sidebar_shows_word_pin_title_facts_and_attention() {
     assert_eq!(rows[0].address, "t2", "the pinned row sorts first");
     let mut ui = UiState::default();
     ui.sidebar.open = true;
-    ui.sidebar.selected = Some(second);
+    ui.sidebar.selected = Some(crate::workspace::sidebar::Item::Agent(second));
     let (buffer, rendered) = render_agents(&workspace, &ui, 80, 14, &rows);
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("agents"), "{text}");
-    assert!(text.contains("blocked"), "{text}");
-    assert!(text.contains("Build") && text.contains("claude"), "{text}");
-    assert!(
-        text.contains("app: permission") || text.contains("permission"),
-        "{text}"
-    );
-    assert!(text.contains("42%"), "{text}");
-    assert!(text.contains("allow?"), "{text}");
-    assert!(text.contains("t2") && text.contains("Review"), "{text}");
-    assert!(text.contains("turn 4") && text.contains("unseen"), "{text}");
-    assert!(
-        text.contains("* done"),
-        "pin marker on the pinned row: {text}"
-    );
-    assert!(
-        text.contains("1 blocked · 1 done"),
-        "attention count in the sidebar title: {text}"
-    );
+    let text = lines(&buffer);
+    assert!(text[0].starts_with(" spaces"), "{text:?}");
+    assert!(text[1].contains("● 1 space 1"), "{text:?}");
+    assert!(text[2].starts_with(" agents"), "{text:?}");
+    assert!(text[3].contains("* Review done"), "{text:?}");
+    assert!(text[4].contains("Build blocked"), "{text:?}");
     assert_eq!(rendered.focused, None);
     assert_eq!(rendered.prompt_cursor, None);
 
-    // The selected row is drawn reversed; the other is not.
-    let (x, y) = (0..80)
-        .flat_map(|x| (0..14).map(move |y| (x, y)))
-        .find(|(x, y)| buffer[(*x, *y)].symbol() == "R" && y > &1)
-        .unwrap_or((0, 0));
+    // The active space is an accent label; headers are quiet overlay0.
+    let active = text[1].find('●').expect("active marker") as u16;
+    assert_eq!(buffer[(active, 1)].fg, Color::Rgb(137, 180, 250));
+    assert!(buffer[(active, 1)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buffer[(1, 0)].fg, Color::Rgb(108, 112, 134));
+
+    // Core-reported words keep their colors; the selected agent row uses
+    // surface0 and keeps its word color.
+    let done = text[3].find("done").expect("done word") as u16;
+    let blocked = text[4].find("blocked").expect("blocked word") as u16;
+    assert_eq!(buffer[(done, 3)].fg, Color::Rgb(148, 226, 213));
+    assert_eq!(buffer[(blocked, 4)].fg, Color::Rgb(243, 139, 168));
+    let review = text[3].find("Review").expect("selected row") as u16;
+    let build = text[4].find("Build").expect("unselected row") as u16;
+    assert_eq!(
+        buffer[(review, 3)].bg,
+        Color::Rgb(49, 50, 68),
+        "the selected agent row uses surface0"
+    );
+    assert_eq!(
+        buffer[(build, 4)].bg,
+        Color::Rgb(24, 24, 37),
+        "the other agent row keeps the panel background"
+    );
+
+    // A selected space row is also surface0, even when it is not active. The
+    // new space becomes active, so space 1 stays listed but loses the accent
+    // and the active marker.
+    let _second_space = add(&mut workspace, StartKind::Space, "s2");
+    let first_space = workspace.spaces()[0].id;
+    ui.sidebar.selected = Some(crate::workspace::sidebar::Item::Space(first_space));
+    let (buffer, _) = render_agents(&workspace, &ui, 80, 14, &rows);
+    let space = lines(&buffer)[1].find("space 1").expect("space row") as u16;
+    assert_eq!(buffer[(space, 1)].bg, Color::Rgb(49, 50, 68));
+    assert_eq!(
+        buffer[(space, 1)].fg,
+        Color::Rgb(205, 214, 244),
+        "a selected non-active space is not drawn as active"
+    );
+    assert_eq!(
+        buffer[(1, 1)].symbol(),
+        " ",
+        "the selected non-active space has no active marker"
+    );
+}
+
+#[test]
+fn the_terminal_theme_reverses_sidebar_selections() {
+    let (mut workspace, first, second) = two_panes();
+    let rows = vec![
+        agent(first, "t1", "working", Priority::Working, "Build", "claude"),
+        agent(second, "t2", "done", Priority::Done, "Review", "codex"),
+    ];
+    let mut ui = UiState::default();
+    ui.sidebar.open = true;
+    ui.sidebar.selected = Some(crate::workspace::sidebar::Item::Agent(first));
+    let (buffer, _) = render_agents_theme(&workspace, &ui, 80, 14, &rows, Theme::terminal());
+    let text = lines(&buffer);
+    let build = text[3].find("Build").expect("selected row") as u16;
+    let review = text[4].find("Review").expect("other row") as u16;
     assert!(
-        buffer[(x, y)].modifier.contains(Modifier::REVERSED),
-        "selected row is highlighted at {x},{y}"
+        buffer[(build, 3)].modifier.contains(Modifier::REVERSED),
+        "the terminal theme left the selected agent without a cue: {:?}",
+        buffer[(build, 3)]
+    );
+    assert!(
+        !buffer[(review, 4)].modifier.contains(Modifier::REVERSED),
+        "an unselected agent was reversed: {:?}",
+        buffer[(review, 4)]
+    );
+
+    // A selected non-active space also reverses instead of disappearing on a
+    // reset background.
+    let _second_space = add(&mut workspace, StartKind::Space, "s2");
+    let first_space = workspace.spaces()[0].id;
+    ui.sidebar.selected = Some(crate::workspace::sidebar::Item::Space(first_space));
+    let (buffer, _) = render_agents_theme(&workspace, &ui, 80, 14, &rows, Theme::terminal());
+    let space = lines(&buffer)[1].find("space 1").expect("space row") as u16;
+    assert!(
+        buffer[(space, 1)].modifier.contains(Modifier::REVERSED),
+        "the terminal theme left the selected space without a cue: {:?}",
+        buffer[(space, 1)]
+    );
+}
+
+#[test]
+fn a_narrow_terminal_hides_the_sidebar() {
+    let (workspace, first, _) = two_panes();
+    let rows = vec![agent(
+        first,
+        "t1",
+        "done",
+        Priority::Done,
+        "Review",
+        "codex",
+    )];
+    let (buffer, _) = render_agents(&workspace, &UiState::default(), 60, 12, &rows);
+    let text = lines(&buffer);
+    assert!(
+        !text.iter().any(|row| row.starts_with(" spaces")),
+        "no sidebar below 70 columns: {text:?}"
+    );
+    assert!(!text.iter().any(|row| row.contains("Review")), "{text:?}");
+    assert!(text[0].starts_with(" space 1 "), "{text:?}");
+}
+
+#[test]
+fn agent_rows_budget_the_status_word_by_display_columns() {
+    let (workspace, first, second) = two_panes();
+    let rows = vec![
+        agent(
+            first,
+            "t1",
+            "working",
+            Priority::Working,
+            "Building the UI",
+            "claude",
+        ),
+        agent(
+            second,
+            "t2",
+            "working",
+            Priority::Working,
+            "Building",
+            "claude",
+        ),
+    ];
+    let (buffer, _) = render_agents(&workspace, &UiState::default(), 80, 14, &rows);
+    let text = lines(&buffer);
+    // The sidebar content is 19 cells at 80 columns; the 20th is the
+    // separator. The full word must fit, so the name gets 8 cells.
+    assert_eq!(
+        text[3].chars().take(19).collect::<String>(),
+        "   Buildin… working"
+    );
+    assert_eq!(
+        text[4].chars().take(19).collect::<String>(),
+        "   Building working",
+        "a title that exactly fits is not truncated"
+    );
+    for y in [3, 4] {
+        assert_eq!(
+            buffer[(19, y)].symbol(),
+            "│",
+            "row {y} crossed the separator"
+        );
+        assert_eq!(buffer[(18, y)].symbol(), "g", "row {y} lost the word tail");
+    }
+}
+
+#[test]
+fn wide_titles_keep_the_status_word_inside_the_panel() {
+    let (workspace, first) = one_pane();
+    let rows = vec![agent(
+        first,
+        "t1",
+        "working",
+        Priority::Working,
+        "构建界面现在",
+        "claude",
+    )];
+    let (buffer, _) = render_agents(&workspace, &UiState::default(), 80, 14, &rows);
+    let text = lines(&buffer).join("\n");
+    assert!(
+        text.contains('…'),
+        "the wide title was not truncated: {text}"
+    );
+    assert!(text.contains("working"), "the status word was lost: {text}");
+    assert_eq!(
+        buffer[(19, 3)].symbol(),
+        "│",
+        "the row crossed the separator: {text}"
+    );
+    let start = (0..19)
+        .find(|x| buffer[(*x, 3)].symbol() == "w")
+        .expect("status word");
+    for (offset, ch) in "working".chars().enumerate() {
+        assert_eq!(
+            buffer[(start + offset as u16, 3)].symbol(),
+            ch.to_string(),
+            "the status word is clipped: {text}"
+        );
+    }
+    assert!(start + 7 <= 19, "the word ends past the content: {text}");
+    let ellipsis = (0..19)
+        .find(|x| buffer[(*x, 3)].symbol() == "…")
+        .expect("ellipsis");
+    assert!(
+        ellipsis <= 11,
+        "the name budget exceeded its columns at cell {ellipsis}: {text}"
     );
 }
 
@@ -482,8 +699,8 @@ fn the_search_bar_shows_the_query_and_match_counts() {
     );
     assert_eq!(
         rendered.prompt_cursor,
-        Some((11, 11)),
-        "after ' search: ' plus the two-char query"
+        Some((31, 11)),
+        "after the sidebar, ' search: ' and the two-char query"
     );
     assert_eq!(rendered.focused, None);
 }
@@ -499,7 +716,11 @@ fn the_search_bar_reports_progress_and_an_empty_query() {
     let (buffer, rendered) = render_ws(&workspace, &ui, 80, 12);
     let row = lines(&buffer)[11].clone();
     assert!(row.contains("type to search scrollback"), "{row:?}");
-    assert_eq!(rendered.prompt_cursor, Some((9, 11)), "after ' search: '");
+    assert_eq!(
+        rendered.prompt_cursor,
+        Some((29, 11)),
+        "after the sidebar and ' search: '"
+    );
 
     let mut search = SearchState::new(pane);
     search.line = Line::new("needle");
@@ -711,343 +932,4 @@ fn redrawing_a_scrolled_snapshot_shows_history_and_resumes_at_the_bottom() {
     assert!(!text.contains("scroll 20/60"));
 }
 
-fn manager_row(address: &str, name: &str, word: &str, shown: bool) -> ManagerRow {
-    ManagerRow {
-        address: address.to_owned(),
-        machine: manager::machine(address),
-        name: name.to_owned(),
-        title: String::new(),
-        parent: None,
-        word: word.to_owned(),
-        cwd: "/work".into(),
-        age: "2m".into(),
-        created_ms: Some(2_000),
-        shown,
-    }
-}
-
-fn render_manager(ui: &UiState, rows: &[ManagerRow], width: u16, height: u16) -> (Buffer, Render) {
-    let (workspace, _) = one_pane();
-    let area = Rect::new(0, 0, width, height);
-    let theme = Theme::default();
-    let selections = BTreeMap::new();
-    let screens = BTreeMap::new();
-    let view = View {
-        screens: &screens,
-        rows: &[],
-        theme: &theme,
-        selections: &selections,
-        scroll_hint: None,
-        manager: rows,
-        machines: &[],
-        preview: None,
-        files: None,
-    };
-    let mut buffer = Buffer::empty(area);
-    let rendered = render_with(&mut buffer, area, &workspace, ui, &view);
-    (buffer, rendered)
-}
-
-#[test]
-fn the_terminal_manager_lists_every_row_with_a_shown_marker() {
-    let mut ui = UiState::default();
-    ui.manager.open = true;
-    ui.manager.selected = Some("m3/t9".into());
-    let rows = vec![
-        manager_row("t7", "worker", "blocked", true),
-        manager_row("m3/t9", "builder", "working", false),
-    ];
-    let (buffer, rendered) = render_manager(&ui, &rows, 90, 18);
-    let text = lines(&buffer).join("\n");
-    for expected in [
-        "terminal manager",
-        "1 shown · 2 live",
-        "* blocked",
-        "t7",
-        "worker",
-        "  working",
-        "m3/t9",
-        "builder",
-        "machine m3",
-        "/work",
-        "Enter show/hide",
-    ] {
-        assert!(text.contains(expected), "missing {expected:?}: {text}");
-    }
-    assert!(rendered.focused.is_none(), "the manager covers the panes");
-    assert!(rendered.prompt_cursor.is_none());
-}
-
-#[test]
-fn the_manager_empty_and_no_match_states_say_so() {
-    let mut ui = UiState::default();
-    ui.manager.open = true;
-    let (buffer, _) = render_manager(&ui, &[], 70, 14);
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("no live terminals in core"), "{text}");
-    assert!(text.contains("0 live"), "{text}");
-
-    ui.manager.filter = Line::new("zzz");
-    let rows = vec![manager_row("t7", "worker", "blocked", true)];
-    let (buffer, _) = render_manager(&ui, &rows, 70, 14);
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("no terminals match the filter"), "{text}");
-    assert!(text.contains("0/1 match"), "{text}");
-    assert!(
-        !text.contains("worker"),
-        "the hidden row is filtered: {text}"
-    );
-}
-
-#[test]
-fn the_manager_filter_owns_the_cursor_and_selection_moves_over_matches() {
-    let mut ui = UiState::default();
-    ui.manager.open = true;
-    ui.manager.filtering = true;
-    ui.manager.filter = Line::new("work");
-    ui.manager.selected = Some("t9".into());
-    let rows = vec![
-        manager_row("t7", "worker", "blocked", true),
-        {
-            let mut other = manager_row("t8", "other", "idle", false);
-            other.cwd = "/elsewhere".into();
-            other
-        },
-        manager_row("t9", "workbench", "working", false),
-    ];
-    let (buffer, rendered) = render_manager(&ui, &rows, 80, 16);
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("filter: work"), "{text}");
-    assert!(
-        text.contains("worker") && text.contains("workbench"),
-        "{text}"
-    );
-    assert!(!text.contains("other"), "the filter is live: {text}");
-    assert!(text.contains("2/3 match"), "{text}");
-    assert!(rendered.prompt_cursor.is_some(), "the filter has a cursor");
-    let (x, y) = rendered.prompt_cursor.expect("cursor");
-    assert_eq!(y, manager_rect(Rect::new(0, 0, 80, 16)).y + 1);
-    assert!(x > 0);
-}
-
-#[test]
-fn the_preview_draws_a_read_only_border_title_and_terminal() {
-    let ui = UiState {
-        preview: Some(PreviewState {
-            address: "m1/t9".into(),
-            title: "worker".into(),
-        }),
-        ..UiState::default()
-    };
-    let (workspace, _) = one_pane();
-    let area = Rect::new(0, 0, 80, 20);
-    let grid = preview_grid(area);
-    assert!(grid.width > 0 && grid.height > 0);
-    let mut vt = Vt::new(grid.width, grid.height).expect("vt");
-    vt.feed(b"PREVIEW");
-    let screen = vt.snapshot().expect("snapshot");
-    let theme = Theme::default();
-    let selections = BTreeMap::new();
-    let screens = BTreeMap::new();
-    let view = View {
-        screens: &screens,
-        rows: &[],
-        theme: &theme,
-        selections: &selections,
-        scroll_hint: None,
-        manager: &[],
-        machines: &[],
-        preview: Some(&screen),
-        files: None,
-    };
-    let mut buffer = Buffer::empty(area);
-    let rendered = render_with(&mut buffer, area, &workspace, &ui, &view);
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("preview · worker · m1/t9"), "{text}");
-    assert!(text.contains("read-only observer"), "{text}");
-    assert!(text.contains("any key closes"), "{text}");
-    assert!(text.contains("PREVIEW"), "the observer VT is drawn: {text}");
-    assert!(rendered.focused.is_none());
-    assert!(rendered.prompt_cursor.is_none());
-}
-
-// --- file overlay ----------------------------------------------------------
-
-fn file_view<'a>(
-    workspace: &'a Workspace,
-    ui: &'a UiState,
-    pane: Option<&'a crate::workspace::file::Pane>,
-) -> (Buffer, Render) {
-    let area = Rect::new(0, 0, 100, 30);
-    let theme = Theme::default();
-    let selections = BTreeMap::new();
-    let screens = BTreeMap::new();
-    let view = View {
-        screens: &screens,
-        rows: &[],
-        theme: &theme,
-        selections: &selections,
-        scroll_hint: None,
-        manager: &[],
-        machines: &[],
-        preview: None,
-        files: pane,
-    };
-    let mut buffer = Buffer::empty(area);
-    let rendered = render_with(&mut buffer, area, workspace, ui, &view);
-    (buffer, rendered)
-}
-
-fn file_pane(
-    path: &str,
-    text: &str,
-    first: usize,
-    last: usize,
-    lines: usize,
-) -> crate::workspace::file::Pane {
-    use crate::workspace::file::{Context, Pane, Window};
-    Pane::viewing(
-        path,
-        Context::default(),
-        Window {
-            text: text.into(),
-            first,
-            last,
-            lines,
-        },
-    )
-}
-
-#[test]
-fn the_file_prompt_names_the_machine_cwd_and_path() {
-    use crate::workspace::file::Context;
-    use crate::workspace::state::FileState;
-    let (workspace, _) = one_pane();
-    let ui = UiState {
-        files: FileState {
-            open: true,
-            context: Context {
-                on: Some("alpha".into()),
-                cwd: Some("/srv/app".into()),
-            },
-            prompt: Some(Line::new("/srv/app/")),
-            error: None,
-        },
-        ..UiState::default()
-    };
-    let (buffer, rendered) = file_view(&workspace, &ui, None);
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("file · Enter read · Esc close"), "{text}");
-    assert!(text.contains("alpha · cwd /srv/app"), "{text}");
-    assert!(text.contains("path: /srv/app/"), "{text}");
-    assert!(
-        text.contains("a path, not a directory"),
-        "the prompt explains itself: {text}"
-    );
-    let (_, y) = rendered
-        .prompt_cursor
-        .expect("the path prompt has a cursor");
-    assert_eq!(y, file_rect(Rect::new(0, 0, 100, 30)).y + 2);
-}
-
-#[test]
-fn the_file_viewer_shows_the_path_range_and_lines() {
-    use crate::workspace::state::FileState;
-    let (workspace, _) = one_pane();
-    let pane = file_pane("notes.txt", "one\ntwo\n", 1, 2, 10);
-    let ui = UiState {
-        files: FileState {
-            open: true,
-            ..FileState::default()
-        },
-        ..UiState::default()
-    };
-    let (buffer, rendered) = file_view(&workspace, &ui, Some(&pane));
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("file · local · notes.txt"), "{text}");
-    assert!(text.contains("lines 1-2 of 10"), "{text}");
-    assert!(text.contains("one") && text.contains("two"), "{text}");
-    assert!(
-        text.contains("file · e edit · Esc close"),
-        "the viewer offers the editor: {text}"
-    );
-    assert_eq!(rendered.prompt_cursor, None, "the viewer has no cursor");
-}
-
-#[test]
-fn the_diff_draws_add_and_remove_marks_with_a_summary() {
-    use crate::workspace::file::{Context, Pane, diff};
-    use crate::workspace::state::FileState;
-    let (workspace, _) = one_pane();
-    let mut pane = Pane::viewing(
-        "notes.txt",
-        Context::default(),
-        crate::workspace::file::Window::default(),
-    );
-    pane.viewer = None;
-    pane.diff = Some(diff("a\nb\n", "a\nc\n"));
-    let ui = UiState {
-        files: FileState {
-            open: true,
-            ..FileState::default()
-        },
-        ..UiState::default()
-    };
-    let (buffer, _) = file_view(&workspace, &ui, Some(&pane));
-    let text = lines(&buffer).join("\n");
-    assert!(
-        text.contains("file diff · w write · q discard · Esc close"),
-        "{text}"
-    );
-    assert!(text.contains("1 added, 1 removed"), "{text}");
-    assert!(text.contains("+     2 c"), "the added line: {text}");
-    assert!(text.contains("-     2 b"), "the removed line: {text}");
-}
-
-#[test]
-fn a_conflict_is_a_title_and_an_error_that_keeps_the_overlay() {
-    use crate::workspace::file::{Context, Pane, diff};
-    use crate::workspace::state::FileState;
-    let (workspace, _) = one_pane();
-    let mut pane = Pane::viewing(
-        "notes.txt",
-        Context::default(),
-        crate::workspace::file::Window::default(),
-    );
-    pane.viewer = None;
-    pane.diff = Some(diff("a\n", "b\n"));
-    pane.conflict = true;
-    let ui = UiState {
-        files: FileState {
-            open: true,
-            error: Some("notes.txt changed since it was read; o overwrite or q discard".into()),
-            ..FileState::default()
-        },
-        ..UiState::default()
-    };
-    let (buffer, _) = file_view(&workspace, &ui, Some(&pane));
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("changed on disk"), "{text}");
-    assert!(text.contains("o overwrite"), "{text}");
-    assert!(text.contains("changed since it was read"), "{text}");
-}
-
-#[test]
-fn an_empty_file_or_a_read_error_stays_inside_the_overlay() {
-    use crate::workspace::state::FileState;
-    let (workspace, _) = one_pane();
-    let pane = file_pane("notes.txt", "", 1, 0, 0);
-    let ui = UiState {
-        files: FileState {
-            open: true,
-            error: Some("notes.txt: not_found".into()),
-            ..FileState::default()
-        },
-        ..UiState::default()
-    };
-    let (buffer, _) = file_view(&workspace, &ui, Some(&pane));
-    let text = lines(&buffer).join("\n");
-    assert!(text.contains("empty file"), "{text}");
-    assert!(text.contains("notes.txt: not_found"), "{text}");
-    assert!(text.contains("file · e edit · Esc close"), "{text}");
-}
+mod panels;

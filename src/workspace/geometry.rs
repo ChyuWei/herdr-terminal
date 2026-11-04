@@ -46,8 +46,17 @@ impl Rects {
     }
 }
 
-/// The tab bar, status bar and workspace area for a viewport.
+/// The tab bar, status bar and workspace area for a viewport. On a wide
+/// terminal the persistent sidebar takes the left edge first; the bars and
+/// panes start to its right.
 pub fn bars(viewport: Rect) -> (Rect, Rect, Rect) {
+    let sidebar = super::sidebar::width(viewport);
+    let viewport = Rect::new(
+        viewport.x.saturating_add(sidebar),
+        viewport.y,
+        viewport.width.saturating_sub(sidebar),
+        viewport.height,
+    );
     let tab_height = TAB_BAR_HEIGHT.min(viewport.height);
     let status_height = if viewport.height > tab_height {
         STATUS_HEIGHT.min(viewport.height - tab_height)
@@ -197,13 +206,17 @@ fn collect_gaps(layout: &Layout, area: Rect, path: &mut Vec<usize>, out: &mut Ve
 }
 
 /// The clickable tab rectangles in the tab bar, in the same order and widths
-/// as the drawn tab bar. The space name's own header is not a tab.
+/// as the drawn tab bar. The space name and the separator after it are not
+/// tabs.
 pub fn tab_spans(space: &Space, area: Rect) -> Vec<(TabId, Rect)> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
     let end = area.x.saturating_add(area.width);
-    let mut x = area.x.saturating_add(width(&format!(" {} ", space.name)));
+    let mut x = area
+        .x
+        .saturating_add(width(&format!(" {} ", space.name)))
+        .saturating_add(width("│"));
     let mut spans = Vec::new();
     for (index, tab) in space.tabs.iter().enumerate() {
         let text = format!(" {} {} ", index + 1, tab.name);
@@ -250,6 +263,92 @@ pub fn attach_size(rect: Rect) -> (u16, u16) {
     inner(rect)
         .map(|inner| (inner.width.max(1), inner.height.max(1)))
         .unwrap_or((1, 1))
+}
+
+/// One keyboard resize step: the split boundary to move and its direction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResizeStep {
+    /// Child indices from the tab root to the split that owns the boundary.
+    pub path: Vec<usize>,
+    /// The child before the boundary in that split.
+    pub index: usize,
+    /// `+1` moves the boundary right/down, `-1` left/up.
+    pub delta: i16,
+}
+
+/// The split boundary the focused pane should move for a keyboard resize.
+/// `forward` is the pressed direction (right or down). The deepest split on
+/// the pane's route that runs along `axis` wins, so a nested grid moves its
+/// local boundary before an outer one. When the pane has a sibling on the
+/// pressed side, that boundary is used; otherwise the opposite side is, so
+/// every key still acts on the focused pane when possible.
+pub fn resize_target(tab: &Tab, focused: PaneId, axis: Axis, forward: bool) -> Option<ResizeStep> {
+    if tab.zoomed.is_some() {
+        return None;
+    }
+    let root = tab.layout.as_ref()?;
+    let mut route = Vec::new();
+    if !route_to(root, focused, &mut route) || route.is_empty() {
+        return None;
+    }
+    for depth in (0..route.len()).rev() {
+        let Some(Layout::Split {
+            axis: split_axis,
+            children,
+        }) = walk(root, &route[..depth])
+        else {
+            continue;
+        };
+        if *split_axis != axis {
+            continue;
+        }
+        let child = route[depth];
+        let preferred = if forward {
+            (child + 1 < children.len()).then_some(child)
+        } else {
+            child.checked_sub(1)
+        };
+        let fallback = if forward {
+            child.checked_sub(1)
+        } else {
+            (child + 1 < children.len()).then_some(child)
+        };
+        if let Some(index) = preferred.or(fallback) {
+            return Some(ResizeStep {
+                path: route[..depth].to_vec(),
+                index,
+                delta: if forward { 1 } else { -1 },
+            });
+        }
+    }
+    None
+}
+
+fn route_to(layout: &Layout, target: PaneId, path: &mut Vec<usize>) -> bool {
+    match layout {
+        Layout::Leaf(id) => *id == target,
+        Layout::Split { children, .. } => {
+            for (index, child) in children.iter().enumerate() {
+                path.push(index);
+                if route_to(&child.layout, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+    }
+}
+
+fn walk<'a>(layout: &'a Layout, path: &[usize]) -> Option<&'a Layout> {
+    let mut node = layout;
+    for &index in path {
+        let Layout::Split { children, .. } = node else {
+            return None;
+        };
+        node = &children.get(index)?.layout;
+    }
+    Some(node)
 }
 
 /// The nearest pane whose centre is in `direction` from `from`. Centres make

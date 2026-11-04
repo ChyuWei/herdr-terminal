@@ -163,7 +163,8 @@ pub fn parse(value: &Value) -> Loaded {
             "theme" => match value.as_str().and_then(ThemeChoice::parse) {
                 Some(theme) => loaded.config.theme = theme,
                 None => loaded.warnings.push(format!(
-                    "theme must be \"default\", \"dark\" or \"light\", not {value}"
+                    "theme must be \"default\", \"dark\", \"light\", \"terminal\", \
+                     \"catppuccin\" or \"catppuccin-latte\", not {value}"
                 )),
             },
             "scrollback" => match value.as_u64() {

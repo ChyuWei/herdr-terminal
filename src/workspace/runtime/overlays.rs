@@ -17,9 +17,22 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::io::Write;
 
 impl Screen<'_> {
+    /// Leaves resize and selection modes before an overlay takes over. The
+    /// modes are modes, not overlays: they must not linger behind a panel.
+    pub(super) fn clear_modes(&mut self) {
+        if self.ui.resize {
+            self.ui.resize = false;
+            self.dirty = true;
+        }
+        if self.ui.selecting.is_some() {
+            self.exit_selection(true);
+        }
+    }
+
     // --- opening ---------------------------------------------------------
 
     pub(super) fn open_palette(&mut self) {
+        self.clear_modes();
         self.ui.help = false;
         self.ui.prompt = None;
         self.ui.peek = None;
@@ -30,6 +43,7 @@ impl Screen<'_> {
     }
 
     pub(super) fn open_search(&mut self) {
+        self.clear_modes();
         let Some(pane) = self.workspace.focused_pane() else {
             self.ui.message = Some("no pane to search".into());
             self.dirty = true;
@@ -58,6 +72,7 @@ impl Screen<'_> {
             self.exit_selection(true);
             return Ok(());
         }
+        self.ui.resize = false;
         let Some(pane) = self.workspace.focused_pane() else {
             self.ui.message = Some("no pane to select in".into());
             self.dirty = true;
@@ -81,7 +96,6 @@ impl Screen<'_> {
         self.ui.help = false;
         self.ui.palette = None;
         self.ui.search = None;
-        self.ui.message = Some("selection: h/j/k/l extend · y copy · Esc cancel".into());
         self.dirty = true;
         Ok(())
     }
@@ -309,6 +323,44 @@ impl Screen<'_> {
             KeyCode::Char('y') if plain => {
                 self.copy_selection()?;
                 self.exit_selection(false);
+                return Ok(true);
+            }
+            KeyCode::Char('/' | '?') if plain => {
+                // Search is the same scrollback search as `prefix f`; copy
+                // mode ends first so the query types into the bar.
+                self.exit_selection(true);
+                self.open_search();
+                return Ok(true);
+            }
+            KeyCode::Char('v' | ' ') if plain => {
+                if let Some(link) = self.links.get_mut(&pane) {
+                    link.vt.reanchor_selection();
+                    self.dirty = true;
+                }
+                return Ok(true);
+            }
+            KeyCode::Char('w') if plain => {
+                if let Some(link) = self.links.get_mut(&pane)
+                    && link.vt.move_selection_word(crate::vt::WordMotion::Forward)
+                {
+                    self.dirty = true;
+                }
+                return Ok(true);
+            }
+            KeyCode::Char('b') if plain => {
+                if let Some(link) = self.links.get_mut(&pane)
+                    && link.vt.move_selection_word(crate::vt::WordMotion::Backward)
+                {
+                    self.dirty = true;
+                }
+                return Ok(true);
+            }
+            KeyCode::Char('e') if plain => {
+                if let Some(link) = self.links.get_mut(&pane)
+                    && link.vt.move_selection_word(crate::vt::WordMotion::End)
+                {
+                    self.dirty = true;
+                }
                 return Ok(true);
             }
             KeyCode::Left | KeyCode::Char('h') if plain => (-1, 0),

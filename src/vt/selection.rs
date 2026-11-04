@@ -195,6 +195,17 @@ fn viewport_point(
     (result == sys::GHOSTTY_SUCCESS).then_some((coordinate.x, coordinate.y))
 }
 
+/// A word motion for copy mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordMotion {
+    /// `w`: the start of the next word.
+    Forward,
+    /// `b`: the start of the previous word.
+    Backward,
+    /// `e`: the end of the current or next word.
+    End,
+}
+
 impl Vt {
     /// Begins a selection at a viewport cell. Replaces any previous one.
     pub fn start_selection(&mut self, x: u16, y: u16) -> bool {
@@ -246,6 +257,111 @@ impl Vt {
         self.selection
             .as_mut()
             .is_some_and(|selection| selection.extend(self.terminal, nx as u16, ny as u16))
+    }
+
+    /// Extends the selection end to the next word boundary. Used by copy
+    /// mode's `w`/`b`/`e` motions; it stays inside the visible grid.
+    pub fn move_selection_word(&mut self, motion: WordMotion) -> bool {
+        let Some((x, y)) = self.selection.as_ref().and_then(Selection::end_point) else {
+            return false;
+        };
+        let Ok(screen) = self.snapshot() else {
+            return false;
+        };
+        let cell = |x: u16, y: u16| {
+            screen
+                .cell(x, y)
+                .map(|cell| cell.width != 0 && !cell.text.trim().is_empty())
+                .unwrap_or(false)
+        };
+        let Ok(cy) = u16::try_from(y) else {
+            return false;
+        };
+        if cy >= self.rows_count {
+            return false;
+        }
+        let (mut cx, mut cy) = (x, cy);
+        let target = match motion {
+            WordMotion::Forward => {
+                if cell(cx, cy) {
+                    while cx + 1 < self.cols && cell(cx + 1, cy) {
+                        cx += 1;
+                    }
+                }
+                loop {
+                    if cx + 1 < self.cols {
+                        cx += 1;
+                    } else if cy + 1 < self.rows_count {
+                        cx = 0;
+                        cy += 1;
+                    } else {
+                        return false;
+                    }
+                    if cell(cx, cy) {
+                        break;
+                    }
+                }
+                (cx, cy)
+            }
+            WordMotion::Backward => {
+                while cx > 0 && cell(cx - 1, cy) {
+                    cx -= 1;
+                }
+                loop {
+                    if cx > 0 {
+                        cx -= 1;
+                    } else if cy > 0 {
+                        cx = self.cols.saturating_sub(1);
+                        cy -= 1;
+                    } else {
+                        return false;
+                    }
+                    if cell(cx, cy) {
+                        break;
+                    }
+                }
+                while cx > 0 && cell(cx - 1, cy) {
+                    cx -= 1;
+                }
+                (cx, cy)
+            }
+            WordMotion::End => {
+                if !cell(cx, cy) {
+                    loop {
+                        if cx + 1 < self.cols {
+                            cx += 1;
+                        } else if cy + 1 < self.rows_count {
+                            cx = 0;
+                            cy += 1;
+                        } else {
+                            return false;
+                        }
+                        if cell(cx, cy) {
+                            break;
+                        }
+                    }
+                }
+                while cx + 1 < self.cols && cell(cx + 1, cy) {
+                    cx += 1;
+                }
+                (cx, cy)
+            }
+        };
+        self.selection
+            .as_mut()
+            .is_some_and(|selection| selection.extend(self.terminal, target.0, target.1))
+    }
+
+    /// Re-anchors the selection at its current end, like starting a fresh
+    /// visual selection at the cursor.
+    pub fn reanchor_selection(&mut self) -> bool {
+        let Some((x, y)) = self.selection.as_ref().and_then(Selection::end_point) else {
+            return false;
+        };
+        let Ok(y) = u16::try_from(y) else {
+            return false;
+        };
+        self.start_selection(x, y)
     }
 
     /// The selection text with wraps unwrapped and trailing padding trimmed.
@@ -372,5 +488,35 @@ mod tests {
         assert!(text.contains("line 08"), "{text:?}");
         assert!(vt.move_selection(0, -1), "past the top scrolls history");
         assert!(!vt.at_bottom());
+    }
+
+    #[test]
+    fn word_motions_move_the_selection_end_to_word_boundaries() {
+        let mut vt = vt_with("alpha beta gamma\r\nsecond line\r\n");
+        assert!(vt.start_selection(0, 0));
+        assert!(vt.move_selection_word(WordMotion::Forward));
+        assert_eq!(end(&vt), (6, 0), "w reaches the start of the next word");
+        assert!(vt.move_selection_word(WordMotion::Forward));
+        assert_eq!(end(&vt), (11, 0), "w skips the rest of the word");
+        assert!(vt.move_selection_word(WordMotion::Backward));
+        assert_eq!(end(&vt), (6, 0), "b reaches the start of the previous word");
+        assert!(vt.move_selection_word(WordMotion::End));
+        assert_eq!(end(&vt), (9, 0), "e reaches the end of the current word");
+
+        // From a blank cell e finds the next word's end, and w wraps to the
+        // next row instead of stopping at the right edge.
+        assert!(vt.start_selection(10, 0));
+        assert!(vt.move_selection_word(WordMotion::End));
+        assert_eq!(end(&vt), (15, 0));
+        assert!(vt.start_selection(15, 0));
+        assert!(vt.move_selection_word(WordMotion::Forward));
+        assert_eq!(end(&vt), (0, 1), "w crosses the line break");
+    }
+
+    fn end(vt: &Vt) -> (u16, u32) {
+        vt.selection
+            .as_ref()
+            .and_then(Selection::end_point)
+            .expect("selection end")
     }
 }

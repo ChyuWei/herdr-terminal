@@ -20,6 +20,7 @@ pub use keys::is_detach;
 pub use screen::{Attrs, Cell, Color, Cursor, CursorShape, Screen};
 pub use scroll::Scrollbar;
 pub use search::SearchProgress;
+pub use selection::WordMotion;
 
 use ghostty_sys as sys;
 use std::ffi::{c_char, c_void};

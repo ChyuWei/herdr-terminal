@@ -30,8 +30,10 @@ pub enum Command {
     Close(CloseKind),
     RenameTab,
     RenameSpace,
-    /// Toggle the modal agent sidebar.
+    /// Toggle the persistent agent sidebar's keyboard focus.
     Agents,
+    /// Enter resize mode for the active tab's split boundaries.
+    Resize,
     /// Open the Core-wide terminal manager.
     Terminals,
     /// Open the machine manager.
@@ -75,8 +77,10 @@ pub enum Effect {
     Rename(RenameTarget),
     /// Open the help overlay.
     Help,
-    /// Toggle the agent sidebar; the runtime selects a row.
+    /// Toggle the agent sidebar focus; the runtime selects a row.
     Agents,
+    /// Enter resize mode.
+    Resize,
     /// Open the terminal manager; the runtime selects a row.
     Terminals,
     /// Open the machine manager; the runtime lists core's machines.
@@ -125,6 +129,7 @@ impl Workspace {
             }
             Command::RenameSpace => Effect::Rename(RenameTarget::Space(self.active_space_id())),
             Command::Agents => Effect::Agents,
+            Command::Resize => Effect::Resize,
             Command::Terminals => Effect::Terminals,
             Command::Machines => Effect::Machines,
             Command::Files => Effect::Files,

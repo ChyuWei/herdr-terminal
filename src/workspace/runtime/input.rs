@@ -25,6 +25,7 @@ impl Screen<'_> {
             Event::Paste(text) => self.handle_paste(text)?,
             Event::Resize(cols, rows) if cols > 0 && rows > 0 => {
                 self.size = (cols, rows);
+                self.release_hidden_sidebar();
                 self.dirty = true;
             }
             Event::FocusGained => {
@@ -116,6 +117,10 @@ impl Screen<'_> {
             self.exit_selection(true);
             self.snap_to_bottom();
             return self.forward_key(&key);
+        }
+        if self.ui.resize {
+            self.swallow = Some(key.code);
+            return self.resize_key(&key);
         }
         if self.ui.sidebar.open {
             self.swallow = Some(key.code);
@@ -311,6 +316,7 @@ impl Screen<'_> {
                 self.dirty = true;
             }
             Effect::Help => {
+                self.clear_modes();
                 self.ui.help = true;
                 self.ui.prompt = None;
                 self.ui.prefix = false;
@@ -321,6 +327,7 @@ impl Screen<'_> {
                 self.dirty = true;
             }
             Effect::Agents => self.toggle_sidebar(),
+            Effect::Resize => self.enter_resize(),
             Effect::Terminals => self.toggle_manager(),
             Effect::Machines => self.toggle_machines(),
             Effect::Files => self.toggle_files(),

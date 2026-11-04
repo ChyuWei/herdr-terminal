@@ -62,7 +62,7 @@ Rules:
 - **Core never sends draw commands.** The TUI runs its own VT and composes its own cells.
 - **Status is only OSC 7501.** No screen scraping, no agent registry, no vendor logic.
 - **A client owns its document and label namespace.** Do not read another client's private state as yours.
-- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar flag stay in the per-screen view; scrollback, search, selection, theme and terminal-/machine-manager state stay in memory, and open file contents stay out of the document and labels (only the editor's temp copy is local).
+- **Shared layout, local UI.** The `herdr-terminal` document holds layout; focus, zoom and the sidebar focus flag stay in the per-screen view; scrollback, search, selection, mode state, theme and terminal-/machine-manager state stay in memory, and open file contents stay out of the document and labels (only the editor's temp copy is local).
 - **Feature-gate on `hello`.** Check generation, version, methods and features; generation 1 only grows.
 
 ## 4. Architecture
@@ -87,16 +87,17 @@ Start with threads and channels; introduce an async runtime only if a measured n
 | `model` | Pure event and terminal model shared by the screen and workspace |
 | `screen` | Single-pane lifecycle, attach playback, pointer and view |
 | `vt` | libghostty-vt binding: cells and grapheme clusters, keys, mouse, scrollback, search, selection |
-| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, terminal manager, machine manager, file viewer, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, reconnect, manager, machine, file and agent handling; `ui/machine_ui.rs` draws the machine panel |
+| `workspace` | Workspace model, split tree and geometry, commands, keybindings, palette, agents, sidebar, terminal manager, machine manager, file viewer, startup, sync, ratatui UI; `runtime/` holds the event loop, attach, input, mouse, overlays, resize mode, reconnect, manager, machine, file and agent handling; `ui/sidebar.rs` and `ui/overlays.rs` draw the panel, overlays and mode strips, and `ui/machine_ui.rs` draws the machine panel; `ui/tests.rs` keeps the shared goldens and delegates panel cases to `ui/tests/panels.rs` |
+| `workspace::sidebar`, `workspace::runtime::resize` | Pure sidebar width (hidden below 70 columns; a quarter of the viewport clamped to 18..28), lines and hit testing; keyboard resize mode that targets a split and calls the weighted `resize_gap` |
 | `workspace::file`, `workspace::runtime::file` | Pure file context, 400-line paging, line diff, editor selection/temp rules and write-back rules; runtime file IO through Core and the editor session |
 | `workspace::state`, `workspace::local` | Runtime UI state and per-screen view |
 | `config` | Startup settings: theme, scrollback, mouse, clipboard, prefix keys |
-| `theme` | Chrome colors, default/dark/light, 16/256/truecolor mapping |
+| `theme` | Catppuccin Mocha (default) and Latte chrome roles, the named-color `terminal` look, and 16/256/truecolor mapping |
 | `clipboard` | OSC 52 encoding and native helper fallback |
 | `tui`, `term`, `session`, `probe` | Terminal backend, process/session ownership, `ht screen` and `ht probe` |
 
-The workspace model, geometry, commands, keys, palette and agents are pure and
-unit-testable without a PTY. IO lives in `core`, `screen`, `vt`,
+The workspace model, geometry, commands, keys, palette, agents and sidebar are
+pure and unit-testable without a PTY. IO lives in `core`, `screen`, `vt`,
 `workspace/runtime`, `tui` and `main`. `ht` has no `status`, `commands` or
 `--skill` subcommand yet; those remain planned.
 
@@ -106,11 +107,27 @@ unit-testable without a PTY. IO lives in `core`, `screen`, `vt`,
 2. Feed bytes into the local VT; it owns screen, scrollback, cursor, modes, title and responses.
 3. On redraw, update the VT render state and iterate visible rows/cells.
 4. Map each cell's symbol, style, foreground/background and attributes into a ratatui `Buffer` cell; honor wide cells and continuation cells.
-5. Compose the TUI around the terminal area: tab bar, pane borders, status bar, sidebar, overlays.
+5. Compose the TUI around the terminal area: persistent left sidebar, tab bar, pane borders, mode strip, status bar and overlays.
 6. Diff and present; use synchronized output when the terminal supports it; place the cursor only for the focused terminal.
 7. Send **FACTS** when colors or cell size change, **RESIZE** when a pane changes size, **FOCUS** when focus changes.
 
 The TUI owns the screen. It does not ask core for frames or scrape `terminal.read`.
+
+**Chrome and theme.** The persistent sidebar takes the left edge of the
+workspace viewport; the tab bar, pane area and status bar start to its right.
+A one-row mode strip overlays the pane area's last row with the status bar
+underneath, so entering or leaving a mode never resizes a terminal. Every
+chrome color comes from `Theme`: panel background, two surfaces, secondary and
+primary text, accent and the status colors. The default is Catppuccin Mocha;
+`light` is Catppuccin Latte; `terminal` keeps the earlier named-color look.
+Active tabs use the accent block, a focused pane border is accent with a bold
+inline title, overlay selections are accent blocks and sidebar selections a
+quieter surface (or a reversed row in `terminal`), and the Catppuccin status
+bar has no reversed row. Rename prompts use an accent chip and search a mauve
+chip. Explicit colors are mapped to the nearest 256-color index or the nearest
+of the 16 named colors from `COLORTERM` and `TERM`, so no RGB reaches a
+terminal that cannot show it. Terminal cells always keep the program's own
+colors.
 
 Grapheme clustering (DEC mode 2027) is a VT reset default, matching Core and
 Herdr App; it is client-local and needs no Core version gate. A
@@ -131,11 +148,14 @@ placement, selection and search consistent with Core.
 1. An in-progress split resize or selection drag owns every mouse event.
 2. An open overlay (help, prompt, palette, search, manager, machine manager
    with its add/rename prompt and removal confirmation, file overlay with its
-   path prompt, viewer, diff and conflict states, preview, peek, sidebar)
-   consumes every mouse event. A selection is not in that list: a fresh press
-   leaves selection and is routed as if none existed.
-3. Chrome: a tab-bar click selects a tab, a status-bar click is consumed, and
-   a split-gap press starts a resize. Chrome never reaches a program.
+   path prompt, viewer, diff and conflict states, preview, peek) consumes every
+   mouse event. A selection is not in that list: a fresh press leaves selection
+   and is routed as if none existed. The focused sidebar is not in that list
+   either: it sits beside the panes, a click in it selects, and a click outside
+   returns its keyboard focus and is routed normally.
+3. Chrome: a sidebar click selects a space or jumps to an agent, a tab-bar
+   click selects a tab, a status-bar click is consumed, and a split-gap press
+   starts a resize. Chrome never reaches a program.
 4. A pane-grid press focuses the pane; a border press only focuses it. With
    Shift, or when the program does not track the mouse, the press arms a local
    selection whose release stays local even without a drag. Selection starts
@@ -150,12 +170,36 @@ placement, selection and search consistent with Core.
 RESIZE is sent only when a pane's grid actually changes. Overlays and chrome
 never change pane geometry.
 
+**Keyboard modes and the strip**
+
+PREFIX (the `Ctrl-b` prefix chord), COPY (`prefix [` selection) and RESIZE
+(`prefix r`) each own the keys until they exit, and a one-row strip over the
+pane area's last row names the active mode with a themed chip and its hints.
+Opening an overlay or search, giving the sidebar focus, or reconnecting calls
+`clear_modes`, and a mouse-started local selection leaves resize first, so the
+strip and the keys that act always agree. Other keys leave COPY and reach the
+program; RESIZE swallows a key that is not a direction and leaves without
+acting. A mode never shrinks a pane or resizes a terminal.
+
+**Resize mode** (`prefix r`) enters only when the active tab has more than one
+pane and is not zoomed; an empty tab and a single-pane tab get distinct
+messages, and a zoomed tab reports resize unavailable. `h`/`l` move the
+focused split on the column axis and `j`/`k` on the row axis by one cell,
+Shift by five; Esc or `q` leaves, and a missing split on that axis is a no-op
+that stays in the mode. It picks the boundary with `geometry::resize_target`
+and calls the same weighted `resize_gap` as a mouse drag, so the keyboard and
+the pointer converge on one layout; pane minimums hold, and the new grid is
+sent as a normal RESIZE.
+
 **Selection, copy and paste**
 
 - `prefix [` starts a keyboard selection at the focused cursor; h/j/k/l or the
-  arrows extend it, `y` or Enter copies, Esc cancels. Mouse click-drag selects
-  on a non-tracking grid; Shift-drag selects over a tracking program. Selection
-  is cell-based; word and line selection are not provided.
+  arrows extend it by a cell, `w`/`b`/`e` move by word, `v` or space re-anchors
+  the selection at its end, `y` or Enter copies, `/` or `?` opens the same
+  scrollback search and ends the selection, and Esc cancels. Mouse click-drag
+  selects on a non-tracking grid; Shift-drag selects over a tracking program.
+  Selection is cell-based; word- and line-granular selection modes are not
+  provided.
 - Copied text strips cell padding: wide cells are copied once and row ends are
   trimmed. An empty selection copies nothing.
 - Copy uses OSC 52 by default. `clipboard` selects OSC 52, a native helper
@@ -203,12 +247,12 @@ version 1:
 **Local view** is per screen and stays on the machine:
 `$XDG_STATE_HOME/herdr-terminal/view-<screen>.json` (falling back to
 `$HOME/.local/state`). It holds the active space/tab, focus, zoom, focus
-history and whether the agent sidebar is open. The screen id comes from
+history and whether the sidebar holds keyboard focus. The screen id comes from
 `HERDR_TERMINAL_SCREEN` (1–64 characters of
 `[A-Za-z0-9._-]`, default `default`). A missing or malformed view is a warning,
 not an error; ids that no longer exist are ignored. Scrollback, search,
-selection and theme are runtime-only: they are not stored here or in the
-shared document.
+selection, mode state, the sidebar selection/offset and theme are runtime-only:
+they are not stored here or in the shared document.
 
 **Labels** identify the TUI's own terminals after a restart:
 
@@ -261,12 +305,23 @@ without a valid label falls back to a transient local flag that is set by
 looking and cleared by a hidden busy→non-busy transition. Nothing local is
 persisted.
 
-**Sidebar** (`a`) lists every agent across all spaces and tabs. Pinned agents
-first, then blocked > done > working > idle (unknown sorts with idle), then
-workspace order and address. `j`/`k` move, `g`/`G` go to the first/last row,
-`Enter` jumps, `i` peeks, `p` toggles the pin, `u` marks unread; `Esc` or `a`
-closes. Selection is by pane id and follows reordering. Only the open flag is
-local view state (`sidebar_open`, schema v1); the selection is not persisted.
+**Sidebar** (`prefix a`) is a persistent left panel, not an overlay. On
+viewports at least 70 columns wide it takes the left edge, a quarter of the
+width clamped to 18..28 columns (20 at 80 columns, 24 at 96); the bars and
+panes start to its right. It lists this workspace's spaces first, then every
+agent across all spaces and tabs: pinned agents first, then blocked > done >
+working > idle (unknown sorts with idle), then workspace order and address.
+`j`/`k` or the arrows move, `g`/`G` go to the first/last item, `Enter`
+switches to a space or jumps to an agent (a jump returns keyboard focus to the
+pane), `i` peeks, `p` toggles the pin, `u` marks unread, and `Esc` or `a`
+returns focus. Clicking a space switches to it; clicking an agent jumps.
+A focused panel counts as covering the panes for seen/attention, but it is not
+mouse-modal: a click outside returns keyboard focus and is routed normally.
+Below 70 columns the panel is hidden and `prefix a` reports the 70-column
+requirement; losing the panel releases its focus, and widening the terminal
+does not restore it. Selection is by item (space id or pane id) and follows
+reordering. The focus flag is local view state (`sidebar_open`, schema v1);
+the selection and offset are not persisted.
 
 **Peek** (`prefix i`, or `i` on a sidebar row) draws the pane's existing local
 VT plus core facts (title, address, word, turn, pin, app, progress, kind,
@@ -606,7 +661,8 @@ command behaves exactly as its key does.
 **Settings** are read once at startup from
 `$XDG_CONFIG_HOME/herdr-terminal/config.json`, falling back to
 `$HOME/.config/herdr-terminal/config.json` when the variable is unset or empty.
-The fields are `theme` (`default`, `dark`, `light`), `scrollback` lines,
+The fields are `theme` (`default`, `dark`, `light`, `terminal`, plus the
+`catppuccin` and `catppuccin-latte` aliases), `scrollback` lines,
 `mouse` on/off, `clipboard` (`osc52`, `native`, `both`, `off`) and `keys`
 prefix-binding overrides. A missing file is normal. Malformed JSON, unknown
 settings and bad values warn and fall back to defaults, so the TUI still starts.
@@ -615,10 +671,17 @@ collisions, keeping the default binding. There is no settings UI and no live
 reload.
 
 **Themes** style only the chrome: tab bar, pane borders, status bar, sidebar,
-peek, help, palette, search and local selection. Terminal cells always keep the
-program's colors. `default` uses the outer terminal's palette; `dark` and
-`light` use explicit colors mapped down for 16- and 256-color terminals, chosen
-from `COLORTERM` and `TERM`.
+peek, help, palette, search, mode strips and local selection. Terminal cells
+always keep the program's colors. Catppuccin Mocha is the default: `default`,
+`dark` and `catppuccin` all select it. `light` and `catppuccin-latte` select
+Catppuccin Latte, and `terminal` keeps the earlier look in the outer terminal's
+own named palette, reversing selected rows because it has no surface color.
+Every role — panel background, surfaces, text, accent and status colors —
+exists in both palettes; explicit colors are mapped to the nearest 256-color
+index or the nearest of the 16 named colors from `COLORTERM` and `TERM`, so no
+RGB reaches a lesser terminal. Agent words use only the Core-reported status
+word: working green, blocked/error red, done teal, idle muted, anything else
+plain.
 
 **Performance.** Input handling, command dispatch, scrollback and search are
 bounded per loop iteration, and output is drained in bounded batches with the
@@ -645,10 +708,10 @@ Statuses:
 | Machine manager | `machine.list` machines, connect/add/rename/remove, remote `machine/t7` terminals |
 | Files | Paged read-only viewer, `$VISUAL`/`$EDITOR`, line diff, content-checked (non-atomic) write-back |
 | Terminals | New/close/rename, labels, keep, kill/rm, shell/command |
-| Agents | Status, turn, title, foreground, list/sidebar, peek, seen/pinned |
-| UI | Tab bar, pane borders, status bar, command palette, help, toast/confirm/prompt |
+| Agents | Status, turn, title, foreground, persistent spaces/agents sidebar, peek, seen/pinned |
+| UI | Persistent sidebar, tab bar, pane borders, status bar, mode strips, command palette, help, toast/confirm/prompt |
 | Persistence | Own `herdr-terminal` document, restore, multi-screen CAS |
-| Themes | 16/256/truecolor, default palette, basic theme config |
+| Themes | Catppuccin Mocha/Latte chrome, named-color `terminal` theme, 16/256/truecolor mapping |
 | Recovery | `lost`/`restarted`/`finished`, `missed`, heartbeat, reattach |
 | Diagnostics | Version, core status, logs, `ht status` |
 | Distribution | macOS Apple Silicon package with notices, GitHub Actions CI and a tag-triggered GitHub release workflow |
@@ -733,13 +796,15 @@ currently implements.
   and labels.
 - **Persistence:** the `herdr-terminal` document, restore, multi-screen
   compare-and-set, and terminal rediscovery by labels.
-- **Agents:** status, turn, title and foreground from core; the agent
-  sidebar; peek; jump; seen and pinned labels; blocked and finished alerts.
-- **UI and CLI:** tab bar, pane frames, status bar, help overlay and rename
-  prompt, with the `Ctrl-b` prefix key map and `?` for help; `ht` opens the
-  workspace, `ht screen` runs or reattaches to one terminal and `ht probe`
-  copies the raw attach bytes. `Ctrl-]` detaches and the programs keep
-  running.
+- **Agents:** status, turn, title and foreground from core; the persistent
+  spaces-and-agents sidebar; peek; jump; seen and pinned labels; blocked and
+  finished alerts.
+- **UI and CLI:** a persistent sidebar, tab bar, pane frames, status bar, help
+  overlay, rename prompt, mode strips on the pane area's last row, and
+  Catppuccin Mocha/Latte chrome with a named-color `terminal` theme; the
+  `Ctrl-b` prefix key map and `?` for help; `ht` opens the workspace,
+  `ht screen` runs or reattaches to one terminal and `ht probe` copies the raw
+  attach bytes. `Ctrl-]` detaches and the programs keep running.
 - **Cell width and startup size:** the local VT enables grapheme clustering
   (DEC mode 2027) by default like Core and Herdr App, so variation-selector
   emoji form one cluster two cells wide, followed by a zero-width spacer cell,
@@ -758,28 +823,30 @@ currently implements.
   Shift-PgUp/PgDn, Shift-Home/End and any ordinary key return to live.
 - **Search and clipboard:** literal case-insensitive scrollback search with a
   match count and next/previous jumps, driven in bounded steps; local
-  selection with no cell padding; copy through OSC 52 by default, optionally
-  a native helper; bracketed paste only to a focused program that enabled
-  DEC 2004.
+  selection with cell and word motion, re-anchoring and no cell padding; copy
+  through OSC 52 by default, optionally a native helper; bracketed paste only
+  to a focused program that enabled DEC 2004.
 - **Palette and settings:** the command palette reuses the command table and
   shows configured key hints; startup settings in
   `$XDG_CONFIG_HOME/herdr-terminal/config.json` cover theme, scrollback,
-  mouse, clipboard and prefix key overrides. The default, dark and light
-  themes style chrome only, mapped to 16, 256 and truecolor; terminal cells
-  keep their own colors.
+  mouse, clipboard and prefix key overrides. Catppuccin Mocha is the default,
+  `light` is Latte, `terminal` is the named-color legacy look, and every role
+  maps to 16, 256 and truecolor; terminal cells keep their own colors.
 - **Performance:** bounded per-loop work, bounded output batches and bounded
   scrollback/search keep palette, search and redraw responsive under large
   output.
 
 The implemented set covers the connection and terminal foundation, the
 workspace and its persistence, agent awareness, the daily-driver input layer
-(mouse, history, search, selection, clipboard, palette, settings and themes),
-the local VT's grapheme clustering, initial terminal sizes, start directories
-and exit-driven pane replacement, the Core-wide terminal manager and its
-read-only Preview, the machine manager with its remote terminals and rename
-recovery, and the Core-backed file viewer, editor, line diff and write-back.
-Packaging, notices, CI and versioning are also
-implemented; the package is macOS Apple Silicon. Still planned: tab reorder,
+(mouse, history, search, selection and copy-mode motion, clipboard, palette,
+the persistent spaces/agents sidebar, PREFIX/COPY/RESIZE strips and keyboard
+resize, settings and Catppuccin themes), the local VT's grapheme clustering,
+initial terminal sizes, start directories and exit-driven pane replacement,
+the Core-wide terminal manager and its read-only Preview, the machine manager
+with its remote terminals and rename recovery, and the Core-backed file
+viewer, editor, line diff and write-back. Packaging, notices, CI and versioning
+are also implemented; the package is macOS Apple Silicon. Still planned: tab
+reorder,
 custom layouts, accessibility, general confirm/toast prompts, the file picker
 and directory listing, install scripts, `ht status` and mods. Scrollback,
 search, selection, theme, terminal- and machine-manager state, and open file
