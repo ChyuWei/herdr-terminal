@@ -498,7 +498,7 @@ and reattaches. `ht` has no update command.
 
 **Startup**
 
-1. Discover the core binary (configured path, `PATH`, login shell `PATH`, usual install dirs; accept it only if `--version` prints `hc …`).
+1. Discover the core binary (configured path, `PATH`, login shell `PATH`, usual install dirs; accept it only if `--version` prints `hc …`). The probe is deadline-bounded and briefly retries a candidate whose executable is busy (for example while an installer replaces it) before rejecting it.
 2. Connect to the socket or `hc connect`; send `hello {"framed": true}`.
 3. Check generation, minimum version, methods and features; fail with a clear message if a required method or feature is missing, or the core is older than 0.1.17 or its version is unreadable.
 4. `events.subscribe`; keep the snapshot.

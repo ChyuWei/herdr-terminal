@@ -68,17 +68,45 @@ pub fn version(bin: &Path) -> Option<String> {
     version_within(bin, VERSION_TIMEOUT)
 }
 
+/// A few short retries cover a busy executable: another thread's fork can
+/// briefly inherit a write handle to a script this process just wrote, and
+/// the kernel reports `ETXTBSY` until that child execs. A binary being
+/// replaced by an installer can be busy for the same reason.
+const SPAWN_ATTEMPTS: u32 = 8;
+const SPAWN_RETRY: Duration = Duration::from_millis(20);
+
 fn version_within(bin: &Path, timeout: Duration) -> Option<String> {
-    let mut command = Command::new(bin);
-    command
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = command.spawn().ok()?;
-    let (status, stdout) = collect_version(&mut child, timeout)?;
+    let deadline = Instant::now() + timeout;
+    let mut child = spawn_probe(bin, deadline)?;
+    let (status, stdout) = collect_version(&mut child, deadline)?;
     let text = String::from_utf8_lossy(&stdout).trim().to_owned();
     (status.success() && text.starts_with("hc ")).then_some(text)
+}
+
+/// Starts the version probe, retrying a busy executable while the probe's
+/// own deadline allows it.
+fn spawn_probe(bin: &Path, deadline: Instant) -> Option<Child> {
+    let mut attempts = 1;
+    loop {
+        let mut command = Command::new(bin);
+        command
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        match command.spawn() {
+            Ok(child) => return Some(child),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempts < SPAWN_ATTEMPTS
+                    && Instant::now() + SPAWN_RETRY < deadline =>
+            {
+                attempts += 1;
+                std::thread::sleep(SPAWN_RETRY);
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Ends the probe: kill, then reap so no zombie is left.
@@ -87,10 +115,10 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// The child's exit status and stdout, both bounded by `timeout` and
+/// The child's exit status and stdout, both bounded by `deadline` and
 /// [`VERSION_LIMIT`]. The single deadline covers exit and stdout collection.
 #[cfg(unix)]
-fn collect_version(child: &mut Child, timeout: Duration) -> Option<(ExitStatus, Vec<u8>)> {
+fn collect_version(child: &mut Child, deadline: Instant) -> Option<(ExitStatus, Vec<u8>)> {
     use std::os::fd::AsRawFd;
 
     let Some(mut stdout) = child.stdout.take() else {
@@ -103,7 +131,6 @@ fn collect_version(child: &mut Child, timeout: Duration) -> Option<(ExitStatus, 
         stop(child);
         return None;
     }
-    let deadline = Instant::now() + timeout;
     let mut out = Vec::new();
     let mut status = None;
     let mut eof = false;
@@ -158,7 +185,7 @@ fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The child's exit status and stdout, both bounded by `timeout` and
+/// The child's exit status and stdout, both bounded by `deadline` and
 /// [`VERSION_LIMIT`]. A reader thread collects stdout so the wait cannot block
 /// on a pipe. The thread is never joined: after a successful exit a descendant
 /// can still hold stdout open, and joining would wait past the deadline. The
@@ -167,7 +194,7 @@ fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
 /// buffer exceeds the cap the caller kills and returns, without waiting for a
 /// chatty child to exit.
 #[cfg(not(unix))]
-fn collect_version(child: &mut Child, timeout: Duration) -> Option<(ExitStatus, Vec<u8>)> {
+fn collect_version(child: &mut Child, deadline: Instant) -> Option<(ExitStatus, Vec<u8>)> {
     use std::sync::mpsc;
 
     let Some(mut stdout) = child.stdout.take() else {
@@ -193,7 +220,6 @@ fn collect_version(child: &mut Child, timeout: Duration) -> Option<(ExitStatus, 
         let _ = sender.send(out);
     });
 
-    let deadline = Instant::now() + timeout;
     let mut status = None;
     let mut bytes = None;
     loop {
@@ -389,6 +415,26 @@ mod tests {
         let other = Scratch::new("hc-name");
         let hc = other.script("hc", "echo 'hc 9.9.9'");
         assert_eq!(search(names(&other.0)), Some(hc));
+    }
+
+    #[test]
+    fn a_busy_candidate_is_retried() {
+        let scratch = Scratch::new("busy");
+        let script = scratch.script("busy", "echo 'hc 9.9.9'");
+        // Linux refuses to exec a file held open for writing (ETXTBSY) until
+        // the handle is dropped, like a forked child that briefly inherited
+        // another thread's handle; macOS permits it, so there the retry path
+        // is covered by inspection rather than by this test.
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("hold open");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            drop(handle);
+        });
+        assert_eq!(version(&script), Some("hc 9.9.9".to_owned()));
+        release.join().expect("release thread");
     }
 
     #[test]
