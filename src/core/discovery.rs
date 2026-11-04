@@ -6,14 +6,19 @@
 //! `--version` prints `hc …`: some systems ship an unrelated `hc`.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// A full path to use instead of searching.
 pub const CONFIGURED_ENV: &str = "HERDR_TERMINAL_HC";
 /// Test hook: replaces every place we would look with these directories.
 pub const DIRS_ENV: &str = "HERDR_CORE_DIRS";
+/// How long a candidate's `--version` may take to exit and close stdout.
+pub const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+/// The most `--version` output accepted; a wedged or chatty binary is refused.
+pub const VERSION_LIMIT: usize = 64 * 1024;
 
 /// The first herdr-core found, or `None`.
 pub fn find(configured: Option<&Path>) -> Option<PathBuf> {
@@ -56,18 +61,173 @@ pub fn search(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> 
         .find(|bin| bin.is_file() && version(bin).is_some())
 }
 
-/// `hc X.Y.Z` when this binary is herdr-core and runs. The probe has no
-/// deadline yet (an M2 gap): a wedged binary can stall discovery.
+/// `hc X.Y.Z` when this binary is herdr-core and runs. The probe gives a
+/// candidate [`VERSION_TIMEOUT`] to exit and close stdout: a wedged binary
+/// must not stall discovery.
 pub fn version(bin: &Path) -> Option<String> {
-    let out = Command::new(bin)
+    version_within(bin, VERSION_TIMEOUT)
+}
+
+fn version_within(bin: &Path, timeout: Duration) -> Option<String> {
+    let mut command = Command::new(bin);
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (out.status.success() && text.starts_with("hc ")).then_some(text)
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let (status, stdout) = collect_version(&mut child, timeout)?;
+    let text = String::from_utf8_lossy(&stdout).trim().to_owned();
+    (status.success() && text.starts_with("hc ")).then_some(text)
+}
+
+/// Ends the probe: kill, then reap so no zombie is left.
+fn stop(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The child's exit status and stdout, both bounded by `timeout` and
+/// [`VERSION_LIMIT`]. The single deadline covers exit and stdout collection.
+#[cfg(unix)]
+fn collect_version(child: &mut Child, timeout: Duration) -> Option<(ExitStatus, Vec<u8>)> {
+    use std::os::fd::AsRawFd;
+
+    let Some(mut stdout) = child.stdout.take() else {
+        // No pipe to drain: the probe cannot succeed, but the child may still
+        // be running, so end it rather than leave an unreaped process.
+        stop(child);
+        return None;
+    };
+    if set_nonblocking(stdout.as_raw_fd()).is_err() {
+        stop(child);
+        return None;
+    }
+    let deadline = Instant::now() + timeout;
+    let mut out = Vec::new();
+    let mut status = None;
+    let mut eof = false;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(done) => status = done,
+                Err(_) => {
+                    stop(child);
+                    return None;
+                }
+            }
+        }
+        if !eof {
+            let mut chunk = [0u8; 8192];
+            match stdout.read(&mut chunk) {
+                Ok(0) => eof = true,
+                Ok(read) => {
+                    out.extend_from_slice(&chunk[..read]);
+                    if out.len() > VERSION_LIMIT {
+                        stop(child);
+                        return None;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    stop(child);
+                    return None;
+                }
+            }
+        }
+        if status.is_some() && eof {
+            return Some((status?, out));
+        }
+        if Instant::now() >= deadline {
+            stop(child);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The child's exit status and stdout, both bounded by `timeout` and
+/// [`VERSION_LIMIT`]. A reader thread collects stdout so the wait cannot block
+/// on a pipe. The thread is never joined: after a successful exit a descendant
+/// can still hold stdout open, and joining would wait past the deadline. The
+/// probe returns by the deadline anyway; the reader is left to finish or die
+/// with the pipe (a bounded, best-effort cleanup). As soon as the received
+/// buffer exceeds the cap the caller kills and returns, without waiting for a
+/// chatty child to exit.
+#[cfg(not(unix))]
+fn collect_version(child: &mut Child, timeout: Duration) -> Option<(ExitStatus, Vec<u8>)> {
+    use std::sync::mpsc;
+
+    let Some(mut stdout) = child.stdout.take() else {
+        stop(child);
+        return None;
+    };
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    out.extend_from_slice(&chunk[..read]);
+                    if out.len() > VERSION_LIMIT {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = sender.send(out);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut bytes = None;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(done) => status = done,
+                Err(_) => {
+                    stop(child);
+                    return None;
+                }
+            }
+        }
+        if bytes.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(left.min(Duration::from_millis(10))) {
+                Ok(out) => bytes = Some(out),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => bytes = Some(Vec::new()),
+            }
+        }
+        // The cap ends the probe even while the child is still running.
+        if bytes.as_ref().is_some_and(|out| out.len() > VERSION_LIMIT) {
+            stop(child);
+            return None;
+        }
+        if status.is_some() && bytes.is_some() {
+            return Some((status?, bytes?));
+        }
+        if Instant::now() >= deadline {
+            stop(child);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn expand(path: &Path, home: Option<&Path>) -> PathBuf {
@@ -132,8 +292,10 @@ fn usual_dirs(home: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
-/// The `PATH` the person's login shell sets up, or `None` if it doesn't
-/// answer quickly. Slow profiles must not hold up the client.
+/// The `PATH` the person's login shell sets up. Waiting for the shell to exit
+/// is bounded to 3 s, but collecting its stdout after that exit can still wait
+/// for EOF when a descendant holds the pipe: discovery as a whole is not
+/// deadline-bounded, only the `--version` probe is.
 fn login_shell_path() -> Option<std::ffi::OsString> {
     if cfg!(windows) {
         return None;
@@ -153,10 +315,15 @@ fn login_shell_path() -> Option<std::ffi::OsString> {
         }
         if Instant::now() > deadline {
             let _ = child.kill();
+            // Reap the killed child so discovery leaves no zombie behind.
+            let _ = child.wait();
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The exit above does not close stdout by itself: a descendant the shell
+    // started can keep it open, and this read can wait for EOF. Discovery as a
+    // whole is therefore not deadline-bounded; only the `--version` probe is.
     let mut out = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
     Some(out.into())
@@ -222,5 +389,80 @@ mod tests {
         let other = Scratch::new("hc-name");
         let hc = other.script("hc", "echo 'hc 9.9.9'");
         assert_eq!(search(names(&other.0)), Some(hc));
+    }
+
+    #[test]
+    fn a_wedged_version_probe_returns_by_its_deadline() {
+        let scratch = Scratch::new("version-slow");
+        // `exec` makes the sleep the probe's direct child, so kill+wait reaps
+        // it instead of leaving a forked `sleep 5` behind.
+        let slow = scratch.script("slow", "exec sleep 5");
+        let started = Instant::now();
+        assert_eq!(version_within(&slow, Duration::from_millis(150)), None);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_version_probe_refuses_output_over_the_limit() {
+        let scratch = Scratch::new("version-big");
+        let big = scratch.script(
+            "big",
+            "printf 'hc '; head -c 131072 /dev/zero | tr '\\0' 'x'; echo",
+        );
+        let started = Instant::now();
+        // The cap must end the probe well before this generous deadline: a
+        // deadline path (about 3 s) would fail the bound below.
+        assert_eq!(version_within(&big, Duration::from_secs(3)), None);
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    /// The pid a descendant recorded, waiting up to 2 s for the shell to write
+    /// it. No pid is not a failure: the shell may have been killed first.
+    fn recorded_pid(path: &Path) -> Option<i32> {
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                return Some(pid);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[test]
+    fn a_version_probe_does_not_wait_for_a_descendant_holding_stdout() {
+        let scratch = Scratch::new("version-descendant");
+        let pidfile = scratch.0.join("descendant.pid");
+        let script = scratch.script(
+            "parent",
+            &format!(
+                // The descendant inherits the version pipe and keeps it open
+                // after the shell exits. The pid is recorded when the shell
+                // gets that far; the probe may kill it first, so the test
+                // never depends on the file (the 5 s sleep bounds any
+                // residue).
+                "sleep 5 &\necho $! > '{}'\necho 'hc 9.9.9'",
+                pidfile.display()
+            ),
+        );
+        let started = Instant::now();
+        let result = version_within(&script, Duration::from_millis(500));
+        let elapsed = started.elapsed();
+        // Clean up before asserting so no failure can leak the descendant.
+        // Best effort only: a missing pid means the shell was killed before
+        // it recorded the pid, and the descendant ends by itself within 5 s.
+        if let Some(pid) = recorded_pid(&pidfile) {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert_eq!(result, None, "the probe waited for the descendant");
+        // Waiting for EOF would take about 5 s; the 500 ms deadline is what
+        // makes the probe return early.
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
 }

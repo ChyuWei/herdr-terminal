@@ -157,9 +157,14 @@ records, raw output, attach, events, status, documents and machines.
   restore the alternate screen, raw mode, keyboard enhancement, paste, focus
   and mouse, including when the editor fails or exits nonzero. Remove the
   temp on every path.
-- **Write-back is content-checked.** Core has no file version or etag. Re-read
-  the whole file before writing and compare it with the first read; a
-  difference requires the explicit `o` overwrite, never a silent overwrite.
+- **Write-back is content-checked, not atomic.** Core has no file version or
+  etag. Re-read the whole file before writing and compare it with the first
+  read; a detected difference requires the explicit `o` overwrite. The
+  comparison and the write are separate requests, so a change made between
+  them is not detected and can be overwritten. The shared workspace document
+  is different: `doc.get` returns a version and `doc.set` takes the expected
+  version, so its updates are optimistic compare-and-set, not
+  read-compare-write.
   `w`/Enter and `o` both refuse a truncated re-read before comparing or
   writing. A failed write keeps the diff and buffer. Use `file.edit` only for
   one exact contiguous replacement; otherwise use `file.write` with base64
