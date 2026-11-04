@@ -9,14 +9,16 @@ If `AGENTS.local.md` exists, read it too: the maintainer's local rules.
 **Status: implemented, unreleased.** The client implements the core connection,
 local VT and terminal lifecycle, the spaces/tabs/panes workspace, its
 `herdr-terminal` document with restore and multi-screen sync, agent awareness
-(status, sidebar, local-VT peek, seen/pin, alerts), the Core-wide terminal
-manager (`prefix t`; Show/Hide and a read-only Preview), the machine manager
-(`prefix m`; add/connect/rename/remove Core machines and start `machine/t7`
-terminals), the file viewer/editor (`prefix o`; paged reads, `$VISUAL`/`$EDITOR`,
-line diff and content-checked write-back), and the daily-driver input surface:
-mouse routing and split drags, bounded local scrollback with search, selection
-with OSC 52/native copy and bracketed paste, the command palette, and startup
-settings with default/dark/light themes. The local VT enables grapheme
+(status, a persistent spaces-and-agents sidebar, local-VT peek, seen/pin,
+alerts), the Core-wide terminal manager (`prefix t`; Show/Hide and a read-only
+Preview), the machine manager (`prefix m`; add/connect/rename/remove Core
+machines and start `machine/t7` terminals), the file viewer/editor
+(`prefix o`; paged reads, `$VISUAL`/`$EDITOR`, line diff and content-checked
+write-back), and the daily-driver input surface: mouse routing and split drags,
+bounded local scrollback with search, selection with copy-mode motion and OSC
+52/native copy, bracketed paste, the command palette, PREFIX/COPY/RESIZE mode
+strips with keyboard resize, and startup settings with Catppuccin Mocha/Latte
+chrome (and a named-color `terminal` theme). The local VT enables grapheme
 clustering as Core does, and new terminals start at the grid they will attach
 at. Settings are read at startup only: there is no settings UI or live reload.
 The tests exist and pass. A file picker, install scripts and accessibility
@@ -53,9 +55,37 @@ records, raw output, attach, events, status, documents and machines.
   `herdr.terminal.*`. Do not read or write Herdr App's `herdr-app` document,
   `herdr.space` or `herdr.tab`. Share only the cross-client `herdr.seen` and
   `herdr.pinned` conventions.
-- **Local daily-use state.** Scrollback, search, selection and theme stay in
-  memory. Never write them to the shared `herdr-terminal` document or the
-  per-screen view; those hold layout and view state only.
+- **Local daily-use state.** Scrollback, search, selection, mode state, the
+  sidebar selection/offset and theme stay in memory. Never write them to the
+  shared `herdr-terminal` document. The per-screen view holds the sidebar
+  focus flag; its selection and offset are not persisted.
+- **Theme owns every chrome color.** Bars, borders, panels, overlays, the
+  sidebar, selections and mode chips take colors from `Theme`; never hardcode a
+  color in a widget. Both Catppuccin palettes define every role and are mapped
+  down for 256- and 16-color terminals, so no RGB reaches a lesser terminal;
+  `terminal` is the named-color legacy look and reverses selected rows. Agent
+  status colors come only from the Core-reported word through
+  `Theme::status_word`.
+- **The sidebar is persistent, not an overlay.** It owns the left edge on
+  viewports at least 70 columns wide, a quarter of the width clamped to 18..28;
+  bars and panes start to its right. `prefix a` only gives it keyboard focus
+  (`a`/Esc returns it), and below 70 columns the message explains why nothing
+  focuses. Releasing focus when the panel disappears must not restore it when
+  the terminal widens again. Focus counts as covering the panes for
+  seen/attention, but the panel is never mouse-modal: a click inside selects, a
+  click outside returns focus. Focus, selection and offset are local UI state;
+  only the focus flag is saved in the per-screen view.
+- **Modes agree with the strip.** PREFIX, COPY (selection) and RESIZE each own
+  the keys, and the one-row strip over the pane area's last row names the mode
+  that acts. `clear_modes` leaves resize and copy before an overlay, palette,
+  search or sidebar focus, and reconnect clears them too; a mouse-started
+  selection ends resize first. Never let the strip name a mode that no longer
+  owns the keys.
+- **Resize only through `resize_gap`.** Keyboard resize picks the split with
+  `geometry::resize_target` and calls `Model::resize_gap`, the weighted path the
+  mouse drag uses; never edit geometry weights in place. Shift moves five cells;
+  pane minimums hold; a zoomed tab refuses resize, and empty and single-pane
+  tabs get distinct messages.
 - **Settings are startup-only.** Read `config.json` once at launch. Do not add
   live reload or a settings UI without a separate design.
 - **Local VT.** Core sends raw bytes and a first paint, not draw commands.
@@ -210,8 +240,9 @@ records, raw output, attach, events, status, documents and machines.
 The Cargo workspace builds and tests. The suites cover the protocol, VT,
 single-pane lifecycle, workspace, persistence, agents, the daily-driver input
 layer (mouse, scrollback/search, clipboard, palette, config and themes),
-grapheme width, initial terminal size, the terminal manager, the machine
-manager and remote recovery, the file viewer/editor and write-back, and
+grapheme width, initial terminal size, the persistent spaces/agents sidebar,
+the PREFIX/COPY/RESIZE strips and keyboard resize, the terminal manager, the
+machine manager and remote recovery, the file viewer/editor and write-back, and
 observer attach/resize ordering.
 
 ```sh
@@ -267,14 +298,19 @@ src/
     commands.rs, keys.rs # command table and bindings
     palette.rs          # pure palette entries and filtering
     agents.rs           # pure agent facts, ordering, alerts
+    sidebar.rs          # pure sidebar geometry, lines and hit testing
     manager.rs          # pure Core-wide inventory, sort/filter, labels
     machines.rs         # pure machine rows, sort/filter, remote addresses
     file.rs             # pure file context, paging, diff, editor and write rules
     file/tests.rs       # file model tests
     runtime/            # event loop, attach, input, mouse, overlays, reconnect, agents, manager, machines
+    runtime/resize.rs   # keyboard resize mode over the weighted resize_gap path
     runtime/file.rs     # file reads, editor, diff and write-back
     ui.rs               # ratatui composition
+    ui/sidebar.rs       # persistent sidebar drawing
+    ui/overlays.rs      # overlays, prompts, mode strips and chips
     ui/machine_ui.rs    # machine manager panel, prompt and confirmation
+    ui/tests.rs, ui/tests/panels.rs  # UI golden and panel tests
     startup.rs          # document claim and restore
     local.rs, state.rs  # local view and UI state
     sync.rs             # document CAS state
@@ -304,6 +340,10 @@ tests/                  # probe, screen, workspace, fake-core
   its spaces.
 - Do not use screen text for status, turn, title or foreground; Core is the
   source.
+- Do not hardcode a chrome color or a status color outside `Theme`; the theme
+  role and the Core-reported word decide both.
+- Do not treat the focused sidebar as a mouse overlay; it sits beside the
+  panes and only counts as covering them for seen/attention.
 - Do not spawn a Core or `hc` per action; keep one connection.
 - Do not run a bare Core/App against a real home; tests are isolated.
 - Do not add mods, an embedded editor, Markdown or images in v1; see the

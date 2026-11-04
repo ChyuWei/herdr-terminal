@@ -6,7 +6,7 @@ Herdr Core 的终端客户端。
 
 HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 runtime）的终端 UI（TUI）客户端。它和 Herdr App 桌面客户端平级，用来替代旧的 Herdr 1.x TUI。HerdR Terminal 负责屏幕和工作区组织；Herdr Core 负责程序和程序的事实。
 
-**状态：** 已实现，还未发布。客户端连接 Herdr Core，用本地 VT 渲染终端，提供带恢复和 agent 感知的 spaces/tabs/panes 工作区，并具备日常使用的输入能力：鼠标、有上限的 scrollback 和搜索、选择与复制/粘贴、命令面板，以及带 default/dark/light 主题的启动配置；此外还有 Core 范围内的终端管理器、面向 Core 机器的机器管理器（远程终端位于同一工作区中），以及由 Core 读取和写入的文件查看器、外部编辑器、行级 diff 和写回。文件选择器及其余后续功能见下方计划。
+**状态：** 已实现，还未发布。客户端连接 Herdr Core，用本地 VT 渲染终端，提供带恢复和 agent 感知的 spaces/tabs/panes 工作区，并具备日常使用的输入能力：鼠标、有上限的 scrollback 和搜索、选择与复制/粘贴、命令面板、常驻的 spaces/agents 侧栏、PREFIX/COPY/RESIZE 模式条和键盘 resize，以及带 Catppuccin Mocha/Latte 外观（并提供命名色 `terminal` 外观）的启动配置；此外还有 Core 范围内的终端管理器、面向 Core 机器的机器管理器（远程终端位于同一工作区中），以及由 Core 读取和写入的文件查看器、外部编辑器、行级 diff 和写回。文件选择器及其余后续功能见下方计划。
 
 **兼容性：** 支持 Herdr Core 0.1.17 及更新版本，协议 generation 1。连接时若 Core 更旧或版本无法解析，客户端会给出更新提示并拒绝连接；缺少必需方法或 feature 的 Core 也会被拒绝。`resize_notifications` 是连接必需的能力，并非可选（observer attach 没有回退路径）；其余能力根据 Core 在 `hello` 中声明的 features 启用，而不是检查版本字符串。
 
@@ -23,15 +23,16 @@ HerdR Terminal 是 **Herdr Core**（负责运行程序、维持终端存活的 r
 - **终端管理器**：`prefix t` 打开 Core 范围内所有 live 终端的列表，包含已显示标记、OSC 7501 状态（未报告时为 `unknown`）、存活时间、地址，以及可选的名称/标题/父终端/机器/cwd；按 blocked/error、working、done、idle、unknown 排序，并支持大小写不敏感的子串过滤。`Enter` 通过采用现有地址显示未显示的终端（不会启动新程序），或隐藏已显示的终端（detach 并移除 pane，绝不 kill/rm）；`p` 通过 observer attach 只读预览，和 agent peek 不同。选择和过滤属于本地 UI 状态。
 - **机器管理器**：`prefix m` 打开 Core 已知机器的模态列表，数据来自 `machine.list`，包含名称、状态（connecting、connected、needs_login、needs_update、unreachable 或 unknown）、处于当前状态的时长和 Core 给出的原因（如有）、target、host/version、session，以及 temporary/via 标记；按 connected、connecting、needs_login、needs_update、unreachable、unknown 排序，同状态中永久机器在前，并支持大小写不敏感的子串过滤。`Enter` 连接或重试，`a` 按 target 添加（原样交给 Core），`r` 重命名，`d` 经确认后移除，`n` 在所选机器上启动终端。远程终端使用 `machine/t7` 地址，像本地 pane 一样位于当前工作区，并从本地文档恢复；机器连接（SSH 或 via 命令）、拨号、退避和中继流由 Core 负责，客户端按 pane label 跟随机器重命名并保留 pane 和 stream。列表只在浮层打开时、每次操作后和定时器中刷新；Core 没有机器状态事件。
 - **文件**：`prefix o` 打开模态文件浮层。文件通过 Core 读写，使用当前 pane 的机器（存在时作为 `on`）和 cwd；路径输入从该 cwd 开始，不提供目录列表或选择器（以 `/` 或 `\` 结尾的输入会被直接拒绝）。查看器只读，用 `file.read` 每次读取 400 行，显示机器、路径、已加载范围和总行数；j/k 或方向键、PgUp/PgDn、g/G 或 Home/End 滚动并在跨越页时读取下一页/上一页；Esc 关闭。`e` 通过 Core 读取整个文件，写入唯一的本地临时副本并用 `$VISUAL` 或 `$EDITOR` 打开（按空白拆分，不回退到 `vi`），期间挂起并恢复 TUI；返回后显示 `+`/`-` 行级 diff。`w`/Enter 写入，`q`/Esc 丢弃。写入前会重新读取并与首次读取比较；文件已变化时显示冲突，`o` 是显式覆盖。这个比较不是原子操作：Core 没有文件版本，重新读取与写入之间发生的变化不会被发现。没有冲突时，单个连续替换使用 `file.edit`，否则使用 `file.write`（包括显式覆盖）。Core 因内联读取上限而截断的整文件读取不能编辑或写回，但查看器仍可分页浏览。文件内容不进入文档或 labels；只有编辑器的临时副本会写到本地。`file.read`、`file.write`、`file.edit` 是连接必需的方法。
-- **Agent**：status、turn、title、foreground、agent 侧栏、本地 VT peek、跳转、seen/pinned、blocked/finished 提醒。
+- **Agent**：status、turn、title、foreground、常驻的 spaces/agents 侧栏、本地 VT peek、跳转、seen/pinned、blocked/finished 提醒。侧栏在至少 70 列时占据左侧；`prefix a` 聚焦侧栏，j/k 和 g/G 移动，Enter 切换 space 或跳转到 agent，`i` peek，`p` 固定，`u` 标为未读，`a`/Esc 返回焦点；点击行可切换 space 或跳转。它是本地视图状态，聚焦时视为遮挡 pane（影响 seen/attention），但不会让鼠标变成模态。
 - **状态**：自己的 `herdr-terminal` 文档、恢复、多屏同步；按 labels 找回终端。
 - **恢复**：detach 不结束程序；重连、reattach，`missed` 后重新获取快照。
 - **鼠标**：点击聚焦 pane 或选择 tab；拖动 split 边界调整大小；chrome 不会发送给程序。程序不跟踪鼠标时滚轮滚动本地历史；Shift 拖动在程序跟踪鼠标时也做本地选择。
 - **Scrollback 和搜索**：每个 pane 保存有上限的历史，attach 时向 Core 请求历史；滚轮和 Shift-PgUp/PgDn/Home/End 滚动，普通按键回到 live 底部。`prefix f` 做字面、大小写不敏感的子串搜索（不支持正则），显示匹配数并支持下一个/上一个。历史按行数封顶并有字节预算；VT 按页裁剪，保留的行数可能比上限多约一页。
-- **选择和剪贴板**：`prefix [` 或拖动选择；`y`/Enter 复制；默认 OSC 52，可配置原生 helper（`pbcopy`、`wl-copy` 或 `xclip`）和 bracketed paste。选择以单元格为单位，不提供按词/按行选择。
+- **选择和剪贴板**：`prefix [` 或拖动选择；copy 模式下 h/j/k/l 移动一格，`w`/`b`/`e` 按词移动，`v`/space 在末端重新锚定，`y`/Enter 复制，`/` 或 `?` 打开 scrollback 搜索并结束选择，Esc 取消；默认 OSC 52，可配置原生 helper（`pbcopy`、`wl-copy` 或 `xclip`）和 bracketed paste。选择以单元格为单位，不提供按词或按行的选择模式。
+- **模式**：`prefix r` 仅在 tab 有多个 pane 且未 zoom 时进入 resize 模式；h/l 或 j/k 将当前 split 移动一格，Shift 移动五格，Esc/q 退出，其他按键退出且不执行操作。一行 PREFIX、COPY 或 RESIZE 模式条覆盖 pane 区域的最后一行，status bar 位于其下；打开浮层或搜索、聚焦侧栏或重连会清除模式，因此模式条和按键始终一致。
 - **命令面板**：`prefix :` 对现有命令表做大小写不敏感过滤，显示当前键位提示；Up/Down 移动选择，Enter 执行；`j`/`k` 输入到过滤器。
-- **UI**：tab bar、pane 边框、status bar、help 浮层、重命名输入、搜索栏，以及 default/dark/light chrome 主题；`Ctrl-b` 前缀键位，`?` 打开帮助；终端单元格保留程序颜色。
-- **设置**：启动时读取 `$XDG_CONFIG_HOME/herdr-terminal/config.json`（HOME 回退），支持 theme、scrollback、mouse、clipboard 和前缀键位；坏值会警告并回退。设置只在启动时读取，没有设置 UI 或热重载。
+- **UI**：默认 Catppuccin 外观（Mocha；`light`/`catppuccin-latte` 为 Latte，`terminal` 保留早先的命名色外观），颜色会降级到 256/16 色终端；常驻左侧栏（spaces 和 agents）、tab bar、pane 边框、status bar、help 浮层、重命名输入、搜索栏、surface 色的文本选择和一行 PREFIX/COPY/RESIZE 模式条；`Ctrl-b` 前缀键位，`?` 打开帮助；终端单元格保留程序颜色。
+- **设置**：启动时读取 `$XDG_CONFIG_HOME/herdr-terminal/config.json`（HOME 回退），支持 theme、scrollback、mouse、clipboard 和前缀键位；`default`、`dark`、`catppuccin` 选择 Mocha，`light`、`catppuccin-latte` 选择 Latte，`terminal` 使用命名色外观；坏值会警告并回退。设置只在启动时读取，没有设置 UI 或热重载。
 - **性能**：每帧的处理量、scrollback 和搜索都有上限，大输出时输入仍保持响应。
 - **CLI**：`ht` 打开工作区，`ht screen` 运行或重新 attach 单个终端，`ht probe` 输出原始 attach 字节；`--version`、`--help`、`--hc`、`--cols`、`--rows`、`-v`。
 - **发布**：macOS Apple Silicon 发布包，包含 `ht`、许可证和生成的第三方 notices；GitHub Actions CI 和由 tag 触发的 GitHub release 工作流。发布包要求 Herdr Core 0.1.17 或更新版本，且不包含 Core。
